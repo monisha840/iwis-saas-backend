@@ -3,24 +3,33 @@ import { z } from 'zod';
 import { PharmacyService } from '../services/pharmacy.service.js';
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
+import { auditAction } from '../middleware/auditLog.js';
 
 const router = express.Router();
 
 const medicineSchema = z.object({
-    name: z.string(),
+    name: z.string().min(1, 'Name is required'),
+    sku: z.string().min(1, 'SKU is required'),
+    category: z.string().min(1, 'Category is required'),
+    type: z.string().min(1, 'Type is required'),
     brand: z.string().optional(),
-    category: z.string().optional(),
     manufacturer: z.string().optional(),
     composition: z.string().optional(),
     description: z.string().optional(),
+    stock: z.number().or(z.string()).transform(v => typeof v === 'string' ? parseInt(v) : v).refine(v => v >= 0 && v <= 100000, { message: 'Stock must be between 0 and 100,000' }).optional().default(0),
     price: z.number().or(z.string()).transform(v => typeof v === 'string' ? parseFloat(v) : v),
 });
+
+const positiveInt = z.number().or(z.string())
+    .transform(v => typeof v === 'string' ? parseInt(v) : v)
+    .refine(v => Number.isInteger(v) && v > 0, { message: 'Must be a positive integer' })
+    .refine(v => v <= 100000, { message: 'Quantity cannot exceed 100,000' });
 
 const stockSchema = z.object({
     medicineId: z.string(),
     batchNumber: z.string(),
     expiryDate: z.string(),
-    quantity: z.number().or(z.string()).transform(v => typeof v === 'string' ? parseInt(v) : v),
+    quantity: positiveInt,
     minStock: z.number().or(z.string()).optional().transform(v => v ? (typeof v === 'string' ? parseInt(v) : v) : 10),
     location: z.string().optional(),
 });
@@ -30,9 +39,9 @@ const dispenseSchema = z.object({
     prescriptionId: z.string().optional(),
     items: z.array(z.object({
         medicineId: z.string(),
-        quantity: z.number(),
+        quantity: z.number().int().positive().max(10000),
         stockId: z.string().optional(),
-    })),
+    })).min(1, 'At least one item is required'),
 });
 
 const orderStatusSchema = z.object({
@@ -56,7 +65,7 @@ const listOrdersSchema = z.object({
     status: z.string().optional(),
 });
 
-router.get('/medicines', authMiddleware, async (req, res, next) => {
+router.get('/medicines', authMiddleware, roleMiddleware(['ADMIN', 'PHARMACIST', 'ADMIN_DOCTOR', 'DOCTOR']), async (req, res, next) => {
     try {
         const data = await PharmacyService.getAllMedicines(req.user.branchId);
         res.json(data);
@@ -67,8 +76,9 @@ router.get('/medicines', authMiddleware, async (req, res, next) => {
 
 router.post('/medicines', authMiddleware, roleMiddleware(['ADMIN', 'PHARMACIST', 'ADMIN_DOCTOR']), validate({ body: medicineSchema }), async (req, res, next) => {
     try {
-        const data = await PharmacyService.addMedicine(req.body);
-        res.status(201).json(data);
+        const data = { ...req.body, branchId: req.user.branchId };
+        const medicine = await PharmacyService.addMedicine(data);
+        res.status(201).json(medicine);
     } catch (err) {
         next(err);
     }
@@ -101,7 +111,7 @@ router.get('/stock/low', authMiddleware, roleMiddleware(['ADMIN', 'PHARMACIST', 
     }
 });
 
-router.post('/dispense', authMiddleware, roleMiddleware(['PHARMACIST', 'ADMIN', 'ADMIN_DOCTOR']), validate({ body: dispenseSchema }), async (req, res, next) => {
+router.post('/dispense', authMiddleware, roleMiddleware(['PHARMACIST', 'ADMIN_DOCTOR']), validate({ body: dispenseSchema }), auditAction('PHARMACY_DISPENSE', 'PharmacyDispense', () => null), async (req, res, next) => {
     try {
         const data = await PharmacyService.dispenseMedicines(req.user.id, req.body);
         res.status(201).json(data);
@@ -110,7 +120,7 @@ router.post('/dispense', authMiddleware, roleMiddleware(['PHARMACIST', 'ADMIN', 
     }
 });
 
-router.get('/dispenses', authMiddleware, async (req, res, next) => {
+router.get('/dispenses', authMiddleware, roleMiddleware(['ADMIN', 'PHARMACIST', 'ADMIN_DOCTOR']), async (req, res, next) => {
     try {
         const data = await PharmacyService.getDispenseHistory(req.user.branchId);
         res.json(data);

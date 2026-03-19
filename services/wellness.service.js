@@ -1,4 +1,5 @@
 import prisma from '../lib/prisma.js';
+import logger from '../lib/logger.js';
 
 export class WellnessService {
     static async getStats(userId) {
@@ -12,11 +13,53 @@ export class WellnessService {
 
         const level = patient.zenPoints >= 1000 ? 'Zen Master' : patient.zenPoints >= 500 ? 'Peaceful Soul' : 'Mindful Beginner';
 
+        // Calculate current medication adherence streak
+        const adherenceStreak = await WellnessService.getMedicationAdherenceStreak(patient.id);
+
         return {
             zenPoints: patient.zenPoints,
             dailyCheckIns: patient.dailyCheckIns,
-            level
+            level,
+            adherenceStreak,
         };
+    }
+
+    /**
+     * Count the current consecutive-day streak of medication adherence for a patient.
+     * A "day" counts if the patient had at least one taken=true medication log.
+     */
+    static async getMedicationAdherenceStreak(patientId) {
+        const today = new Date();
+        const lookbackDate = new Date(today);
+        lookbackDate.setDate(lookbackDate.getDate() - 60);
+
+        const logs = await prisma.medicationLog.findMany({
+            where: {
+                prescription: { patientId },
+                taken: true,
+                date: { gte: lookbackDate },
+            },
+            select: { date: true },
+            orderBy: { date: 'desc' },
+        });
+
+        const uniqueDates = [...new Set(logs.map(
+            (l) => l.date.toISOString().split('T')[0]
+        ))].sort().reverse();
+
+        let streak = 0;
+        const cursor = new Date(today.toISOString().split('T')[0]);
+        for (const d of uniqueDates) {
+            const cursorStr = cursor.toISOString().split('T')[0];
+            if (d === cursorStr) {
+                streak++;
+                cursor.setDate(cursor.getDate() - 1);
+            } else {
+                break;
+            }
+        }
+
+        return streak;
     }
 
     static async submitCheckIn(userId, data) {
@@ -133,7 +176,85 @@ export class WellnessService {
                         urgency: updatedPrescription.totalQuantity <= 2 ? 'critical' : 'normal'
                     });
                 } catch (notifyErr) {
-                    console.warn('[WellnessService] Alert failed:', notifyErr.message);
+                    logger.warn('[WellnessService] Alert failed:', notifyErr.message);
+                }
+            }
+
+            // ── Gamification: Zen Points for medication adherence ─────────
+            const logDate = new Date(date || Date.now());
+            const logDateStr = logDate.toISOString().split('T')[0];
+
+            // Base points (5 per taken dose), but only once per day per patient
+            const alreadyLoggedToday = await tx.medicationLog.count({
+                where: {
+                    prescription: { patientId: patient.id },
+                    taken: true,
+                    date: {
+                        gte: new Date(`${logDateStr}T00:00:00.000Z`),
+                        lt:  new Date(`${logDateStr}T23:59:59.999Z`),
+                    },
+                    id: { not: log.id }, // exclude the log we just created
+                },
+            });
+
+            if (alreadyLoggedToday === 0) {
+                // First taken log today — award base points + check streak
+                await tx.patient.update({
+                    where: { id: patient.id },
+                    data: { zenPoints: { increment: 5 } },
+                });
+
+                // Compute consecutive adherence streak (up to 60 days lookback)
+                const lookbackDate = new Date(logDate);
+                lookbackDate.setDate(lookbackDate.getDate() - 60);
+
+                const recentLogs = await tx.medicationLog.findMany({
+                    where: {
+                        prescription: { patientId: patient.id },
+                        taken: true,
+                        date: { gte: lookbackDate, lte: logDate },
+                    },
+                    select: { date: true },
+                    orderBy: { date: 'desc' },
+                });
+
+                // Collect unique dates
+                const uniqueDates = [...new Set(recentLogs.map(
+                    (l) => l.date.toISOString().split('T')[0]
+                ))].sort().reverse();
+
+                // Count consecutive streak ending today
+                let streak = 0;
+                let cursor = new Date(logDateStr);
+                for (const d of uniqueDates) {
+                    const cursorStr = cursor.toISOString().split('T')[0];
+                    if (d === cursorStr) {
+                        streak++;
+                        cursor.setDate(cursor.getDate() - 1);
+                    } else {
+                        break;
+                    }
+                }
+
+                // Milestone bonuses (awarded only at exact milestone days)
+                const MILESTONES = { 7: 20, 14: 30, 30: 50 };
+                const bonus = MILESTONES[streak];
+                if (bonus) {
+                    await tx.patient.update({
+                        where: { id: patient.id },
+                        data: { zenPoints: { increment: bonus } },
+                    });
+                    try {
+                        const { notificationService } = await import('./notification.service.js');
+                        await notificationService.createNotification({
+                            userId,
+                            type: 'ADHERENCE_MILESTONE',
+                            title: `🔥 ${streak}-day medication streak!`,
+                            message: `Incredible! You've taken your medication consistently for ${streak} days. +${bonus} Zen Points awarded!`,
+                            priority: 'MEDIUM',
+                            data: { streak, bonusPoints: bonus },
+                        });
+                    } catch { /* non-fatal */ }
                 }
             }
 

@@ -1,4 +1,5 @@
 import twilio from 'twilio';
+import logger from '../lib/logger.js';
 
 /**
  * SMS service using Twilio
@@ -15,9 +16,9 @@ class SMSService {
 
         if (this.accountSid && this.authToken) {
             this.client = twilio(this.accountSid, this.authToken);
-            console.log('[SMSService] Twilio client initialized');
+            logger.info('[SMSService] Twilio client initialized');
         } else {
-            console.warn('[SMSService] Twilio credentials not configured. SMS notifications will be disabled.');
+            logger.warn('[SMSService] Twilio credentials not configured. SMS notifications will be disabled.');
         }
     }
 
@@ -26,7 +27,7 @@ class SMSService {
      */
     async sendNotification(to, message) {
         if (!this.client) {
-            console.warn('[SMSService] Twilio not configured. Skipping SMS.');
+            logger.warn('[SMSService] Twilio not configured. Skipping SMS.');
             return null;
         }
 
@@ -40,10 +41,10 @@ class SMSService {
                 to: formattedNumber,
             });
 
-            console.log('[SMSService] SMS sent:', result.sid);
+            logger.info('[SMSService] SMS sent:', result.sid);
             return result;
         } catch (error) {
-            console.error('[SMSService] Error sending SMS:', error);
+            logger.error('[SMSService] Error sending SMS:', error);
             throw error;
         }
     }

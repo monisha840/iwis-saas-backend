@@ -1,4 +1,5 @@
 import PDFDocument from 'pdfkit';
+import logger from '../lib/logger.js';
 import { createObjectCsvWriter } from 'csv-writer';
 import { createWriteStream } from 'fs';
 import { join } from 'path';
@@ -17,7 +18,7 @@ class ExportService {
         try {
             await mkdir(this.exportDir, { recursive: true });
         } catch (error) {
-            console.error('[ExportService] Failed to create export directory:', error);
+            logger.error('[ExportService] Failed to create export directory:', error);
         }
     }
 
@@ -37,7 +38,7 @@ class ExportService {
         });
 
         await csvWriter.writeRecords(data);
-        console.log(`[ExportService] CSV generated: ${filepath}`);
+        logger.info(`[ExportService] CSV generated: ${filepath}`);
         return filepath;
     }
 
@@ -148,7 +149,7 @@ class ExportService {
             doc.end();
 
             stream.on('finish', () => {
-                console.log(`[ExportService] PDF generated: ${filepath}`);
+                logger.info(`[ExportService] PDF generated: ${filepath}`);
                 resolve(filepath);
             });
 

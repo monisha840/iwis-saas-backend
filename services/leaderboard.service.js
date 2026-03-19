@@ -1,5 +1,6 @@
 import crypto from 'crypto';
 import prisma from '../lib/prisma.js';
+import logger from '../lib/logger.js';
 import { cacheService } from './cache.service.js';
 
 const LOOKBACK_DAYS = 30;
@@ -271,7 +272,7 @@ export class LeaderboardService {
                     metrics: result.metrics
                 };
             } catch (err) {
-                console.error(`[LeaderboardService] Score computation failed for ${p.id}:`, err.message);
+                logger.error(`[LeaderboardService] Score computation failed for ${p.id}:`, err.message);
                 return null;
             }
         }));
@@ -360,9 +361,10 @@ export class LeaderboardService {
         });
 
         // Chat Response: Patient Message to Clinician reply
-        const conversations = prefetchedData
-            ? []
-            : await prisma.conversation.findMany({
+        // M-3: Use prefetched conversations if available (was hardcoded to [] when prefetchedData
+        //      was truthy, silently skipping chat response time for bulk leaderboard computations)
+        const conversations = prefetchedData?.conversations ??
+            await prisma.conversation.findMany({
                 where: {
                     OR: [{ doctorId: participantId }, { therapistId: participantId }],
                     updatedAt: { gte: thirtyDaysAgo }

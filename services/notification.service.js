@@ -1,11 +1,16 @@
 import prisma from '../lib/prisma.js';
 import { emitToUser } from '../websocket/index.js';
+import logger from '../lib/logger.js';
+import config from '../config/index.js';
+import { enqueueAppointmentWebhook } from './queue.service.js';
 
-const N8N_WEBHOOK_URL = "https://n8n.srv930949.hstgr.cloud/webhook/6d090cd6-89ef-4fc3-97d1-0a6c0ca9debe";
-const WEBHOOK_SECRET = "shifa-ayush-secret-token-2024";
-
-// Track processed appointment IDs for idempotency
-const processedIds = new Set();
+// ─── SCALING NOTE ────────────────────────────────────────────────────────────
+// The previous module-level `processedIds = new Set()` was removed.
+// In-process Sets are destroyed on restart and invisible to sibling instances,
+// making it impossible to scale horizontally.  Idempotency is now enforced
+// exclusively via the DB `notificationSent` flag (atomic DB update) PLUS the
+// Bull queue's per-jobId deduplication in enqueueAppointmentWebhook().
+// ─────────────────────────────────────────────────────────────────────────────
 
 export class NotificationService {
     /**
@@ -35,12 +40,13 @@ export class NotificationService {
             // Only trigger if final approval state is reached for the given type
             const isApproved = this.checkFinalApprovalState(appointment);
             if (!isApproved) {
-                console.log(`[NotificationService] Skipping Webhook for ${appointmentId} - Not fully approved yet.`);
+                logger.info(`[NotificationService] Skipping Webhook for ${appointmentId} - Not fully approved yet.`);
                 return false;
             }
 
-            if (processedIds.has(appointmentId) || appointment.notificationSent) {
-                console.log(`[NotificationService] IDEMPOTENCY - Webhook Bypassed for ${appointmentId}`);
+            // DB-only idempotency — no in-process Set (supports horizontal scale)
+            if (appointment.notificationSent) {
+                logger.info(`[NotificationService] IDEMPOTENCY - Webhook Bypassed for ${appointmentId}`);
                 return false;
             }
 
@@ -50,44 +56,26 @@ export class NotificationService {
             // 4. Strict Payload Validation - Block if required data is missing
             const validation = this.validatePayload(payload);
             if (!validation.success) {
-                console.error(`[NotificationService] BLOCKING WEBHOOK for ${appointmentId} - Missing Real Data: ${validation.missing.join(', ')}`);
+                logger.warn(`[NotificationService] BLOCKING WEBHOOK for ${appointmentId} - Missing Real Data`, { missing: validation.missing });
                 // Not marking as sent so it can be retried once data is corrected
                 return false;
             }
 
-            // 5. Mark as processed BEFORE dispatching to guarantee once-only behavior
+            // 5. Enqueue webhook FIRST — if enqueueing fails the flag is never set,
+            //    so the next retry attempt will re-enter and try again.
+            logger.info(`[NotificationService] Enqueueing webhook for ${appointmentId}`, { payload: JSON.stringify(payload) });
+            await enqueueAppointmentWebhook(appointmentId, payload);
+
+            // 6. Mark as processed ONLY after successful enqueue.
+            //    DB write is atomic across replicas; Bull's jobId deduplication prevents double-fire.
             await prisma.appointment.update({
                 where: { id: appointmentId },
                 data: { notificationSent: true }
             });
-            processedIds.add(appointmentId);
-
-            console.log(`[NotificationService] Dispatching Extended Webhook for ${appointmentId} (Record Source Verified):`, JSON.stringify(payload, null, 2));
-
-            // 6. Trigger webhook and wait for response
-            try {
-                const response = await fetch(N8N_WEBHOOK_URL, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'X-Webhook-Secret': WEBHOOK_SECRET
-                    },
-                    body: JSON.stringify(payload)
-                });
-
-                if (!response.ok) {
-                    const errorText = await response.text();
-                    console.error(`[NotificationService] Webhook failed (${response.status}) for ${appointmentId}: ${errorText}`);
-                } else {
-                    console.log(`[NotificationService] Webhook delivered successfully for ${appointmentId}`);
-                }
-            } catch (err) {
-                console.error(`[NotificationService] Error calling webhook for ${appointmentId}:`, err.message);
-            }
 
             return true;
         } catch (error) {
-            console.error(`[NotificationService] Fatal failure in webhook preparation for ${appointmentOrId}:`, error.message);
+            logger.error(`[NotificationService] Fatal failure in webhook preparation`, error, { appointmentOrId });
             return false;
         }
     }
@@ -222,6 +210,57 @@ export class NotificationService {
     }
 
     /**
+     * Send a timed appointment reminder notification to the patient.
+     * Called by the scheduler's 24h and 1h cron jobs.
+     *
+     * @param {string} appointmentId
+     * @param {number} hoursAhead    - How many hours until the appointment (1 or 24)
+     */
+    async sendAppointmentReminder(appointmentId, hoursAhead) {
+        try {
+            const appointment = await prisma.appointment.findUnique({
+                where: { id: appointmentId },
+                include: {
+                    patient: { include: { user: { select: { id: true } } } },
+                    doctor:    { select: { fullName: true } },
+                    therapist: { select: { fullName: true } },
+                    branch:    { select: { name: true } },
+                }
+            });
+
+            if (!appointment || !appointment.patient?.user?.id) return false;
+
+            const clinicianName =
+                appointment.doctor?.fullName ||
+                appointment.therapist?.fullName ||
+                'your clinician';
+
+            const dateStr = new Date(appointment.date).toLocaleString('en-US', {
+                weekday: 'short', month: 'short', day: 'numeric',
+                hour: '2-digit', minute: '2-digit'
+            });
+
+            const locationNote = appointment.branch?.name
+                ? ` at ${appointment.branch.name}`
+                : '';
+
+            await this.createNotification({
+                userId:   appointment.patient.user.id,
+                type:     'APPOINTMENT_REMINDER',
+                title:    `⏰ Appointment in ${hoursAhead} hour${hoursAhead !== 1 ? 's' : ''}`,
+                message:  `Reminder: You have an appointment with ${clinicianName} on ${dateStr}${locationNote}. Please be ready.`,
+                priority: hoursAhead <= 1 ? 'HIGH' : 'MEDIUM',
+                data:     { appointmentId, hoursAhead }
+            });
+
+            return true;
+        } catch (error) {
+            logger.error('[NotificationService] Failed to send appointment reminder', error, { appointmentId, hoursAhead });
+            return false;
+        }
+    }
+
+    /**
      * Create a notification for a user
      */
     async createNotification({ userId, type, title, message, priority = 'INFO', data = {} }) {
@@ -233,7 +272,7 @@ export class NotificationService {
             emitToUser(userId, 'new_notification', notification);
             return notification;
         } catch (error) {
-            console.error(`[NotificationService] Failed to create notification:`, error.message);
+            logger.error(`[NotificationService] Failed to create notification`, error, { userId, type });
             throw error;
         }
     }
@@ -263,7 +302,7 @@ export class NotificationService {
             }
             return true;
         } catch (error) {
-            console.error('[NotificationService] Failed to send low stock alert:', error.message);
+            logger.error('[NotificationService] Failed to send low stock alert', error);
             return false;
         }
     }

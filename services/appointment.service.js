@@ -1,5 +1,6 @@
 import prisma from '../lib/prisma.js';
 import logger from '../lib/logger.js';
+import crypto from 'crypto';
 import { notificationService } from './notification.service.js';
 import { AvailabilityService } from './availability.service.js';
 
@@ -8,6 +9,7 @@ const includeDetails = {
     therapist: { include: { user: { select: { email: true } } } },
     patient: { include: { user: { select: { email: true } } } },
     triageSession: true,
+    branch: { select: { id: true, name: true, address: true } },
 };
 
 export class AppointmentService {
@@ -15,12 +17,18 @@ export class AppointmentService {
         logger.info(`Trace: Entering getAppointments [User: ${id}, Role: ${role}]`, { filters });
 
         try {
-            const { status, date } = filters;
+            const { status, date, sort } = filters;
             const requestedPage = parseInt(filters.page) || 1;
             const page = Math.max(1, requestedPage);
-            const limit = parseInt(filters.limit) || 20;
+            const MAX_LIMIT = 100;
+            const limit = Math.min(parseInt(filters.limit) || 20, MAX_LIMIT);
             const skip = (page - 1) * limit;
             const take = limit;
+
+            // Build sort order — branch-name or default date-desc
+            const orderBy = sort === 'branch'
+                ? [{ branch: { name: 'asc' } }, { date: 'desc' }]
+                : { date: 'desc' };
 
             let where = {
                 ...(status && { status }),
@@ -66,14 +74,20 @@ export class AppointmentService {
                 where.branchId = user.branchId;
             }
 
-            logger.info(`Trace: Executing Appointment query`, { where, skip, take });
+            // 3. Admin-only branch filter — allows ADMIN / ADMIN_DOCTOR to scope by branch
+            //    Applies only when no branch-lock is already in effect (i.e. super-admin)
+            if ((role === 'ADMIN' || role === 'ADMIN_DOCTOR') && filters.branchId) {
+                where.branchId = filters.branchId;
+            }
 
-            // 3. Parallel Fetching (Optimized with skip/take)
+            logger.info(`Trace: Executing Appointment query`, { where, skip, take, sort });
+
+            // 4. Parallel Fetching (Optimized with skip/take)
             const [appointments, total] = await Promise.all([
                 prisma.appointment.findMany({
                     where,
                     include: includeDetails,
-                    orderBy: { date: 'desc' },
+                    orderBy,
                     skip,
                     take
                 }),
@@ -114,6 +128,15 @@ export class AppointmentService {
         }
 
         const appointmentDate = new Date(date);
+
+        // Reject appointments in the past
+        const now = new Date();
+        if (appointmentDate < now) {
+            const error = new Error('Appointment date must be in the future');
+            error.status = 400;
+            throw error;
+        }
+
         const [startTimeStr] = (data.slot || appointmentDate.toTimeString().slice(0, 5)).split(' - ');
 
         // Mandatory Branch Selection
@@ -198,11 +221,17 @@ export class AppointmentService {
         }
 
         if (contactDetails) {
+            const rawPhone = contactDetails.phoneNumber?.replace(/[\s\-]/g, '') || '';
+            if (rawPhone && !/^\+?[0-9]{7,15}$/.test(rawPhone)) {
+                const error = new Error('Invalid phone number format');
+                error.status = 400;
+                throw error;
+            }
             await prisma.patient.update({
                 where: { id: actualPatientId },
                 data: {
                     fullName: contactDetails.fullName,
-                    phoneNumber: contactDetails.phoneNumber.replace(/[\s\-]/g, ''),
+                    ...(rawPhone && { phoneNumber: rawPhone }),
                 },
             });
 
@@ -215,7 +244,7 @@ export class AppointmentService {
         // Online meeting generation
         let meetingLink = null;
         if (consultationMode === 'ONLINE') {
-            meetingLink = `https://meet.jit.si/al-shifa-${Math.random().toString(36).substring(7)}`;
+            meetingLink = `https://meet.jit.si/al-shifa-${crypto.randomBytes(12).toString('hex')}`;  // cryptographically random, not Math.random()
         }
 
         // 3. Clinical Recommendation Enforcement
@@ -237,44 +266,74 @@ export class AppointmentService {
             }
         }
 
-        const appointment = await prisma.appointment.create({
-            data: {
-                patientId: actualPatientId,
-                doctorId: (consultationType === 'THERAPIST' || !doctorId) ? null : doctorId,
-                therapistId: (consultationType === 'DOCTOR' || !therapistId) ? null : therapistId,
-                date: appointmentDate,
-                therapistDate: (consultationType === 'COMBINED' || consultationType === 'THERAPIST') ? actualTherapistDate : null,
-                status: user.role === 'PATIENT' ? 'PENDING' : (status || 'CONFIRMED'),
-                notes,
-                triageSessionId: triageSessionId || null,
-                consultationType: consultationType || 'DOCTOR',
-                consultationMode: consultationMode || 'OFFLINE',
-                meetingLink,
-                branchId: branchIdToUse
-            },
-            include: {
-                ...includeDetails,
-                triageSession: true
+        // H-2: Wrap create inside a serializable transaction so the double-booking check
+        //       and the insert are atomic — eliminates the TOCTOU race condition.
+        const appointment = await prisma.$transaction(async (tx) => {
+            if (doctorId && consultationType !== 'THERAPIST') {
+                const conflict = await tx.appointment.findFirst({
+                    where: { doctorId, date: appointmentDate, status: { notIn: ['CANCELLED', 'REJECTED'] } },
+                    select: { id: true }
+                });
+                if (conflict) {
+                    const err = new Error('The selected doctor is already booked at this time.');
+                    err.status = 409;
+                    throw err;
+                }
             }
+            if (therapistId && consultationType !== 'DOCTOR') {
+                const conflictDate = (consultationType === 'COMBINED' || consultationType === 'THERAPIST')
+                    ? actualTherapistDate
+                    : appointmentDate;
+                const conflict = await tx.appointment.findFirst({
+                    where: {
+                        therapistId,
+                        OR: [{ date: conflictDate }, { therapistDate: conflictDate }],
+                        status: { notIn: ['CANCELLED', 'REJECTED'] }
+                    },
+                    select: { id: true }
+                });
+                if (conflict) {
+                    const err = new Error('The selected therapist is already booked at this time.');
+                    err.status = 409;
+                    throw err;
+                }
+            }
+            return tx.appointment.create({
+                data: {
+                    patientId: actualPatientId,
+                    doctorId: (consultationType === 'THERAPIST' || !doctorId) ? null : doctorId,
+                    therapistId: (consultationType === 'DOCTOR' || !therapistId) ? null : therapistId,
+                    date: appointmentDate,
+                    therapistDate: (consultationType === 'COMBINED' || consultationType === 'THERAPIST') ? actualTherapistDate : null,
+                    status: user.role === 'PATIENT' ? 'PENDING' : (status || 'CONFIRMED'),
+                    notes,
+                    triageSessionId: triageSessionId || null,
+                    consultationType: consultationType || 'DOCTOR',
+                    consultationMode: consultationMode || 'OFFLINE',
+                    meetingLink,
+                    branchId: branchIdToUse
+                },
+                include: { ...includeDetails, triageSession: true }
+            });
         });
 
         // Notify Clinicians of New Appointment (INFO priority)
-        if (appointment.doctorId) {
+        if (appointment.doctorId && appointment.doctor?.userId) {
             await notificationService.createNotification({
                 userId: appointment.doctor.userId,
                 type: 'NEW_APPOINTMENT',
                 title: 'New Appointment Request',
-                message: `You have a new appointment request from ${appointment.patient.fullName} for ${appointmentDate.toLocaleDateString()}.`,
+                message: `You have a new appointment request from ${appointment.patient?.fullName ?? 'a patient'} for ${appointmentDate.toLocaleDateString()}.`,
                 priority: 'INFO',
                 data: { appointmentId: appointment.id }
             });
         }
-        if (appointment.therapistId) {
+        if (appointment.therapistId && appointment.therapist?.userId) {
             await notificationService.createNotification({
                 userId: appointment.therapist.userId,
                 type: 'NEW_APPOINTMENT',
                 title: 'New Appointment Request',
-                message: `You have a new appointment request from ${appointment.patient.fullName} for ${appointmentDate.toLocaleDateString()}.`,
+                message: `You have a new appointment request from ${appointment.patient?.fullName ?? 'a patient'} for ${appointmentDate.toLocaleDateString()}.`,
                 priority: 'INFO',
                 data: { appointmentId: appointment.id }
             });
@@ -343,18 +402,9 @@ export class AppointmentService {
             });
         }
 
-        // Trigger notification if status transitions to ACCEPTED and not already sent
-        const isDoctor = ['DOCTOR', 'ADMIN_DOCTOR'].includes(user.role);
-        const transitioningToAccepted = data.status === 'ACCEPTED' && existing.status !== 'ACCEPTED';
-
-        if (transitioningToAccepted && isDoctor && !appointment.notificationSent) {
-            console.log(`[AppointmentService] Manual status update to ACCEPTED by ${user.role} for ${id}. Triggering notification.`);
-            try {
-                await notificationService.sendAppointmentConfirmation(appointment, 'DOCTOR_ACCEPT');
-            } catch (notifyError) {
-                console.error('[AppointmentService] Failed to send confirmation notification:', notifyError.message);
-            }
-        }
+        // H-6: Duplicate trigger removed — approveAppointment() already handles the
+        //       ACCEPTED notification via the proper approval flow. Firing it here
+        //       caused double webhook delivery on manual status edits.
 
         return appointment;
     }
@@ -418,14 +468,14 @@ export class AppointmentService {
         }
 
         if (shouldTrigger && !updated.notificationSent) {
-            console.log(`[AppointmentService] Final approval reached for ${id} (Type: ${type}). Triggering webhook.`);
+            logger.info(`[AppointmentService] Final approval reached for ${id} (Type: ${type}). Triggering webhook.`);
             try {
                 await notificationService.sendAppointmentConfirmation(updated, `${user.role}_ACCEPT`);
             } catch (notifyError) {
-                console.error('[AppointmentService] Failed to send confirmation notification:', notifyError.message);
+                logger.error('[AppointmentService] Failed to send confirmation notification', { message: notifyError.message, appointmentId: id });
             }
         } else {
-            console.log(`[AppointmentService] Status updated for ${id}. Notification check: Sent=${updated.notificationSent}, ShouldTrigger=${shouldTrigger}`);
+            logger.info(`[AppointmentService] Status updated for ${id}`, { notificationSent: updated.notificationSent, shouldTrigger });
         }
 
         return updated;
@@ -468,16 +518,15 @@ export class AppointmentService {
             appointment.therapist?.userId
         ].filter(Boolean);
 
-        for (const userId of parties) {
-            await notificationService.createNotification({
-                userId,
-                type: 'APPOINTMENT_CANCELLED',
-                title: 'Appointment Cancelled',
-                message: `The appointment for ${appointment.patient.fullName} on ${new Date(appointment.date).toLocaleDateString()} has been cancelled.`,
-                priority: 'HIGH',
-                data: { appointmentId: appointment.id }
-            });
-        }
+        // M-8: Fire all cancellation notifications in parallel (was sequential await-in-loop)
+        await Promise.all(parties.map(userId => notificationService.createNotification({
+            userId,
+            type: 'APPOINTMENT_CANCELLED',
+            title: 'Appointment Cancelled',
+            message: `The appointment for ${appointment.patient.fullName} on ${new Date(appointment.date).toLocaleDateString()} has been cancelled.`,
+            priority: 'HIGH',
+            data: { appointmentId: appointment.id }
+        })));
 
         return appointment;
     }
@@ -506,27 +555,34 @@ export class AppointmentService {
         ]);
 
         // 2. Real-time Availability Filter (if date and slot provided)
+        // Run all clinician availability checks in parallel to avoid N+1 serial queries.
         if (date && slot) {
             const [startTime, endTime] = slot.split(' - ');
 
-            const [availDocs, availTherapists] = await Promise.all([
-                Promise.all(doctors.map(async (doc) => {
-                    const check = await AvailabilityService.checkAvailability(doc.id, date, startTime, endTime);
-                    return check.available ? doc : null;
-                })),
-                Promise.all(therapists.map(async (t) => {
-                    const check = await AvailabilityService.checkAvailability(t.id, date, startTime, endTime);
-                    return check.available ? t : null;
-                }))
+            const [docResults, therapistResults] = await Promise.all([
+                Promise.all(doctors.map((doc) =>
+                    AvailabilityService.checkAvailability(doc.id, date, startTime, endTime)
+                        .then((check) => check.available ? doc : null)
+                        .catch(() => null)
+                )),
+                Promise.all(therapists.map((t) =>
+                    AvailabilityService.checkAvailability(t.id, date, startTime, endTime)
+                        .then((check) => check.available ? t : null)
+                        .catch(() => null)
+                )),
             ]);
 
             return {
-                doctors: availDocs.filter(d => d !== null),
-                therapists: availTherapists.filter(t => t !== null)
+                doctors: docResults.filter(Boolean),
+                therapists: therapistResults.filter(Boolean),
             };
         }
 
         return { doctors, therapists };
+    }
+
+    static async getAppointmentById(id) {
+        return prisma.appointment.findUnique({ where: { id }, select: { id: true, status: true } });
     }
 
     static async getAvailableSlots(clinicianId, date) {

@@ -13,7 +13,9 @@ import { createServer } from 'http';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+import config from './config/index.js';
 import logger from './lib/logger.js';
+import { errorHandler } from './middleware/errorHandler.js';
 import authRoutes from './routes/auth.js';
 // ... other imports
 import userRoutes from './routes/user.js';
@@ -31,22 +33,45 @@ import branchRoutes from './routes/branch.js';
 import availabilityRoutes from './routes/availability.js';
 import adherenceRoutes from './routes/adherence.js';
 import leaderboardRoutes from './routes/leaderboard.js';
+import timelineRoutes from './routes/timeline.js';
+import refillRoutes from './routes/refill.js';
+import featureFlagRoutes from './routes/feature-flags.js';
+import referralRoutes from './routes/referrals.js';
+import retentionChecklistRoutes from './routes/retention-checklist.js';
 
 import { initializeWebSocket } from './websocket/index.js';
 import { schedulerService } from './services/scheduler.service.js';
+import { FeatureFlagService } from './services/feature-flag.service.js';
 
 const app = express();
 const httpServer = createServer(app);
 
+// Attach a unique request ID for log tracing
+app.use((req, res, next) => {
+  req.id = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  res.setHeader('X-Request-Id', req.id);
+  next();
+});
+
 // Request Logger for Audit Traceability
 app.use((req, res, next) => {
   logger.info(`${req.method} ${req.url}`, {
+    requestId: req.id,
     origin: req.headers.origin,
     ip: req.ip,
     userAgent: req.headers['user-agent']
   });
   next();
 });
+
+// CORS must come first so preflight OPTIONS requests get Access-Control headers
+// before rate limiters or helmet can intercept and respond without them.
+app.use(cors({
+  origin: config.cors.origins,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 
 // Security Middleware
 app.use(helmet({
@@ -66,10 +91,10 @@ app.use(helmet({
   },
 }));
 
-// Basic Rate Limiting
+// Basic Rate Limiting — values from centralized config
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per windowMs
+  windowMs: config.rateLimit.windowMs,
+  max: config.rateLimit.max,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests from this IP, please try again after 15 minutes' }
@@ -77,8 +102,8 @@ const limiter = rateLimit({
 
 // Stricter Rate Limiting for Auth
 const authLimiter = rateLimit({
-  windowMs: 60 * 60 * 1000, // 1 hour
-  max: 10, // Limit each IP to 10 login attempts per hour
+  windowMs: config.rateLimit.authWindowMs,
+  max: config.rateLimit.authMax,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many login attempts, please try again after an hour' }
@@ -86,25 +111,9 @@ const authLimiter = rateLimit({
 
 app.use('/api/', limiter);
 app.use('/api/auth/login', authLimiter);
+app.use('/api/auth/register', authLimiter);
 
-// Middleware
-app.use(cors({
-  origin: [
-    'http://localhost:5173',
-    'http://localhost:8080',
-    'http://localhost:8081',
-    'http://127.0.0.1:5173',
-    'http://127.0.0.1:8080',
-    'http://127.0.0.1:8081',
-    process.env.FRONTEND_URL,
-    // Support Render internal networking or same-origin requests
-    '*.onrender.com'
-  ].filter(Boolean),
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization']
-}));
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '1mb' }));
 app.use(morgan('dev'));
 
 // Health check endpoint
@@ -133,37 +142,26 @@ app.use('/api/branches', branchRoutes);
 app.use('/api/availability', availabilityRoutes);
 app.use('/api/adherence', adherenceRoutes);
 app.use('/api/leaderboard', leaderboardRoutes);
-
+app.use('/api/patients', timelineRoutes);
+app.use('/api/refills', refillRoutes);
+app.use('/api/feature-flags', featureFlagRoutes);
+app.use('/api/referrals', referralRoutes);app.use('/api/retention-checklist', retentionChecklistRoutes);
 
 // Redundant static serving removed for standalone architecture
 
-// Global error handler
-app.use((err, req, res, next) => {
-  const status = err.status || 500;
-  const message = process.env.NODE_ENV === 'production'
-    ? 'Internal Server Error'
-    : err.message || 'Internal Server Error';
+// Global error handler — imported from middleware/errorHandler.js
+app.use(errorHandler);
 
-  logger.error(`API Error: ${req.method} ${req.url}`, err, {
-    status,
-    userId: req.user?.id,
-    role: req.user?.role
-  });
-
-  res.status(status).json({
-    error: message,
-    ...(err.suggestedSlot && { suggestedSlot: err.suggestedSlot }),
-    ...(process.env.NODE_ENV !== 'production' && { stack: err.stack })
-  });
-});
-
-const PORT = process.env.PORT || 4000;
+const PORT = config.server.port;
 
 // Initialize WebSocket server
 initializeWebSocket(httpServer);
 
 // Initialize scheduler for automated tasks
 schedulerService.init();
+
+// Seed default feature flags (idempotent — safe to run every startup)
+FeatureFlagService.seedDefaults().catch(err => logger.error('Feature flag seed failed', { err }));
 
 httpServer.listen(PORT, () => {
   logger.info(`Backend server running on port ${PORT}`, { env: process.env.NODE_ENV });

@@ -5,6 +5,7 @@ import { analyticsService } from '../services/analytics.service.js';
 import { exportService } from '../services/export.service.js';
 import { validate } from '../middleware/validate.js';
 import { createReadStream, unlink } from 'fs';
+import logger from '../lib/logger.js';
 
 const router = express.Router();
 
@@ -50,7 +51,7 @@ router.get('/patient-progress/export/csv', authMiddleware, roleMiddleware(['ADMI
         fileStream.pipe(res);
         fileStream.on('end', () => {
             unlink(filepath, (err) => {
-                if (err) console.error('Failed to delete temp file:', err);
+                if (err) logger.error('Failed to delete temp file:', err);
             });
         });
     } catch (err) {
@@ -83,7 +84,7 @@ router.get('/doctor-performance/export/pdf', authMiddleware, roleMiddleware(['AD
         fileStream.pipe(res);
         fileStream.on('end', () => {
             unlink(filepath, (err) => {
-                if (err) console.error('Failed to delete temp file:', err);
+                if (err) logger.error('Failed to delete temp file:', err);
             });
         });
     } catch (err) {
@@ -112,7 +113,7 @@ router.get('/appointments/export/csv', authMiddleware, roleMiddleware(['ADMIN', 
         fileStream.pipe(res);
         fileStream.on('end', () => {
             unlink(filepath, (err) => {
-                if (err) console.error('Failed to delete temp file:', err);
+                if (err) logger.error('Failed to delete temp file:', err);
             });
         });
     } catch (err) {
@@ -141,6 +142,15 @@ router.get('/dashboard-stats', authMiddleware, async (req, res, next) => {
 router.get('/patient/:patientId/progress', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST']), async (req, res, next) => {
     try {
         const data = await analyticsService.getClientProgressReport(req.params.patientId);
+        res.json({ success: true, data });
+    } catch (err) {
+        next(err);
+    }
+});
+
+router.get('/branch-summary', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']), async (req, res, next) => {
+    try {
+        const data = await analyticsService.getBranchSummary();
         res.json({ success: true, data });
     } catch (err) {
         next(err);

@@ -23,7 +23,7 @@ async function runTest() {
 
         // 2. Test: Branch List Filtering
         console.log('Test 1: Testing branch-based doctor listing...');
-        const branchDoctors = await UserService.listDoctors(patient.branchId);
+        const branchDoctors = await UserService.listDoctors({ branchId: patient.branchId });
         const crossBranch = branchDoctors.find(d => d.branchId !== patient.branchId);
         if (crossBranch) {
             console.error('FAILED: listDoctors returned a doctor from a different branch!');

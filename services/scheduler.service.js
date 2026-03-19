@@ -1,6 +1,7 @@
 import cron from 'node-cron';
 import prisma from '../lib/prisma.js';
 import { notificationService } from './notification.service.js';
+import logger from '../lib/logger.js';
 
 /**
  * Scheduler service for automated tasks
@@ -15,7 +16,7 @@ class SchedulerService {
      * Initialize all scheduled jobs
      */
     init() {
-        console.log('[SchedulerService] Initializing scheduled jobs...');
+        logger.info('[SchedulerService] Initializing scheduled jobs...');
 
         // Check for 24-hour reminders every hour
         this.jobs.push(
@@ -38,7 +39,35 @@ class SchedulerService {
             })
         );
 
-        console.log('[SchedulerService] All jobs scheduled');
+        // Post-session follow-up nudges — runs daily at 9am
+        this.jobs.push(
+            cron.schedule('0 9 * * *', () => {
+                this.sendPostSessionFollowUps();
+            })
+        );
+
+        // Care-gap detection — runs every Monday at 8am
+        this.jobs.push(
+            cron.schedule('0 8 * * 1', () => {
+                this.sendCareGapAlerts();
+            })
+        );
+
+        // Medication adherence reminders — runs daily at 8pm
+        this.jobs.push(
+            cron.schedule('0 20 * * *', () => {
+                this.sendMedicationAdherenceReminders();
+            })
+        );
+
+        // Prescription expiry alerts — runs daily at 8am
+        this.jobs.push(
+            cron.schedule('0 8 * * *', () => {
+                this.checkExpiringPrescriptions();
+            })
+        );
+
+        logger.info('[SchedulerService] All jobs scheduled');
     }
 
     /**
@@ -65,13 +94,13 @@ class SchedulerService {
                 },
             });
 
-            console.log(`[SchedulerService] Found ${appointments.length} appointments for 24h reminders`);
+            logger.info(`[SchedulerService] Found ${appointments.length} appointments for 24h reminders`);
 
             for (const appointment of appointments) {
                 await notificationService.sendAppointmentReminder(appointment.id, 24);
             }
         } catch (error) {
-            console.error('[SchedulerService] Error sending 24h reminders:', error);
+            logger.error('[SchedulerService] Error sending 24h reminders:', error);
         }
     }
 
@@ -99,13 +128,13 @@ class SchedulerService {
                 },
             });
 
-            console.log(`[SchedulerService] Found ${appointments.length} appointments for 1h reminders`);
+            logger.info(`[SchedulerService] Found ${appointments.length} appointments for 1h reminders`);
 
             for (const appointment of appointments) {
                 await notificationService.sendAppointmentReminder(appointment.id, 1);
             }
         } catch (error) {
-            console.error('[SchedulerService] Error sending 1h reminders:', error);
+            logger.error('[SchedulerService] Error sending 1h reminders:', error);
         }
     }
 
@@ -126,9 +155,218 @@ class SchedulerService {
                 },
             });
 
-            console.log(`[SchedulerService] Cleaned up ${result.count} old notifications`);
+            logger.info(`[SchedulerService] Cleaned up ${result.count} old notifications`);
         } catch (error) {
-            console.error('[SchedulerService] Error cleaning up notifications:', error);
+            logger.error('[SchedulerService] Error cleaning up notifications:', error);
+        }
+    }
+
+    /**
+     * Send post-session follow-up nudges.
+     * Targets: appointments COMPLETED 3 days ago where no DailyCheckIn has been
+     * submitted since the completion date.
+     * Runs: daily at 9am
+     */
+    async sendPostSessionFollowUps() {
+        try {
+            const threeDaysAgo = new Date();
+            threeDaysAgo.setDate(threeDaysAgo.getDate() - 3);
+
+            const fourDaysAgo = new Date();
+            fourDaysAgo.setDate(fourDaysAgo.getDate() - 4);
+
+            // Appointments completed roughly 3 days ago
+            const completedAppointments = await prisma.appointment.findMany({
+                where: {
+                    status: 'COMPLETED',
+                    updatedAt: { gte: fourDaysAgo, lt: threeDaysAgo },
+                },
+                include: { patient: true },
+            });
+
+            let sentCount = 0;  // M-7: count only actually sent notifications, not total eligible
+
+            for (const appt of completedAppointments) {
+                if (!appt.patient?.userId) continue;
+
+                // Check if patient has submitted a check-in since the appointment date
+                const checkIn = await prisma.dailyCheckIn.findFirst({
+                    where: {
+                        patientId: appt.patientId,
+                        createdAt: { gte: new Date(appt.updatedAt) },
+                    },
+                });
+
+                if (!checkIn) {
+                    await notificationService.createNotification({
+                        userId: appt.patient.userId,
+                        type: 'POST_SESSION_FOLLOWUP',
+                        title: '💬 How are you feeling after your session?',
+                        message: `It has been 3 days since your last session. Please submit a wellness check-in to track your recovery progress.`,
+                        priority: 'MEDIUM',
+                        data: { appointmentId: appt.id },
+                    });
+                    sentCount++;
+                }
+            }
+
+            logger.info(`[SchedulerService] Post-session follow-up sent for ${sentCount} out of ${completedAppointments.length} eligible appointments`);
+        } catch (error) {
+            logger.error('[SchedulerService] Error sending post-session follow-ups:', error);
+        }
+    }
+
+    /**
+     * Care-gap detection: alert patients and their doctor when no appointment
+     * has been scheduled for > 21 days on an active journey.
+     * Runs: every Monday at 8am
+     */
+    async sendCareGapAlerts() {
+        try {
+            const twentyOneDaysAgo = new Date();
+            twentyOneDaysAgo.setDate(twentyOneDaysAgo.getDate() - 21);
+
+            const atRiskJourneys = await prisma.journey.findMany({
+                where: { status: 'ACTIVE' },
+                include: {
+                    patient: { include: { user: true } },
+                    doctor: { include: { user: true } },
+                },
+            });
+
+            let alertCount = 0;
+
+            for (const journey of atRiskJourneys) {
+                // Find the most recent appointment for this patient
+                const lastAppointment = await prisma.appointment.findFirst({
+                    where: {
+                        patientId: journey.patientId,
+                        status: { in: ['COMPLETED', 'CONFIRMED', 'SCHEDULED'] },
+                    },
+                    orderBy: { date: 'desc' },
+                });
+
+                const lastDate = lastAppointment?.date || journey.startDate;
+                if (new Date(lastDate) < twentyOneDaysAgo) {
+                    // M-2: Deduplication — skip patients already notified about this care gap
+                    //       within the past 7 days to prevent alert spam.
+                    if (journey.patient?.userId) {
+                        const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+                        const recentAlert = await prisma.notification.findFirst({
+                            where: {
+                                userId: journey.patient.userId,
+                                type: 'CARE_GAP_PATIENT',
+                                createdAt: { gte: sevenDaysAgo }
+                            },
+                            select: { id: true }
+                        });
+                        if (recentAlert) continue;
+                    }
+
+                    // Notify patient
+                    if (journey.patient?.userId) {
+                        await notificationService.createNotification({
+                            userId: journey.patient.userId,
+                            type: 'CARE_GAP_PATIENT',
+                            title: '📅 Time to schedule your next session',
+                            message: `You haven't had an appointment in over 3 weeks. Your ongoing treatment journey benefits from regular sessions. Book your next visit today.`,
+                            priority: 'MEDIUM',
+                            data: { journeyId: journey.id },
+                        });
+                    }
+
+                    // Notify assigned doctor
+                    if (journey.doctor?.userId) {
+                        await notificationService.createNotification({
+                            userId: journey.doctor.userId,
+                            type: 'CARE_GAP_DOCTOR',
+                            title: `⚠️ Care gap: ${journey.patient?.fullName || 'Patient'}`,
+                            message: `${journey.patient?.fullName || 'A patient'} on an active journey has had no appointment for over 21 days. Consider reaching out.`,
+                            priority: 'LOW',
+                            data: { journeyId: journey.id, patientId: journey.patientId },
+                        });
+                    }
+
+                    alertCount++;
+                }
+            }
+
+            logger.info(`[SchedulerService] Care-gap alerts sent for ${alertCount} journeys`);
+        } catch (error) {
+            logger.error('[SchedulerService] Error sending care-gap alerts:', error);
+        }
+    }
+
+    /**
+     * Medication adherence reminders: notify patients who have active prescriptions
+     * but have not logged any medication intake today.
+     * Runs: daily at 8pm
+     */
+    async sendMedicationAdherenceReminders() {
+        try {
+            const todayStart = new Date();
+            todayStart.setHours(0, 0, 0, 0);
+
+            const todayEnd = new Date();
+            todayEnd.setHours(23, 59, 59, 999);
+
+            // Find prescriptions that are still within their expected active window
+            // Duration is a string like "7 days", "1 month" — we compare createdAt
+            // to a generous 90-day window (covers all common durations)
+            const ninetyDaysAgo = new Date();
+            ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
+
+            const activePrescriptions = await prisma.prescription.findMany({
+                where: { createdAt: { gte: ninetyDaysAgo } },
+                include: { patient: { include: { user: true } } },
+            });
+
+            // Group by patientId to send one notification per patient (not per prescription)
+            const patientMap = new Map();
+            for (const rx of activePrescriptions) {
+                if (!rx.patient?.userId) continue;
+
+                // Check if patient logged any medication for this prescription today
+                const logsToday = await prisma.medicationLog.count({
+                    where: {
+                        prescriptionId: rx.id,
+                        takenAt: { gte: todayStart, lte: todayEnd },
+                        taken: true,
+                    },
+                });
+
+                if (logsToday === 0 && !patientMap.has(rx.patientId)) {
+                    patientMap.set(rx.patientId, rx.patient);
+                }
+            }
+
+            for (const [, patient] of patientMap) {
+                await notificationService.createNotification({
+                    userId: patient.userId,
+                    type: 'MEDICATION_ADHERENCE_REMINDER',
+                    title: '💊 Medication reminder',
+                    message: `Don't forget to take your medication today and log it in your wellness tracker to maintain your health streak.`,
+                    priority: 'LOW',
+                    data: {},
+                });
+            }
+
+            logger.info(`[SchedulerService] Medication adherence reminders sent to ${patientMap.size} patients`);
+        } catch (error) {
+            logger.error('[SchedulerService] Error sending medication adherence reminders:', error);
+        }
+    }
+
+    /**
+     * Detect prescriptions expiring within the next 5 days and notify patients
+     */
+    async checkExpiringPrescriptions() {
+        try {
+            const { RefillService } = await import('./refill.service.js');
+            const count = await RefillService.detectExpiringPrescriptions(5);
+            logger.info(`[SchedulerService] Expiry alerts sent for ${count} prescriptions`);
+        } catch (error) {
+            logger.error('[SchedulerService] Error checking expiring prescriptions:', error);
         }
     }
 
@@ -136,7 +374,7 @@ class SchedulerService {
      * Stop all scheduled jobs
      */
     stopAll() {
-        console.log('[SchedulerService] Stopping all jobs...');
+        logger.info('[SchedulerService] Stopping all jobs...');
         this.jobs.forEach((job) => job.stop());
     }
 }

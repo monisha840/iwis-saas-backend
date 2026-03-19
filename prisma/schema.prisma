@@ -29,6 +29,7 @@ model User {
   branch                 Branch?                 @relation(fields: [branchId], references: [id])
   branchId               String?
   auditLogs              AuditLog[]
+  refillRequests         RefillRequest[]
 
   @@index([branchId])
 }
@@ -110,6 +111,9 @@ model BlockedSlot {
   @@index([doctorId])
   @@index([therapistId])
   @@index([date])
+  // Composite indexes for the availability check queries
+  @@index([doctorId, date, dayOfWeek])    // checkAvailability + getAvailableSlots
+  @@index([therapistId, date, dayOfWeek]) // checkAvailability + getAvailableSlots
 }
 
 model Therapist {
@@ -176,6 +180,13 @@ model Patient {
   videoPrescriptions  VideoPrescription[]
   branch              Branch?             @relation(fields: [branchId], references: [id])
   branchId            String?
+  refillRequests      RefillRequest[]
+  referralsMade       Referral[]          @relation("PatientReferrals")
+  referralsReceived   Referral[]          @relation("PatientReferredBy")
+  retentionChecklists RetentionChecklist[]
+  appointmentFeedback AppointmentFeedback[]
+
+  @@index([branchId]) // branch-scoped patient queries (listPatients, triage dispatch)
 }
 
 model DailyCheckIn {
@@ -247,6 +258,8 @@ model Appointment {
   doctorApproved   Boolean        @default(false)
   therapistApproved Boolean       @default(false)
   notificationSent  Boolean       @default(false)
+  retentionChecklist RetentionChecklist?
+  feedback           AppointmentFeedback?
 
   @@index([patientId])
   @@index([doctorId])
@@ -254,6 +267,13 @@ model Appointment {
   @@index([status])
   @@index([date])
   @@index([branchId])
+  // Composite indexes for high-frequency joined queries
+  @@index([doctorId, date])         // Availability check: "is the doctor free on date X?"
+  @@index([therapistId, date])      // Availability check: "is the therapist free on date X?"
+  @@index([patientId, status])      // Patient dashboard: filter by status
+  @@index([status, date])           // Admin dashboard: date-range + status filter
+  @@index([branchId, date])         // Branch reporting: appointments per branch per period
+  @@index([notificationSent, status]) // Webhook retry: find confirmed, un-notified appointments
 }
 
 model Prescription {
@@ -283,6 +303,7 @@ model Prescription {
   pharmacyOrders    PharmacyOrder[]
   branch            Branch?            @relation(fields: [branchId], references: [id])
   branchId          String?
+  refillRequests    RefillRequest[]
 
   @@index([patientId])
   @@index([doctorId])
@@ -301,6 +322,10 @@ model Availability {
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
   therapist   Therapist @relation(fields: [therapistId], references: [id])
+
+  @@index([therapistId])                   // Basic FK index (was missing)
+  @@index([therapistId, dayOfWeek])        // Slot lookup: schedule for a clinician on a given day
+  @@index([therapistId, isApproved])       // Approved availability filter
 }
 
 model Notification {
@@ -312,11 +337,16 @@ model Notification {
   priority  NotificationPriority @default(INFO)
   isRead    Boolean  @default(false)
   data      Json?
+  /// Optional: ID of the related entity (appointment, prescription, etc.)
+  /// Used for idempotency checks — prevents duplicate in-app notifications.
+  relatedId String?
   createdAt DateTime @default(now())
   user      User     @relation(fields: [userId], references: [id])
 
   @@index([userId, isRead])
   @@index([createdAt])
+  @@index([relatedId, type])   // Idempotency: check if notification already sent for a given entity+type
+  @@index([userId, type, createdAt]) // Deduplication queries: "has this user been sent type X recently?"
 }
 
 enum NotificationPriority {
@@ -685,6 +715,55 @@ model LeaderboardConfig {
   updatedAt             DateTime @updatedAt
 }
 
+model FeatureFlag {
+  id              String   @id @default(uuid())
+  key             String   @unique
+  enabled         Boolean  @default(false)
+  description     String?
+  allowedRoles    String[]
+  allowedBranches String[]
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([key])
+}
+
+model RefillRequest {
+  id             String       @id @default(uuid())
+  prescriptionId String
+  patientId      String
+  requestedById  String
+  status         String       @default("PENDING") // PENDING | APPROVED | REJECTED | FULFILLED
+  notes          String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  prescription   Prescription @relation(fields: [prescriptionId], references: [id])
+  patient        Patient      @relation(fields: [patientId], references: [id])
+  requestedBy    User         @relation(fields: [requestedById], references: [id])
+
+  @@index([prescriptionId])
+  @@index([patientId])
+  @@index([status])
+  @@index([requestedById])
+}
+
+model Referral {
+  id             String   @id @default(uuid())
+  referrerId     String
+  referredId     String?
+  referralCode   String   @unique
+  status         String   @default("PENDING") // PENDING | REGISTERED | COMPLETED
+  rewardGranted  Boolean  @default(false)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+  referrer       Patient  @relation("PatientReferrals", fields: [referrerId], references: [id])
+  referred       Patient? @relation("PatientReferredBy", fields: [referredId], references: [id])
+
+  @@index([referrerId])
+  @@index([referralCode])
+  @@index([status])
+}
+
 model LeaderboardAudit {
   id                String   @id @default(uuid())
   participantId     String
@@ -699,4 +778,54 @@ model LeaderboardAudit {
   
   @@index([participantId])
   @@index([calculationDate])
+}
+
+// ── Retention Checklist ───────────────────────────────────────────────────────
+// Recorded by a doctor or therapist at the end of (or during) a consultation
+// to track patient adherence across five structured follow-up categories.
+
+enum RetentionStatus {
+  COMPLETED
+  PARTIAL
+  NOT_FOLLOWED
+}
+
+model RetentionChecklist {
+  id            String      @id @default(uuid())
+  appointmentId String      @unique
+  patientId     String
+  clinicianId   String      // userId of the recording doctor / therapist
+  clinicianRole String      // DOCTOR | THERAPIST | ADMIN_DOCTOR
+  items         Json        // Array<{ category: RetentionCategory, status: RetentionStatus, notes?: string }>
+  branchId      String?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  appointment   Appointment @relation(fields: [appointmentId], references: [id])
+  patient       Patient     @relation(fields: [patientId], references: [id])
+
+  @@index([patientId])
+  @@index([appointmentId])
+  @@index([clinicianId])
+  @@index([branchId])
+  @@index([clinicianId, createdAt])  // Leaderboard: active follow-up days per clinician
+}
+
+// ── Appointment Feedback (CSAT) ───────────────────────────────────────────────
+// Submitted once by the patient after an appointment is COMPLETED.
+// Clinicians and admins can view aggregated ratings.
+
+model AppointmentFeedback {
+  id            String      @id @default(uuid())
+  appointmentId String      @unique
+  patientId     String
+  rating        Int         // 1–5
+  comment       String?
+  branchId      String?
+  createdAt     DateTime    @default(now())
+  appointment   Appointment @relation(fields: [appointmentId], references: [id])
+  patient       Patient     @relation(fields: [patientId], references: [id])
+
+  @@index([patientId])
+  @@index([appointmentId])
+  @@index([branchId])
 }

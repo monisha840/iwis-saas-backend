@@ -1,4 +1,5 @@
 import prisma from '../lib/prisma.js';
+import logger from '../lib/logger.js';
 
 class InventoryService {
     /**
@@ -32,7 +33,7 @@ class InventoryService {
                 price: medicine.price
             };
         } catch (error) {
-            console.error('Error checking stock:', error);
+            logger.error('Error checking stock:', error);
             throw error;
         }
     }
@@ -87,7 +88,7 @@ class InventoryService {
                             const { notificationService } = await import('./notification.service.js');
                             await notificationService.sendLowStockAlert(medicine.name, updatedStock.quantity);
                         } catch (notifyErr) {
-                            console.warn('Failed to send low stock alert:', notifyErr.message);
+                            logger.warn('Failed to send low stock alert:', notifyErr.message);
                         }
                     }
                 }

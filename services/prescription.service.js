@@ -1,4 +1,5 @@
 import prisma from '../lib/prisma.js';
+import logger from '../lib/logger.js';
 import { inventoryService } from './inventory.service.js';
 
 const includeDetails = {
@@ -10,14 +11,23 @@ export class PrescriptionService {
     static async getPatientPrescriptions(patientId, user) {
         let allowed = false;
 
-        if (user.role === 'PATIENT' && user.patient?.id === patientId) allowed = true;
+        if (user.role === 'PATIENT') {
+            const patientRecord = await prisma.patient.findUnique({ where: { userId: user.id }, select: { id: true } });
+            if (patientRecord?.id === patientId) allowed = true;
+        }
         if (user.role === 'DOCTOR') {
-            const appointment = await prisma.appointment.findFirst({ where: { patientId, doctorId: user.doctor.id } });
-            if (appointment) allowed = true;
+            const doctor = await prisma.doctor.findUnique({ where: { userId: user.id }, select: { id: true } });
+            if (doctor) {
+                const appointment = await prisma.appointment.findFirst({ where: { patientId, doctorId: doctor.id } });
+                if (appointment) allowed = true;
+            }
         }
         if (user.role === 'THERAPIST') {
-            const appointment = await prisma.appointment.findFirst({ where: { patientId, therapistId: user.therapist.id } });
-            if (appointment) allowed = true;
+            const therapist = await prisma.therapist.findUnique({ where: { userId: user.id }, select: { id: true } });
+            if (therapist) {
+                const appointment = await prisma.appointment.findFirst({ where: { patientId, therapistId: therapist.id } });
+                if (appointment) allowed = true;
+            }
         }
 
         if (!allowed && !['ADMIN', 'ADMIN_DOCTOR'].includes(user.role)) {
@@ -44,19 +54,28 @@ export class PrescriptionService {
 
         if (['ADMIN', 'ADMIN_DOCTOR'].includes(user.role)) {
             allowed = true;
-            if (user.role === 'ADMIN_DOCTOR' && user.doctor) doctorId = user.doctor.id;
+            if (user.role === 'ADMIN_DOCTOR') {
+                const doctor = await prisma.doctor.findUnique({ where: { userId: user.id }, select: { id: true } });
+                if (doctor) doctorId = doctor.id;
+            }
         }
 
         if (user.role === 'DOCTOR') {
-            doctorId = user.doctor.id;
-            const appointment = await prisma.appointment.findFirst({ where: { patientId, doctorId } });
-            if (appointment) allowed = true;
+            const doctor = await prisma.doctor.findUnique({ where: { userId: user.id }, select: { id: true } });
+            if (doctor) {
+                doctorId = doctor.id;
+                const appointment = await prisma.appointment.findFirst({ where: { patientId, doctorId } });
+                if (appointment) allowed = true;
+            }
         }
 
         if (user.role === 'THERAPIST') {
-            therapistId = user.therapist.id;
-            const appointment = await prisma.appointment.findFirst({ where: { patientId, therapistId } });
-            if (appointment) allowed = true;
+            const therapist = await prisma.therapist.findUnique({ where: { userId: user.id }, select: { id: true } });
+            if (therapist) {
+                therapistId = therapist.id;
+                const appointment = await prisma.appointment.findFirst({ where: { patientId, therapistId } });
+                if (appointment) allowed = true;
+            }
         }
 
         if (!allowed) {
@@ -96,7 +115,7 @@ export class PrescriptionService {
         try {
             stockStatus = await inventoryService.checkStockByMedicineName(medicationName);
         } catch (stockErr) {
-            console.warn('Real-time stock check failed:', stockErr);
+            logger.warn('Real-time stock check failed:', stockErr);
         }
 
         return {
@@ -111,19 +130,28 @@ export class PrescriptionService {
 
         if (['ADMIN', 'ADMIN_DOCTOR'].includes(user.role)) {
             allowed = true;
-            if (user.role === 'ADMIN_DOCTOR' && user.doctor) doctorId = user.doctor.id;
+            if (user.role === 'ADMIN_DOCTOR') {
+                const doctor = await prisma.doctor.findUnique({ where: { userId: user.id }, select: { id: true } });
+                if (doctor) doctorId = doctor.id;
+            }
         }
 
         if (user.role === 'DOCTOR') {
-            doctorId = user.doctor.id;
-            const appointment = await prisma.appointment.findFirst({ where: { patientId, doctorId } });
-            if (appointment) allowed = true;
+            const doctor = await prisma.doctor.findUnique({ where: { userId: user.id }, select: { id: true } });
+            if (doctor) {
+                doctorId = doctor.id;
+                const appointment = await prisma.appointment.findFirst({ where: { patientId, doctorId } });
+                if (appointment) allowed = true;
+            }
         }
 
         if (user.role === 'THERAPIST') {
-            therapistId = user.therapist.id;
-            const appointment = await prisma.appointment.findFirst({ where: { patientId, therapistId } });
-            if (appointment) allowed = true;
+            const therapist = await prisma.therapist.findUnique({ where: { userId: user.id }, select: { id: true } });
+            if (therapist) {
+                therapistId = therapist.id;
+                const appointment = await prisma.appointment.findFirst({ where: { patientId, therapistId } });
+                if (appointment) allowed = true;
+            }
         }
 
         if (!allowed) {
@@ -135,32 +163,33 @@ export class PrescriptionService {
         const patient = await prisma.patient.findUnique({ where: { id: patientId } });
         if (!patient) throw new Error('Patient not found');
 
-        const created = await Promise.all(medicines.map(med => {
-            // Include Ayush fields in notes for now if not in schema
-            const extendedNotes = [
-                med.notes,
-                med.timing ? `Timing: ${med.timing}` : null,
-                med.vehicle ? `Anupana (Vehicle): ${med.vehicle}` : null
-            ].filter(Boolean).join(' | ');
+        const created = await prisma.$transaction(async (tx) =>
+            Promise.all(medicines.map(med => {
+                const extendedNotes = [
+                    med.notes,
+                    med.timing ? `Timing: ${med.timing}` : null,
+                    med.vehicle ? `Anupana (Vehicle): ${med.vehicle}` : null
+                ].filter(Boolean).join(' | ');
 
-            return prisma.prescription.create({
-                data: {
-                    patientId,
-                    doctorId,
-                    therapistId,
-                    medicineId: med.medicineId,
-                    medicationName: med.medicationName,
-                    dosage: med.dosage,
-                    frequency: med.frequency,
-                    duration: med.duration,
-                    notes: extendedNotes,
-                    videoUrl: med.videoUrl,
-                    sku: med.sku,
-                    branchId: patient.branchId,
-                    lowStockThreshold: med.lowStockThreshold || 5,
-                }
-            });
-        }));
+                return tx.prescription.create({
+                    data: {
+                        patientId,
+                        doctorId,
+                        therapistId,
+                        medicineId: med.medicineId,
+                        medicationName: med.medicationName,
+                        dosage: med.dosage,
+                        frequency: med.frequency,
+                        duration: med.duration,
+                        notes: extendedNotes,
+                        videoUrl: med.videoUrl,
+                        sku: med.sku,
+                        branchId: patient.branchId,
+                        lowStockThreshold: med.lowStockThreshold || 5,
+                    }
+                });
+            }))
+        );
 
         return created;
     }

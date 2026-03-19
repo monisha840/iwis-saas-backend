@@ -270,7 +270,7 @@ class AnalyticsService {
                 const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
                 const todayEnd = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
 
-                const [todaySittings, completedSittings, activePatients] = await Promise.all([
+                const [todaySittings, completedSittings, activePatients, cancelledSittings, totalSittings] = await Promise.all([
                     prisma.appointment.count({
                         where: {
                             therapistId: therapist.id,
@@ -289,15 +289,30 @@ class AnalyticsService {
                             therapistId: therapist.id,
                             status: { not: 'COMPLETED' }
                         }
-                    })
+                    }),
+                    prisma.appointment.count({
+                        where: {
+                            therapistId: therapist.id,
+                            status: 'CANCELLED'
+                        }
+                    }),
+                    prisma.appointment.count({
+                        where: { therapistId: therapist.id }
+                    }),
                 ]);
 
                 stats.todaySittings = todaySittings;
                 stats.completedSittings = completedSittings;
                 stats.activeCases = activePatients.length;
                 stats.hoursWorked = (completedSittings * 0.75).toFixed(1);
-                stats.recoveryProgress = 75; // Logic placeholder
-                stats.sessionAdherence = 92; // Logic placeholder
+                // % of all sessions ever scheduled that have been completed
+                stats.recoveryProgress = totalSittings > 0
+                    ? Math.round((completedSittings / totalSittings) * 100)
+                    : 0;
+                // % of non-pending sessions that were not cancelled (adherence)
+                stats.sessionAdherence = (completedSittings + cancelledSittings) > 0
+                    ? Math.round((completedSittings / (completedSittings + cancelledSittings)) * 100)
+                    : 0;
             }
         }
 
@@ -542,6 +557,52 @@ class AnalyticsService {
             totalTaken,
             trendData
         };
+    }
+
+    /**
+     * Get per-branch summary statistics for comparison.
+     * Accessible by ADMIN and ADMIN_DOCTOR.
+     */
+    async getBranchSummary() {
+        const branches = await prisma.branch.findMany({
+            where: { isActive: true },
+            include: {
+                appointments: {
+                    select: { id: true, status: true },
+                },
+                patients: {
+                    select: { id: true },
+                },
+                users: {
+                    select: { id: true, role: true },
+                },
+            },
+        });
+
+        return branches.map((branch) => {
+            const totalAppointments = branch.appointments.length;
+            const completedAppointments = branch.appointments.filter(
+                (a) => a.status === 'COMPLETED'
+            ).length;
+            const cancelledAppointments = branch.appointments.filter(
+                (a) => a.status === 'CANCELLED'
+            ).length;
+
+            return {
+                branchId: branch.id,
+                branchName: branch.name,
+                address: branch.address,
+                totalPatients: branch.patients.length,
+                totalAppointments,
+                completedAppointments,
+                cancelledAppointments,
+                completionRate: totalAppointments > 0
+                    ? Math.round((completedAppointments / totalAppointments) * 100)
+                    : 0,
+                totalDoctors: branch.users.filter((u) => u.role === 'DOCTOR' || u.role === 'ADMIN_DOCTOR').length,
+                totalTherapists: branch.users.filter((u) => u.role === 'THERAPIST').length,
+            };
+        });
     }
 }
 

@@ -4,6 +4,7 @@ import multer from 'multer';
 import { PrescriptionService } from '../services/prescription.service.js';
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
+import { auditAction } from '../middleware/auditLog.js';
 
 const router = express.Router();
 
@@ -53,7 +54,7 @@ const batchPrescriptionSchema = z.object({
   })),
 });
 
-router.post('/batch-add', authMiddleware, roleMiddleware(['DOCTOR', 'THERAPIST', 'ADMIN', 'ADMIN_DOCTOR']), validate({ body: batchPrescriptionSchema }), async (req, res, next) => {
+router.post('/batch-add', authMiddleware, roleMiddleware(['DOCTOR', 'THERAPIST', 'ADMIN', 'ADMIN_DOCTOR']), validate({ body: batchPrescriptionSchema }), auditAction('CREATE_PRESCRIPTION', 'Prescription', () => null), async (req, res, next) => {
   try {
     const prescriptions = await PrescriptionService.createBatchPrescriptions(req.user, req.body.patientId, req.body.medicines);
     res.status(201).json(prescriptions);
@@ -62,7 +63,7 @@ router.post('/batch-add', authMiddleware, roleMiddleware(['DOCTOR', 'THERAPIST',
   }
 });
 
-router.post('/add', authMiddleware, roleMiddleware(['DOCTOR', 'THERAPIST', 'ADMIN', 'ADMIN_DOCTOR']), upload.single('file'), validate({ body: addPrescriptionSchema }), async (req, res, next) => {
+router.post('/add', authMiddleware, roleMiddleware(['DOCTOR', 'THERAPIST', 'ADMIN', 'ADMIN_DOCTOR']), upload.single('file'), validate({ body: addPrescriptionSchema }), auditAction('CREATE_PRESCRIPTION', 'Prescription', () => null), async (req, res, next) => {
   try {
     const prescription = await PrescriptionService.addPrescription(req.user, req.body, req.file?.filename);
     res.status(201).json(prescription);

@@ -1,26 +1,45 @@
 import prisma from '../lib/prisma.js';
 import { cacheService } from './cache.service.js';
+import { Prisma } from '@prisma/client';
+import logger from '../lib/logger.js';
 
 const BRANCHES_CACHE_KEY = 'branches:all';
 
 export class BranchService {
     static async createBranch(adminId, data) {
-        return prisma.$transaction(async (tx) => {
-            const branch = await tx.branch.create({ data });
+        try {
+            return await prisma.$transaction(async (tx) => {
+                const branch = await tx.branch.create({ data });
 
-            await tx.auditLog.create({
-                data: {
-                    userId: adminId,
-                    action: 'CREATE',
-                    entityType: 'BRANCH',
-                    entityId: branch.id,
-                    newData: branch
-                }
+                await tx.auditLog.create({
+                    data: {
+                        userId: adminId,
+                        action: 'CREATE',
+                        entityType: 'BRANCH',
+                        entityId: branch.id,
+                        newData: branch
+                    }
+                });
+
+                await cacheService.del(BRANCHES_CACHE_KEY);
+                return branch;
             });
-
-            await cacheService.del(BRANCHES_CACHE_KEY);
-            return branch;
-        });
+        } catch (err) {
+            // Log exact failure reason before re-throwing so it appears in structured logs
+            if (err instanceof Prisma.PrismaClientKnownRequestError) {
+                if (err.code === 'P2002') {
+                    const field = err.meta?.target?.[0] ?? 'field';
+                    logger.warn('[BranchService.createBranch] Duplicate key', { field, adminId, data });
+                    const friendly = new Error(`A branch with that ${field} already exists.`);
+                    friendly.status = 409;
+                    throw friendly;
+                }
+                logger.error('[BranchService.createBranch] Prisma error', err, { code: err.code, meta: err.meta, adminId });
+            } else {
+                logger.error('[BranchService.createBranch] Unexpected error', err, { adminId });
+            }
+            throw err;
+        }
     }
 
     static async getBranches() {

@@ -19,22 +19,67 @@ export class PharmacyService {
     }
 
     static async addMedicine(data) {
-        return prisma.medicine.create({
-            data: {
-                ...data,
-                price: parseFloat(data.price)
+        const { sku, name, stock, branchId, ...rest } = data;
+
+        // Duplicate SKU check
+        if (sku) {
+            const existing = await prisma.medicine.findUnique({ where: { sku } });
+            if (existing) {
+                const error = new Error(`Medicine with SKU ${sku} already exists`);
+                error.status = 409;
+                throw error;
             }
-        });
+        }
+
+        try {
+            return await prisma.$transaction(async (tx) => {
+                const medicine = await tx.medicine.create({
+                    data: {
+                        ...rest,
+                        sku,
+                        name,
+                        price: parseFloat(data.price)
+                    }
+                });
+
+                // Create initial stock record if provided
+                if (stock !== undefined) {
+                    await tx.medicineStock.create({
+                        data: {
+                            medicineId: medicine.id,
+                            batchNumber: `INIT-${Date.now()}`,
+                            expiryDate: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000), // Default 1 year
+                            quantity: parseInt(stock),
+                            minStock: 10,
+                            branchId: branchId || null
+                        }
+                    });
+                }
+
+                logger.audit('ADD_MEDICINE', 'SYSTEM', medicine.id, { sku, name });
+                return medicine;
+            });
+        } catch (error) {
+            logger.error('Failed to add medicine:', error);
+            if (error.status) throw error;
+            throw new Error(`Failed to create medicine: ${error.message}`);
+        }
     }
 
     static async updateMedicine(id, data) {
-        return prisma.medicine.update({
-            where: { id },
-            data: {
-                ...data,
-                price: data.price ? parseFloat(data.price) : undefined
-            }
-        });
+        const { price, ...rest } = data;
+        try {
+            return await prisma.medicine.update({
+                where: { id },
+                data: {
+                    ...rest,
+                    price: price ? parseFloat(price) : undefined
+                }
+            });
+        } catch (error) {
+            logger.error('Failed to update medicine:', error);
+            throw error;
+        }
     }
 
     static async addStock(data) {

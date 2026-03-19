@@ -1,4 +1,5 @@
 import nodemailer from 'nodemailer';
+import logger from '../lib/logger.js';
 
 /**
  * Email service using Nodemailer
@@ -32,10 +33,10 @@ class EmailService {
       };
 
       const info = await this.transporter.sendMail(mailOptions);
-      console.log('[EmailService] Email sent:', info.messageId);
+      logger.info('[EmailService] Email sent:', info.messageId);
       return info;
     } catch (error) {
-      console.error('[EmailService] Error sending email:', error);
+      logger.error('[EmailService] Error sending email:', error);
       throw error;
     }
   }
@@ -151,10 +152,10 @@ class EmailService {
   async verify() {
     try {
       await this.transporter.verify();
-      console.log('[EmailService] SMTP connection verified');
+      logger.info('[EmailService] SMTP connection verified');
       return true;
     } catch (error) {
-      console.error('[EmailService] SMTP verification failed:', error);
+      logger.error('[EmailService] SMTP verification failed:', error);
       return false;
     }
   }

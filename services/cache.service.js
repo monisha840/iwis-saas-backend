@@ -102,6 +102,30 @@ class CacheService {
             return false;
         }
     }
+
+    /**
+     * Delete all keys matching a glob pattern (e.g. 'leaderboard:*').
+     * Uses SCAN to avoid blocking Redis with KEYS on large datasets.
+     */
+    async invalidatePattern(pattern) {
+        if (!this._available) return false;
+        try {
+            await this.connect();
+            if (!this._available) return false;
+            let cursor = 0;
+            do {
+                const reply = await this.client.scan(cursor, { MATCH: pattern, COUNT: 100 });
+                cursor = reply.cursor;
+                if (reply.keys.length > 0) {
+                    await this.client.del(reply.keys);
+                }
+            } while (cursor !== 0);
+            return true;
+        } catch (err) {
+            logger.error(`Cache invalidatePattern Error [${pattern}]`, err);
+            return false;
+        }
+    }
 }
 
 export const cacheService = new CacheService();

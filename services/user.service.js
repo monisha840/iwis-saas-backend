@@ -1,23 +1,38 @@
 import prisma from '../lib/prisma.js';
 import bcrypt from 'bcrypt';
+import logger from '../lib/logger.js';
 
 
 export class UserService {
-    static async listTherapists() {
-        const therapists = await prisma.therapist.findMany({
-            where: { user: { deletedAt: null } },
-            include: { user: true }
-        });
-        return therapists.map((ther) => ({
-            id: ther.id,
-            fullName: ther.fullName,
-            specialization: ther.specialization,
-            profilePhoto: ther.profilePhoto,
-            yearsExperience: ther.yearsExperience,
-            qualification: ther.qualification,
-            clinic: ther.clinic,
-            email: ther.user?.email,
-        }));
+    static async listTherapists({ search = '', branchId = null } = {}) {
+        try {
+            // Build root-level AND conditions so that the OR search clause does not
+            // inadvertently bypass the deletedAt / branchId guards.
+            const conditions = [{ user: { deletedAt: null } }];
+            if (branchId) conditions.push({ user: { branchId } });
+            if (search)   conditions.push({ fullName: { contains: search, mode: 'insensitive' } });
+            const where = conditions.length === 1 ? conditions[0] : { AND: conditions };
+
+            const therapists = await prisma.therapist.findMany({
+                where,
+                include: { user: { include: { branch: true } } }
+            });
+            return therapists.map((ther) => ({
+                id: ther.id,
+                fullName: ther.fullName,
+                specialization: ther.specialization,
+                profilePhoto: ther.profilePhoto,
+                yearsExperience: ther.yearsExperience,
+                qualification: ther.qualification,
+                clinic: ther.clinic,
+                email: ther.user?.email,
+                branchId: ther.user?.branchId,
+                branchName: ther.user?.branch?.name,
+            }));
+        } catch (err) {
+            logger.error('[UserService.listTherapists]', err);
+            throw err;
+        }
     }
 
     static async getClinicalGamification() {
@@ -76,63 +91,101 @@ export class UserService {
         return stats.sort((a, b) => b.excellenceScore - a.excellenceScore || b.appointmentCount - a.appointmentCount);
     }
 
-    static async listDoctors(branchId = null) {
-        const where = { user: { deletedAt: null } };
-        if (branchId) {
-            where.user.branchId = branchId;
-        }
+    static async listDoctors(options = null) {
+        // Supports legacy positional call listDoctors(branchId) and new object form listDoctors({ branchId, search })
+        const branchId = typeof options === 'string' ? options : (options?.branchId ?? null);
+        const search   = typeof options === 'string' ? ''      : (options?.search   ?? '');
 
-        const doctors = await prisma.doctor.findMany({
-            where,
-            include: { user: { include: { branch: true } }, _count: { select: { appointments: true } } }
-        });
-        return doctors.map((doc) => ({
-            id: doc.id,
-            fullName: doc.fullName,
-            specialization: doc.specialization,
-            profilePhoto: doc.profilePhoto,
-            yearsExperience: doc.yearsExperience,
-            qualification: doc.qualification,
-            clinic: doc.clinic,
-            email: doc.user?.email,
-            branchId: doc.user?.branchId,
-            branchName: doc.user?.branch?.name,
-            appointmentCount: doc._count?.appointments || 0,
-        }));
+        try {
+            // Build root-level AND conditions so each filter is composed cleanly
+            const conditions = [{ user: { deletedAt: null } }];
+            if (branchId) conditions.push({ user: { branchId } });
+            if (search)   conditions.push({ fullName: { contains: search, mode: 'insensitive' } });
+            const where = conditions.length === 1 ? conditions[0] : { AND: conditions };
+
+            const doctors = await prisma.doctor.findMany({
+                where,
+                include: { user: { include: { branch: true } }, _count: { select: { appointments: true } } }
+            });
+            return doctors.map((doc) => ({
+                id: doc.id,
+                fullName: doc.fullName,
+                specialization: doc.specialization,
+                profilePhoto: doc.profilePhoto,
+                yearsExperience: doc.yearsExperience,
+                qualification: doc.qualification,
+                clinic: doc.clinic,
+                email: doc.user?.email,
+                branchId: doc.user?.branchId,
+                branchName: doc.user?.branch?.name,
+                appointmentCount: doc._count?.appointments || 0,
+            }));
+        } catch (err) {
+            logger.error('[UserService.listDoctors]', err);
+            throw err;
+        }
     }
 
     static async listPharmacists() {
-        const pharmacists = await prisma.pharmacist.findMany({
-            where: { user: { deletedAt: null } },
-            include: { user: true }
-        });
-        return pharmacists.map((pharma) => ({
-            id: pharma.id,
-            userId: pharma.userId,
-            fullName: pharma.fullName,
-            profilePhoto: pharma.profilePhoto,
-            yearsExperience: pharma.yearsExperience,
-            qualification: pharma.qualification,
-            email: pharma.user?.email,
-        }));
+        try {
+            const pharmacists = await prisma.pharmacist.findMany({
+                where: { user: { deletedAt: null } },
+                include: { user: true }
+            });
+            return pharmacists.map((pharma) => ({
+                id: pharma.id,
+                userId: pharma.userId,
+                fullName: pharma.fullName,
+                profilePhoto: pharma.profilePhoto,
+                yearsExperience: pharma.yearsExperience,
+                qualification: pharma.qualification,
+                email: pharma.user?.email,
+            }));
+        } catch (err) {
+            logger.error('[UserService.listPharmacists]', err);
+            throw err;
+        }
     }
 
-    static async listPatients() {
-        const patients = await prisma.patient.findMany({
-            where: { user: { deletedAt: null } },
-            include: { user: true, branch: true }
-        });
-        return patients.map((pat) => ({
-            id: pat.id,
-            fullName: pat.fullName,
-            dob: pat.dob,
-            age: pat.age,
-            gender: pat.gender,
-            phoneNumber: pat.phoneNumber,
-            patientId: pat.patientId,
-            therapyType: pat.therapyType,
-            email: pat.user?.email,
-        }));
+    static async listPatients({ search = '', branchId = null } = {}) {
+        try {
+            // Use explicit AND so that the OR search clause is scoped correctly alongside
+            // the user.deletedAt filter and the optional branchId filter. Without explicit
+            // AND, a root-level OR could shadow the sibling filter keys in some Prisma versions.
+            const conditions = [{ user: { deletedAt: null } }];
+            if (branchId) conditions.push({ branchId });
+            if (search) {
+                conditions.push({
+                    OR: [
+                        { fullName:    { contains: search, mode: 'insensitive' } },
+                        { patientId:   { contains: search, mode: 'insensitive' } },
+                        { phoneNumber: { contains: search, mode: 'insensitive' } },
+                    ],
+                });
+            }
+            const where = conditions.length === 1 ? conditions[0] : { AND: conditions };
+
+            const patients = await prisma.patient.findMany({
+                where,
+                include: { user: true, branch: true }
+            });
+            return patients.map((pat) => ({
+                id: pat.id,
+                fullName: pat.fullName,
+                dob: pat.dob,
+                age: pat.age,
+                gender: pat.gender,
+                phoneNumber: pat.phoneNumber,
+                patientId: pat.patientId,
+                therapyType: pat.therapyType,
+                email: pat.user?.email,
+                branchId: pat.branchId,
+                branchName: pat.branch?.name,
+            }));
+        } catch (err) {
+            logger.error('[UserService.listPatients]', err);
+            throw err;
+        }
     }
 
     static async getCurrentUser(userId) {

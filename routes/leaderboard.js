@@ -21,11 +21,23 @@ const updateConfigSchema = z.object({
 
 /**
  * GET /api/leaderboard
- * Fetch the current leaderboard rankings
+ * Fetch the current leaderboard rankings.
+ *
+ * Access rules:
+ *   ADMIN / ADMIN_DOCTOR  — may pass ?branchId=<id> to filter; omit for global view
+ *   DOCTOR / THERAPIST    — always scoped to their assigned branch (req.user.branchId);
+ *                           any ?branchId query param is silently ignored to prevent
+ *                           cross-branch data access via parameter manipulation.
  */
-router.get('/', authMiddleware, async (req, res, next) => {
+router.get('/', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST']), async (req, res, next) => {
     try {
-        const { branchId } = req.query;
+        const isClinician = ['DOCTOR', 'THERAPIST'].includes(req.user.role);
+
+        // For clinicians the branch is authoritative from the JWT — never from the query string.
+        const branchId = isClinician
+            ? (req.user.branchId || null)
+            : (req.query.branchId || null);
+
         const leaderboard = await LeaderboardService.getLeaderboard(branchId);
         res.json(leaderboard);
     } catch (err) {

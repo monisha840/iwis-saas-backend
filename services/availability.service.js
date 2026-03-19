@@ -1,4 +1,5 @@
 import prisma from '../lib/prisma.js';
+import logger from '../lib/logger.js';
 const DEFAULT_SLOT_INTERVAL = 30;
 const CLINICAL_DAY_START = 9;
 const CLINICAL_DAY_END = 18;
@@ -50,8 +51,9 @@ export class AvailabilityService {
         });
 
         for (const apt of conflictingAppointments) {
-            const aptStart = apt.date.toTimeString().slice(0, 5);
-            const aptEnd = new Date(apt.date.getTime() + 60 * 60 * 1000).toTimeString().slice(0, 5);
+            // Use UTC time so comparison is consistent with slot labels stored/generated in UTC.
+            const aptStart = apt.date.toISOString().slice(11, 16);
+            const aptEnd = new Date(apt.date.getTime() + 60 * 60 * 1000).toISOString().slice(11, 16);
 
             if (dayOfWeek !== undefined && apt.date.getDay() !== parseInt(dayOfWeek)) continue;
 
@@ -146,7 +148,7 @@ export class AvailabilityService {
             if (matchesDay) {
                 // Overlap if (newStart < existingEnd) AND (newEnd > existingStart)
                 if (startTime < block.endTime && endTime > block.startTime) {
-                    console.log(`[Availability Conflict] User: ${doctorId || therapistId} | Input: ${startTime}-${endTime} | Conflict: ${block.startTime}-${block.endTime} (${block.reason || 'No reason'})`);
+                    logger.info(`[Availability Conflict] User: ${doctorId || therapistId} | Input: ${startTime}-${endTime} | Conflict: ${block.startTime}-${block.endTime} (${block.reason || 'No reason'})`);
                     throw new Error(`Time slot overlaps with an existing blocked slot (${block.reason || 'Leave/Blocked'})`);
                 }
             }
@@ -284,10 +286,12 @@ export class AvailabilityService {
                 continue;
             }
 
-            // Check if booked by appointment
+            // Check if booked by appointment.
+            // Use .toISOString() (UTC) not .toTimeString() (server local) so slot labels
+            // always line up with the UTC-based working-hours grid (09:00–18:00 UTC).
             const appointment = appointments.find(a => {
-                const start = a.date.toTimeString().slice(0, 5);
-                const end = new Date(a.date.getTime() + 60 * 60 * 1000).toTimeString().slice(0, 5); // Default 1hr
+                const start = a.date.toISOString().slice(11, 16);
+                const end = new Date(a.date.getTime() + 60 * 60 * 1000).toISOString().slice(11, 16);
                 return slotStart < end && slotEnd > start;
             });
 
