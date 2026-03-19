@@ -1,0 +1,42 @@
+{
+  "name": "al-shifa-aayush-backend",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "nodemon index.js",
+    "start": "node index.js",
+    "prisma": "prisma"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.22.0",
+    "archiver": "^7.0.1",
+    "bcrypt": "^5.1.0",
+    "bull": "^4.16.5",
+    "cors": "^2.8.5",
+    "csv-parser": "^3.2.0",
+    "csv-writer": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "express-rate-limit": "^8.2.1",
+    "helmet": "^8.1.0",
+    "i18next": "^25.8.4",
+    "i18next-http-middleware": "^3.9.2",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.0",
+    "multer": "^2.0.2",
+    "node-cron": "^4.2.1",
+    "nodemailer": "^8.0.0",
+    "pdfkit": "^0.17.2",
+    "redis": "^5.10.0",
+    "socket.io": "^4.8.3",
+    "twilio": "^5.12.1",
+    "web-push": "^3.6.7",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "cross-env": "^10.1.0",
+    "nodemon": "^3.0.3",
+    "prisma": "^5.10.2"
+  }
+}
