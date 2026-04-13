@@ -57,9 +57,9 @@ const config = {
 
   rateLimit: {
     windowMs: 15 * 60 * 1000,
-    // Production: 300/15min (reasonable for a multi-page clinical app with many concurrent calls).
-    // Development: 2000/15min so hot-reloads and testing never hit the limiter.
-    max: parseInt(process.env.RATE_LIMIT_MAX || (isProduction ? '300' : '2000'), 10),
+    // Production: 600/15min — multi-page clinical apps with parallel fetches + search
+    // need headroom. Development: 2000/15min so hot-reloads and testing never hit the limiter.
+    max: parseInt(process.env.RATE_LIMIT_MAX || (isProduction ? '600' : '2000'), 10),
     authWindowMs: 60 * 60 * 1000,
     // Production: strict 10/hour. Development: 200/hour.
     authMax: parseInt(process.env.RATE_LIMIT_AUTH_MAX || (isProduction ? '10' : '200'), 10),

@@ -153,7 +153,7 @@ export class UserService {
             // the user.deletedAt filter and the optional branchId filter. Without explicit
             // AND, a root-level OR could shadow the sibling filter keys in some Prisma versions.
             const conditions = [{ user: { deletedAt: null } }];
-            if (branchId) conditions.push({ branchId });
+            if (branchId) conditions.push({ OR: [{ branchId }, { branchId: null }] });
             if (search) {
                 conditions.push({
                     OR: [

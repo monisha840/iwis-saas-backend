@@ -161,7 +161,7 @@ initializeWebSocket(httpServer);
 schedulerService.init();
 
 // Seed default feature flags (idempotent — safe to run every startup)
-FeatureFlagService.seedDefaults().catch(err => logger.error('Feature flag seed failed', { err }));
+FeatureFlagService.seedDefaults().catch(err => logger.error('Feature flag seed failed', err));
 
 httpServer.listen(PORT, () => {
   logger.info(`Backend server running on port ${PORT}`, { env: process.env.NODE_ENV });
