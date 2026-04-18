@@ -38,8 +38,17 @@ router.get('/', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR
             ? (req.user.branchId || null)
             : (req.query.branchId || null);
 
-        const leaderboard = await LeaderboardService.getLeaderboard(branchId);
-        res.json(leaderboard);
+        const allEntries = await LeaderboardService.getLeaderboard(branchId);
+
+        // Support optional pagination via page/limit query params
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 20;
+        const total = allEntries.length;
+        const totalPages = Math.ceil(total / limit);
+        const start = (page - 1) * limit;
+        const data = allEntries.slice(start, start + limit);
+
+        res.json({ data, total, page, limit, totalPages });
     } catch (err) {
         next(err);
     }

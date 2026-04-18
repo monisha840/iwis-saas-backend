@@ -12,6 +12,7 @@
 import { ZodError } from 'zod';
 import { Prisma } from '@prisma/client';
 import logger from '../lib/logger.js';
+import { Sentry } from '../lib/sentry.js';
 
 // eslint-disable-next-line no-unused-vars
 export function errorHandler(err, req, res, next) {
@@ -59,6 +60,7 @@ export function errorHandler(err, req, res, next) {
 
   // Log server errors with full stack, client errors briefly
   if (status >= 500) {
+    Sentry.captureException(err);
     logger.error(`[errorHandler] ${req.method} ${req.url} → ${status}`, err, {
       userId: req.user?.id,
       role: req.user?.role,

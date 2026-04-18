@@ -271,18 +271,34 @@ export class PharmacyService {
         return updatedOrder;
     }
 
-    static async getDispenseHistory(branchId) {
+    static async getDispenseHistory(branchId, { page = 1, limit = 20 } = {}) {
         const where = branchId ? { branchId } : {};
-        return prisma.pharmacyDispense.findMany({
-            where,
-            include: {
-                patient: { select: { fullName: true } },
-                dispenser: { select: { email: true } },
-                items: {
-                    include: { medicine: { select: { name: true } } }
-                }
-            },
-            orderBy: { createdAt: 'desc' }
-        });
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+        const take = parseInt(limit);
+
+        const [dispenses, total] = await Promise.all([
+            prisma.pharmacyDispense.findMany({
+                where,
+                include: {
+                    patient: { select: { fullName: true } },
+                    dispenser: { select: { email: true } },
+                    items: {
+                        include: { medicine: { select: { name: true } } }
+                    }
+                },
+                orderBy: { createdAt: 'desc' },
+                skip,
+                take
+            }),
+            prisma.pharmacyDispense.count({ where })
+        ]);
+
+        return {
+            data: dispenses,
+            total,
+            page: parseInt(page),
+            limit: take,
+            totalPages: Math.ceil(total / take)
+        };
     }
 }

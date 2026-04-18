@@ -67,7 +67,242 @@ class SchedulerService {
             })
         );
 
+        // No-show detection — every 15 minutes
+        this.jobs.push(
+            cron.schedule('*/15 * * * *', () => {
+                this.detectNoShows();
+            })
+        );
+
+        // Post-appointment CSAT survey — every 15 minutes
+        this.jobs.push(
+            cron.schedule('*/15 * * * *', () => {
+                this.sendCSATSurveys();
+            })
+        );
+
+        // Advanced care gap detection — daily at 7am
+        this.jobs.push(
+            cron.schedule('0 7 * * *', () => {
+                this.runCareGapDetection();
+            })
+        );
+
+        // ── Gamification jobs ─────────────────────────────────────────────────
+
+        // Daily leaderboard recalculation + badge checking — runs at 2am
+        this.jobs.push(
+            cron.schedule('0 2 * * *', () => {
+                this.runGamificationRecalculation();
+            })
+        );
+
+        // Clinician streak updates — runs at 11:55pm daily
+        this.jobs.push(
+            cron.schedule('55 23 * * *', () => {
+                this.updateClinicianStreaks();
+            })
+        );
+
+        // Branch competition recalculation — runs daily at 3am
+        this.jobs.push(
+            cron.schedule('0 3 * * *', () => {
+                this.recalculateBranchCompetitions();
+            })
+        );
+
+        // Weekly gamification digest — runs every Monday at 9am
+        this.jobs.push(
+            cron.schedule('0 9 * * 1', () => {
+                this.sendWeeklyGamificationDigest();
+            })
+        );
+
+        // Streak-at-risk notifications — runs daily at 8pm
+        this.jobs.push(
+            cron.schedule('0 20 * * *', () => {
+                this.sendStreakAtRiskNotifications();
+            })
+        );
+
+        // Seed badge definitions on startup
+        this.seedBadges();
+
         logger.info('[SchedulerService] All jobs scheduled');
+    }
+
+    /**
+     * Seed badge definitions (runs once on startup).
+     */
+    async seedBadges() {
+        try {
+            const { BadgeService } = await import('./badge.service.js');
+            await BadgeService.seedDefaults();
+        } catch (error) {
+            logger.error('[SchedulerService] Error seeding badges:', error);
+        }
+    }
+
+    /**
+     * Full gamification recalculation: scores → badges → adaptive targets.
+     * Runs daily at 2am.
+     */
+    async runGamificationRecalculation() {
+        try {
+            const { LeaderboardService } = await import('./leaderboard.service.js');
+            const { BadgeService } = await import('./badge.service.js');
+            const { AntiGamingService } = await import('./antiGaming.service.js');
+            const { AdaptiveTargetsService } = await import('./adaptiveTargets.service.js');
+
+            logger.info('[SchedulerService] Starting gamification recalculation...');
+
+            // Step 1: Recalculate all scores
+            const result = await LeaderboardService.recalculateAll();
+
+            // Step 2: Get the full leaderboard for rank-aware badge checking
+            const leaderboard = await LeaderboardService.getLeaderboard();
+
+            // Step 3: Check badges and anomalies for each participant
+            for (let i = 0; i < leaderboard.length; i++) {
+                const entry = leaderboard[i];
+                const rank = i + 1;
+
+                try {
+                    // Anti-gaming check
+                    await AntiGamingService.checkScoreAnomaly(entry.id, entry.role, entry.score);
+
+                    // Badge check
+                    await BadgeService.checkAndAwardBadges(entry.id, entry.role, entry.metrics, entry.score, rank);
+
+                    // Adaptive targets
+                    await AdaptiveTargetsService.recalculateTargets(entry.id, entry.role);
+                } catch (err) {
+                    logger.error(`[SchedulerService] Post-recalc failed for ${entry.id}:`, err.message);
+                }
+            }
+
+            logger.info(`[SchedulerService] Gamification recalculation complete: ${result.recalculated} scored`);
+        } catch (error) {
+            logger.error('[SchedulerService] Error in gamification recalculation:', error);
+        }
+    }
+
+    /**
+     * Update clinician streaks — runs at 11:55pm daily.
+     */
+    async updateClinicianStreaks() {
+        try {
+            const { StreakService } = await import('./streak.service.js');
+            const updated = await StreakService.updateAllClinicianStreaks();
+            logger.info(`[SchedulerService] Updated ${updated} clinician streaks`);
+        } catch (error) {
+            logger.error('[SchedulerService] Error updating clinician streaks:', error);
+        }
+    }
+
+    /**
+     * Recalculate branch competition scores.
+     */
+    async recalculateBranchCompetitions() {
+        try {
+            const { BranchCompetitionService } = await import('./branchCompetition.service.js');
+            const count = await BranchCompetitionService.recalculateActiveCompetitions();
+            logger.info(`[SchedulerService] Recalculated ${count} active branch competitions`);
+        } catch (error) {
+            logger.error('[SchedulerService] Error recalculating branch competitions:', error);
+        }
+    }
+
+    /**
+     * Send weekly gamification digest to all clinicians.
+     */
+    async sendWeeklyGamificationDigest() {
+        try {
+            const [doctors, therapists] = await Promise.all([
+                prisma.doctor.findMany({ include: { user: { select: { id: true } } } }),
+                prisma.therapist.findMany({ include: { user: { select: { id: true } } } })
+            ]);
+
+            const participants = [
+                ...doctors.map(d => ({ profileId: d.id, userId: d.user.id, name: d.fullName })),
+                ...therapists.map(t => ({ profileId: t.id, userId: t.user.id, name: t.fullName }))
+            ];
+
+            // Get latest leaderboard for rank info
+            const { LeaderboardService } = await import('./leaderboard.service.js');
+            const leaderboard = await LeaderboardService.getLeaderboard();
+            const rankMap = {};
+            leaderboard.forEach((entry, i) => { rankMap[entry.id] = { rank: i + 1, score: entry.score, trend: entry.trend }; });
+
+            let sentCount = 0;
+            for (const p of participants) {
+                const info = rankMap[p.profileId];
+                if (!info) continue;
+
+                const trendEmoji = info.trend === 'up' ? '↑' : info.trend === 'down' ? '↓' : '→';
+                await notificationService.createNotification({
+                    userId: p.userId,
+                    type: 'GAMIFICATION_DIGEST',
+                    title: `Weekly Performance: Score ${info.score} ${trendEmoji}`,
+                    message: `You're ranked #${info.rank} out of ${leaderboard.length} clinicians this week. ${info.trend === 'up' ? 'Great progress!' : 'Keep pushing!'}`,
+                    priority: 'LOW',
+                    data: { score: info.score, rank: info.rank, trend: info.trend }
+                });
+                sentCount++;
+            }
+
+            logger.info(`[SchedulerService] Sent ${sentCount} weekly gamification digests`);
+        } catch (error) {
+            logger.error('[SchedulerService] Error sending gamification digests:', error);
+        }
+    }
+
+    /**
+     * Send streak-at-risk notifications to clinicians who haven't logged activity today.
+     */
+    async sendStreakAtRiskNotifications() {
+        try {
+            const activeStreaks = await prisma.clinicianStreak.findMany({
+                where: { currentStreak: { gte: 3 } } // Only warn for meaningful streaks
+            });
+
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+
+            let sentCount = 0;
+            for (const streak of activeStreaks) {
+                const lastActive = streak.lastActiveDate ? new Date(streak.lastActiveDate) : null;
+                if (!lastActive) continue;
+
+                const lastActiveStr = lastActive.toISOString().split('T')[0];
+                const todayStr = today.toISOString().split('T')[0];
+
+                // If they were NOT active today, warn them
+                if (lastActiveStr !== todayStr) {
+                    const user = streak.participantRole === 'DOCTOR'
+                        ? await prisma.doctor.findUnique({ where: { id: streak.participantId }, select: { userId: true } })
+                        : await prisma.therapist.findUnique({ where: { id: streak.participantId }, select: { userId: true } });
+
+                    if (user) {
+                        await notificationService.createNotification({
+                            userId: user.userId,
+                            type: 'STREAK_AT_RISK',
+                            title: `Your ${streak.currentStreak}-day streak is at risk!`,
+                            message: `You haven't logged any activity today. Complete an appointment, respond to a patient, or write a prescription to keep your streak alive.`,
+                            priority: 'MEDIUM',
+                            data: { currentStreak: streak.currentStreak }
+                        });
+                        sentCount++;
+                    }
+                }
+            }
+
+            if (sentCount > 0) {
+                logger.info(`[SchedulerService] Sent ${sentCount} streak-at-risk notifications`);
+            }
+        } catch (error) {
+            logger.error('[SchedulerService] Error sending streak-at-risk notifications:', error);
+        }
     }
 
     /**
@@ -367,6 +602,108 @@ class SchedulerService {
             logger.info(`[SchedulerService] Expiry alerts sent for ${count} prescriptions`);
         } catch (error) {
             logger.error('[SchedulerService] Error checking expiring prescriptions:', error);
+        }
+    }
+
+    /**
+     * No-show detection: 30 min after appointment start, if status still PENDING → mark as NO_SHOW.
+     */
+    async detectNoShows() {
+        try {
+            const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000);
+            const sixtyMinAgo = new Date(Date.now() - 60 * 60 * 1000);
+
+            const noShows = await prisma.appointment.findMany({
+                where: {
+                    date: { gte: sixtyMinAgo, lte: thirtyMinAgo },
+                    status: { in: ['PENDING', 'CONFIRMED', 'ACCEPTED'] },
+                },
+                include: { patient: { include: { user: true } } },
+            });
+
+            for (const appt of noShows) {
+                await prisma.appointment.update({
+                    where: { id: appt.id },
+                    data: { status: 'NO_SHOW' },
+                });
+
+                // Audit event
+                logger.audit('APPOINTMENT_NO_SHOW', null, appt.id, {
+                    patientId: appt.patientId,
+                    scheduledDate: appt.date,
+                });
+
+                // Notify patient
+                if (appt.patient?.userId) {
+                    await notificationService.createNotification({
+                        userId: appt.patient.userId,
+                        type: 'NO_SHOW',
+                        title: 'Missed Appointment',
+                        message: 'You missed your scheduled appointment. Please rebook at your earliest convenience.',
+                        priority: 'MEDIUM',
+                        data: { appointmentId: appt.id },
+                    });
+                }
+            }
+
+            if (noShows.length > 0) {
+                logger.info(`[SchedulerService] Marked ${noShows.length} appointments as NO_SHOW`);
+            }
+        } catch (error) {
+            logger.error('[SchedulerService] Error detecting no-shows:', error);
+        }
+    }
+
+    /**
+     * Post-appointment CSAT: send feedback request 2-3 hours after completed appointment.
+     */
+    async sendCSATSurveys() {
+        try {
+            const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+            const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);
+
+            const appointments = await prisma.appointment.findMany({
+                where: {
+                    status: 'COMPLETED',
+                    updatedAt: { gte: threeHoursAgo, lte: twoHoursAgo },
+                    feedback: null,
+                },
+                include: { patient: true, doctor: { include: { user: true } } }
+            });
+
+            for (const appt of appointments) {
+                if (!appt.patient?.userId) continue;
+
+                const doctorName = appt.doctor?.fullName || 'your doctor';
+                await notificationService.createNotification({
+                    userId: appt.patient.userId,
+                    type: 'FEEDBACK_REQUEST',
+                    title: 'How was your visit?',
+                    message: `Please rate your appointment with ${doctorName}`,
+                    actionUrl: `/appointments/${appt.id}/feedback`,
+                    priority: 'LOW',
+                    data: { appointmentId: appt.id },
+                });
+            }
+
+            if (appointments.length > 0) {
+                logger.info(`[SchedulerService] Sent ${appointments.length} CSAT survey requests`);
+            }
+        } catch (error) {
+            logger.error('[SchedulerService] Error sending CSAT surveys:', error);
+        }
+    }
+
+    /**
+     * Advanced care gap detection across 5 dimensions.
+     */
+    async runCareGapDetection() {
+        try {
+            const { CareGapService } = await import('./careGap.service.js');
+            const alerts = await CareGapService.detectAndNotify();
+            logger.info(`[SchedulerService] Care gap detection: ${alerts} alerts sent`);
+        } catch (error) {
+            logger.error('[SchedulerService] Error in care gap detection:', error);
         }
     }
 

@@ -1,6 +1,61 @@
 import prisma from '../lib/prisma.js';
 
 export class ChatService {
+    /**
+     * Verify that a patient has been assigned to a clinician via appointments or journeys.
+     * Only CONFIRMED/COMPLETED appointments or active journeys count as a valid assignment.
+     * ADMIN_DOCTOR bypasses this check — they can chat with any patient.
+     */
+    static async verifyAssignment(patientId, clinicianId, clinicianType) {
+        // ADMIN_DOCTORs can always chat with any patient
+        if (clinicianType === 'DOCTOR') {
+            const doctor = await prisma.doctor.findUnique({
+                where: { id: clinicianId },
+                include: { user: { select: { role: true } } }
+            });
+            if (doctor?.user?.role === 'ADMIN_DOCTOR') return true;
+        }
+
+        // Check appointments
+        const appointmentWhere = {
+            patientId,
+            status: { in: ['CONFIRMED', 'COMPLETED', 'ASSIGNED'] }
+        };
+        if (clinicianType === 'DOCTOR') appointmentWhere.doctorId = clinicianId;
+        else if (clinicianType === 'THERAPIST') appointmentWhere.therapistId = clinicianId;
+        // Pharmacists connect to patients via dispensing records
+        else if (clinicianType === 'PHARMACIST') {
+            const pharmacist = await prisma.pharmacist.findUnique({
+                where: { id: clinicianId },
+                select: { userId: true }
+            });
+            if (!pharmacist) return false;
+
+            const dispense = await prisma.pharmacyDispense.findFirst({
+                where: {
+                    patientId,
+                    dispensedBy: pharmacist.userId
+                }
+            });
+            return !!dispense;
+        }
+
+        const appointment = await prisma.appointment.findFirst({ where: appointmentWhere });
+        if (appointment) return true;
+
+        // Check journeys (ongoing treatment relationships)
+        if (clinicianType === 'DOCTOR' || clinicianType === 'THERAPIST') {
+            const journeyWhere = { patientId };
+            if (clinicianType === 'DOCTOR') journeyWhere.doctorId = clinicianId;
+            else journeyWhere.therapistId = clinicianId;
+
+            const journey = await prisma.journey.findFirst({ where: journeyWhere });
+            if (journey) return true;
+        }
+
+        return false;
+    }
+
     static async getOrCreateConversation(patientId, targetId, clinicianType = 'DOCTOR') {
         const whereMap = {
             'DOCTOR': { patientId_doctorId: { patientId, doctorId: targetId } },
@@ -13,6 +68,12 @@ export class ChatService {
         let conversation = await prisma.conversation.findUnique({ where });
 
         if (!conversation) {
+            // Verify the patient is actually assigned to this clinician before creating
+            const isAssigned = await this.verifyAssignment(patientId, targetId, clinicianType);
+            if (!isAssigned) {
+                throw new Error('Patient is not assigned to this clinician');
+            }
+
             const dataField = clinicianType === 'DOCTOR' ? 'doctorId' : (clinicianType === 'THERAPIST' ? 'therapistId' : 'pharmacistId');
             conversation = await prisma.conversation.create({
                 data: {
@@ -24,14 +85,47 @@ export class ChatService {
         return conversation;
     }
 
+    /**
+     * Verify the requesting user is a participant of the given conversation.
+     * Returns the conversation if authorized, throws otherwise.
+     */
+    static async verifyParticipant(conversationId, userId) {
+        const conversation = await prisma.conversation.findFirst({
+            where: {
+                id: conversationId,
+                OR: [
+                    { patient:    { userId } },
+                    { doctor:     { userId } },
+                    { therapist:  { userId } },
+                    { pharmacist: { userId } },
+                ]
+            }
+        });
+
+        if (!conversation) {
+            throw new Error('Unauthorized: You are not a participant of this conversation');
+        }
+
+        return conversation;
+    }
+
     static async listUserConversations(userId) {
         const user = await prisma.user.findUnique({
             where: { id: userId },
-            include: { doctor: true, patient: true, therapist: true }
+            include: { doctor: true, patient: true, therapist: true, pharmacist: true }
         });
 
+        if (!user) throw new Error('User not found');
+
         let where = {};
-        if (user.doctor) {
+
+        if (user.role === 'ADMIN_DOCTOR' && user.doctor) {
+            // ADMIN_DOCTOR sees all conversations (top of hierarchy)
+            where = {};
+        } else if (user.role === 'ADMIN') {
+            // ADMIN sees all conversations
+            where = {};
+        } else if (user.doctor) {
             where = { doctorId: user.doctor.id };
         } else if (user.therapist) {
             where = { therapistId: user.therapist.id };
@@ -40,15 +134,15 @@ export class ChatService {
         } else if (user.patient) {
             const patientId = user.patient.id;
 
-            // Auto-initialize conversations for patients
+            // Auto-initialize conversations only with assigned clinicians
             const adminDoctor = await prisma.doctor.findFirst({
                 where: { user: { role: 'ADMIN_DOCTOR' } }
             });
 
-            const recentAppointments = await prisma.appointment.findMany({
+            const assignedAppointments = await prisma.appointment.findMany({
                 where: {
                     patientId,
-                    status: { in: ['CONFIRMED', 'COMPLETED'] }
+                    status: { in: ['CONFIRMED', 'COMPLETED', 'ASSIGNED'] }
                 },
                 select: { doctorId: true, therapistId: true },
                 distinct: ['doctorId', 'therapistId']
@@ -59,16 +153,20 @@ export class ChatService {
 
             const targetTherapistIds = new Set();
 
-            recentAppointments.forEach(a => {
+            assignedAppointments.forEach(a => {
                 if (a.doctorId) targetDoctorIds.add(a.doctorId);
                 if (a.therapistId) targetTherapistIds.add(a.therapistId);
             });
 
             for (const dId of targetDoctorIds) {
-                await this.getOrCreateConversation(patientId, dId, 'DOCTOR');
+                try {
+                    await this.getOrCreateConversation(patientId, dId, 'DOCTOR');
+                } catch { /* assignment check may fail for removed assignments */ }
             }
             for (const tId of targetTherapistIds) {
-                await this.getOrCreateConversation(patientId, tId, 'THERAPIST');
+                try {
+                    await this.getOrCreateConversation(patientId, tId, 'THERAPIST');
+                } catch { /* assignment check may fail for removed assignments */ }
             }
 
             where = { patientId };
@@ -92,9 +190,17 @@ export class ChatService {
         });
     }
 
-    static async getMessages(conversationId) {
-        return prisma.message.findMany({
-            where: { conversationId },
+    static async getMessages(conversationId, userId, { cursor, limit = 50 } = {}) {
+        // Verify the requesting user is a participant before returning messages
+        await this.verifyParticipant(conversationId, userId);
+
+        const where = { conversationId };
+        if (cursor) {
+            where.createdAt = { lt: new Date(cursor) };
+        }
+
+        const messages = await prisma.message.findMany({
+            where,
             include: {
                 sender: {
                     select: {
@@ -107,19 +213,30 @@ export class ChatService {
                     }
                 }
             },
-            orderBy: { createdAt: 'asc' }
+            orderBy: { createdAt: 'desc' },
+            take: limit + 1, // fetch one extra to determine hasMore
         });
+
+        const hasMore = messages.length > limit;
+        if (hasMore) messages.pop();
+        messages.reverse(); // Return in chronological order
+
+        return {
+            messages,
+            hasMore,
+            nextCursor: hasMore ? messages[0]?.createdAt?.toISOString() : null,
+        };
     }
 
     static async initiateConversation(currentUserId, partnerUserId) {
         const [currentUser, partnerUser] = await Promise.all([
             prisma.user.findUnique({
                 where: { id: currentUserId },
-                include: { doctor: true, patient: true, therapist: true }
+                include: { doctor: true, patient: true, therapist: true, pharmacist: true }
             }),
             prisma.user.findUnique({
                 where: { id: partnerUserId },
-                include: { doctor: true, patient: true, therapist: true }
+                include: { doctor: true, patient: true, therapist: true, pharmacist: true }
             })
         ]);
 
@@ -139,6 +256,7 @@ export class ChatService {
             throw new Error('Only patients can chat with doctors/therapists/pharmacists and vice versa');
         }
 
+        // getOrCreateConversation will verify assignment before creating
         return this.getOrCreateConversation(patientId, targetId, clinicianType);
     }
 }

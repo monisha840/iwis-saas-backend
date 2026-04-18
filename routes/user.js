@@ -60,6 +60,7 @@ const updateDoctorSchema = z.object({
   qualification: z.string().optional(),
   yearsExperience: z.number().optional(),
   clinic: z.string().optional(),
+  branchId: z.string().optional(),
 });
 
 const updateTherapistSchema = z.object({
@@ -69,6 +70,7 @@ const updateTherapistSchema = z.object({
   qualification: z.string().optional(),
   yearsExperience: z.number().optional(),
   clinic: z.string().optional(),
+  branchId: z.string().optional(),
 });
 
 const updatePatientSchema = z.object({
@@ -79,6 +81,7 @@ const updatePatientSchema = z.object({
   gender: z.string().optional(),
   therapyType: z.string().optional(),
   patientId: z.string().optional(),
+  branchId: z.string().optional(),
 });
 
 const updatePharmacistSchema = z.object({
@@ -86,6 +89,7 @@ const updatePharmacistSchema = z.object({
   fullName: z.string().optional(),
   qualification: z.string().optional(),
   yearsExperience: z.number().optional(),
+  branchId: z.string().optional(),
 });
 
 router.get('/list-therapists', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']), validate({ query: listTherapistsSchema }), async (req, res, next) => {

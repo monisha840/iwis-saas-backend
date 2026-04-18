@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { WellnessService } from '../services/wellness.service.js';
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
+import prisma from '../lib/prisma.js';
 
 const router = express.Router();
 
@@ -57,6 +58,34 @@ router.get('/my-prescriptions', authMiddleware, roleMiddleware(['PATIENT']), asy
 
 router.post('/prescribe', authMiddleware, roleMiddleware(['DOCTOR', 'THERAPIST', 'ADMIN_DOCTOR', 'ADMIN']), validate({ body: prescribeSchema }), async (req, res, next) => {
     try {
+        const { patientId } = req.body;
+
+        // IDOR protection: verify clinician is assigned to the patient
+        if (req.user.role === 'DOCTOR' || req.user.role === 'THERAPIST') {
+            const isAssigned = await prisma.appointment.findFirst({
+                where: {
+                    patientId,
+                    status: { in: ['CONFIRMED', 'COMPLETED', 'ASSIGNED'] },
+                    OR: [
+                        { doctor: { userId: req.user.id } },
+                        { therapist: { userId: req.user.id } },
+                    ]
+                }
+            });
+            if (!isAssigned) {
+                const journeyAssigned = await prisma.journey.findFirst({
+                    where: {
+                        patientId,
+                        OR: [
+                            { doctor: { userId: req.user.id } },
+                            { therapist: { userId: req.user.id } },
+                        ]
+                    }
+                });
+                if (!journeyAssigned) return res.status(403).json({ error: 'Forbidden: not assigned to this patient' });
+            }
+        }
+
         const prescription = await WellnessService.prescribeVideo(req.user.id, req.body);
         res.json({ message: 'Video prescribed successfully', prescription });
     } catch (err) {

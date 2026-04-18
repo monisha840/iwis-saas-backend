@@ -5,6 +5,7 @@ import { PrescriptionService } from '../services/prescription.service.js';
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
 import { auditAction } from '../middleware/auditLog.js';
+import prisma from '../lib/prisma.js';
 
 const router = express.Router();
 
@@ -31,7 +32,44 @@ const addPrescriptionSchema = z.object({
 
 router.get('/patient/:id', authMiddleware, async (req, res, next) => {
   try {
-    const prescriptions = await PrescriptionService.getPatientPrescriptions(req.params.id, req.user);
+    const patientId = req.params.id;
+
+    // IDOR protection: verify the caller has access to this patient's prescriptions
+    if (req.user.role === 'PATIENT') {
+      const patientRecord = await prisma.patient.findUnique({
+        where: { userId: req.user.id },
+        select: { id: true }
+      });
+      if (patientRecord?.id !== patientId) {
+        return res.status(403).json({ error: 'Forbidden: you can only view your own prescriptions' });
+      }
+    } else if (req.user.role === 'DOCTOR' || req.user.role === 'THERAPIST') {
+      const isAssigned = await prisma.appointment.findFirst({
+        where: {
+          patientId,
+          status: { in: ['CONFIRMED', 'COMPLETED', 'ASSIGNED'] },
+          OR: [
+            { doctor: { userId: req.user.id } },
+            { therapist: { userId: req.user.id } },
+          ]
+        }
+      });
+      if (!isAssigned) {
+        const journeyAssigned = await prisma.journey.findFirst({
+          where: {
+            patientId,
+            OR: [
+              { doctor: { userId: req.user.id } },
+              { therapist: { userId: req.user.id } },
+            ]
+          }
+        });
+        if (!journeyAssigned) return res.status(403).json({ error: 'Forbidden: not assigned to this patient' });
+      }
+    }
+    // ADMIN and ADMIN_DOCTOR can access any patient's prescriptions
+
+    const prescriptions = await PrescriptionService.getPatientPrescriptions(patientId, req.user);
     res.json(prescriptions);
   } catch (err) {
     next(err);
@@ -74,7 +112,44 @@ router.post('/add', authMiddleware, roleMiddleware(['DOCTOR', 'THERAPIST', 'ADMI
 
 router.get('/patient/:id/view', authMiddleware, async (req, res, next) => {
   try {
-    const prescriptions = await PrescriptionService.viewAnyPatientPrescriptions(req.params.id);
+    const patientId = req.params.id;
+
+    // IDOR protection: verify the caller has access to this patient's prescriptions
+    if (req.user.role === 'PATIENT') {
+      const patientRecord = await prisma.patient.findUnique({
+        where: { userId: req.user.id },
+        select: { id: true }
+      });
+      if (patientRecord?.id !== patientId) {
+        return res.status(403).json({ error: 'Forbidden: you can only view your own prescriptions' });
+      }
+    } else if (req.user.role === 'DOCTOR' || req.user.role === 'THERAPIST') {
+      const isAssigned = await prisma.appointment.findFirst({
+        where: {
+          patientId,
+          status: { in: ['CONFIRMED', 'COMPLETED', 'ASSIGNED'] },
+          OR: [
+            { doctor: { userId: req.user.id } },
+            { therapist: { userId: req.user.id } },
+          ]
+        }
+      });
+      if (!isAssigned) {
+        const journeyAssigned = await prisma.journey.findFirst({
+          where: {
+            patientId,
+            OR: [
+              { doctor: { userId: req.user.id } },
+              { therapist: { userId: req.user.id } },
+            ]
+          }
+        });
+        if (!journeyAssigned) return res.status(403).json({ error: 'Forbidden: not assigned to this patient' });
+      }
+    }
+    // ADMIN and ADMIN_DOCTOR can access any patient's prescriptions
+
+    const prescriptions = await PrescriptionService.getPatientPrescriptions(patientId, req.user);
     res.json(prescriptions);
   } catch (err) {
     next(err);

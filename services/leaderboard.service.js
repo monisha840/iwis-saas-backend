@@ -6,6 +6,7 @@ import { cacheService } from './cache.service.js';
 const LOOKBACK_DAYS = 30;
 const RESPONSE_TIME_TARGET_MINS = 30;
 const MSS_IN_A_DAY = 24 * 60 * 60 * 1000;
+const DECAY_RATE = 0.05; // Exponential decay factor — recent days weighted higher
 
 export class LeaderboardService {
     /**
@@ -60,7 +61,7 @@ export class LeaderboardService {
             }
         }
 
-        // 1. Appointment Metric
+        // 1. Appointment Metric (time-decay weighted: recent activity counts more)
         const appointments = prefetchedData
             ? prefetchedData.appointments.filter(a => a.status === 'COMPLETED')
             : await prisma.appointment.findMany({
@@ -71,7 +72,14 @@ export class LeaderboardService {
                 }
             });
         const appointmentCount = appointments.length;
-        const appointmentScore = Math.min((appointmentCount / config.targetAppointments) * 100, 100);
+        // Time-decay: weight each appointment by recency (e^(-DECAY_RATE * daysAgo))
+        const decayWeightedCount = appointments.reduce((sum, a) => {
+            const daysAgo = (now.getTime() - new Date(a.date).getTime()) / MSS_IN_A_DAY;
+            return sum + Math.exp(-DECAY_RATE * daysAgo);
+        }, 0);
+        // Normalize: max possible decay-weighted count for `target` evenly-spaced appointments
+        const maxDecayWeight = config.targetAppointments * 0.75; // Adjusted baseline for decay
+        const appointmentScore = Math.min((decayWeightedCount / maxDecayWeight) * 100, 100);
 
         // 2. Adherence Rate Metric
         const clinician = prefetchedData
@@ -107,20 +115,36 @@ export class LeaderboardService {
         const { consistency, activeDaysCount } = await this._calculateConsistencyScore(participantId, thirtyDaysAgo, prefetchedData);
         const consistencyScore = consistency;
 
-        const finalScore = Math.round(
+        // Fetch streak multiplier (if clinician has an active streak)
+        let streakMultiplier = 1.0;
+        let currentStreak = 0;
+        try {
+            const streak = await prisma.clinicianStreak.findUnique({
+                where: { participantId }
+            });
+            if (streak) {
+                streakMultiplier = streak.streakMultiplier;
+                currentStreak = streak.currentStreak;
+            }
+        } catch { /* streak table may not exist yet */ }
+
+        const baseScore =
             (appointmentScore * config.appointmentWeight) +
             (adherenceScore * config.adherenceWeight) +
             (responseTimeScore * config.responseTimeWeight) +
             (successScore * config.successRateWeight) +
-            (consistencyScore * config.consistencyWeight)
-        );
+            (consistencyScore * config.consistencyWeight);
+
+        // Apply streak multiplier (capped at 110% to prevent runaway scores)
+        const finalScore = Math.round(Math.min(baseScore * streakMultiplier, 100));
 
         const metrics = {
-            appointments: { value: appointmentCount, score: appointmentScore, target: config.targetAppointments },
+            appointments: { value: appointmentCount, score: appointmentScore, target: config.targetAppointments, decayWeighted: Math.round(decayWeightedCount * 10) / 10 },
             adherence: { value: adherenceRate, score: adherenceScore, target: config.targetAdherence },
             responseTime: { value: avgMinutes, score: responseTimeScore, target: config.targetResponseTime },
             successRate: { value: successRate, score: successScore, target: config.targetSuccessRate },
-            consistency: { value: activeDaysCount, score: consistencyScore, target: 15 }
+            consistency: { value: activeDaysCount, score: consistencyScore, target: 15 },
+            streak: { currentStreak, multiplier: streakMultiplier }
         };
 
         return { score: finalScore, metrics };
@@ -449,6 +473,42 @@ export class LeaderboardService {
 
         const consistency = Math.min((activeDays.size / 15) * 100, 100);
         return { consistency, sourceIds: [...new Set(sourceIds)], activeDaysCount: activeDays.size };
+    }
+
+    /**
+     * Recalculate scores for ALL clinicians and persist audit records.
+     * Called by the scheduled cron job and by the admin manual trigger.
+     */
+    static async recalculateAll() {
+        const config = await this.getConfig();
+        const [doctors, therapists] = await Promise.all([
+            prisma.doctor.findMany({ include: { user: { select: { role: true } } } }),
+            prisma.therapist.findMany({ include: { user: { select: { role: true } } } })
+        ]);
+
+        const participants = [
+            ...doctors.map(d => ({ id: d.id, role: 'DOCTOR' })),
+            ...therapists.map(t => ({ id: t.id, role: 'THERAPIST' }))
+        ];
+
+        let recalculated = 0;
+        let errors = 0;
+
+        for (const p of participants) {
+            try {
+                const result = await this.calculateParticipantScore(p.id, p.role);
+                if (result) recalculated++;
+            } catch (err) {
+                errors++;
+                logger.error(`[LeaderboardService] Recalc failed for ${p.id}:`, err.message);
+            }
+        }
+
+        // Invalidate all cached leaderboards
+        await cacheService.deletePattern('leaderboard:*').catch(() => { });
+
+        logger.info(`[LeaderboardService] Recalculation complete: ${recalculated} scored, ${errors} errors`);
+        return { recalculated, errors, total: participants.length };
     }
 
     /**

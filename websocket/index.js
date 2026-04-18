@@ -2,20 +2,35 @@ import { Server } from 'socket.io';
 import jwt from 'jsonwebtoken';
 import prisma from '../lib/prisma.js';
 import config from '../config/index.js';
+import logger from '../lib/logger.js';
 
 let io;
 
 /**
- * Initialize Socket.IO server
+ * Initialize Socket.IO server with optional Redis adapter for horizontal scaling.
  */
-export function initializeWebSocket(httpServer) {
+export async function initializeWebSocket(httpServer) {
     io = new Server(httpServer, {
         cors: {
-            // Use same origin list as the HTTP API — single source of truth via config
             origin: config.cors.origins,
             credentials: true,
         },
     });
+
+    // Redis adapter for horizontal scaling (when REDIS_ADAPTER_ENABLED=true)
+    if (process.env.REDIS_ADAPTER_ENABLED === 'true') {
+        try {
+            const { createAdapter } = await import('@socket.io/redis-adapter');
+            const { createClient } = await import('redis');
+            const pubClient = createClient({ url: process.env.REDIS_URL });
+            const subClient = pubClient.duplicate();
+            await Promise.all([pubClient.connect(), subClient.connect()]);
+            io.adapter(createAdapter(pubClient, subClient));
+            logger.info('Socket.IO Redis adapter enabled — horizontal scaling ready');
+        } catch (err) {
+            logger.warn('Socket.IO Redis adapter failed to initialize, using default adapter', { error: err.message });
+        }
+    }
 
     // Authentication middleware
     io.use((socket, next) => {
@@ -75,6 +90,30 @@ export function initializeWebSocket(httpServer) {
 
         socket.on('send_message', async ({ conversationId, content }) => {
             try {
+                // Validate conversationId
+                if (typeof conversationId !== 'string' || !conversationId.trim()) {
+                    socket.emit('error', { message: 'Invalid conversationId' });
+                    return;
+                }
+
+                // Validate content
+                if (typeof content !== 'string') {
+                    socket.emit('error', { message: 'Message content must be a string' });
+                    return;
+                }
+
+                // Trim, sanitize (strip HTML tags to prevent XSS), and length-check
+                content = content.trim().replace(/<[^>]*>/g, '');
+
+                if (content.length === 0) {
+                    socket.emit('error', { message: 'Message content cannot be empty' });
+                    return;
+                }
+                if (content.length > 5000) {
+                    socket.emit('error', { message: 'Message content exceeds 5000 character limit' });
+                    return;
+                }
+
                 // Re-verify membership before writing — prevents message injection even if room
                 // was joined via a different socket session or after role/membership change.
                 const isMember = await prisma.conversation.findFirst({
@@ -119,9 +158,10 @@ export function initializeWebSocket(httpServer) {
                 // Emit to the conversation room (delivers to everyone already viewing the chat)
                 io.to(`conversation:${conversationId}`).emit('new_message', message);
 
-                // Notify all other participants via the persistent notification pipeline.
-                // This ensures the message surfaces in their notification panel and unread badge
-                // even when they are not currently in the conversation room.
+                // Notify all participants via their personal user-room AND the persistent
+                // notification pipeline.  The user-room `conversation_updated` event lets
+                // the sidebar conversation list update in real-time even when the user has
+                // not joined the conversation room.
                 try {
                     const conv = await prisma.conversation.findUnique({
                         where: { id: conversationId },
@@ -149,6 +189,16 @@ export function initializeWebSocket(httpServer) {
                             conv.therapist?.userId,
                             conv.pharmacist?.userId,
                         ].filter((uid) => uid && uid !== socket.userId);
+
+                        // Emit a lightweight sidebar-update event to every participant's
+                        // personal room so their conversation list stays current even when
+                        // they have not opened this specific conversation.
+                        for (const userId of recipientUserIds) {
+                            io.to(`user:${userId}`).emit('conversation_updated', {
+                                conversationId,
+                                lastMessage: message,
+                            });
+                        }
 
                         // Create a persistent notification record and emit to each recipient
                         await Promise.all(recipientUserIds.map(async (userId) => {
@@ -198,6 +248,15 @@ export function initializeWebSocket(httpServer) {
         });
 
         socket.on('typing', ({ conversationId, isTyping }) => {
+            if (typeof conversationId !== 'string' || !conversationId.trim()) {
+                socket.emit('error', { message: 'Invalid conversationId' });
+                return;
+            }
+            if (typeof isTyping !== 'boolean') {
+                socket.emit('error', { message: 'isTyping must be a boolean' });
+                return;
+            }
+
             socket.to(`conversation:${conversationId}`).emit('user_typing', {
                 userId: socket.userId,
                 isTyping

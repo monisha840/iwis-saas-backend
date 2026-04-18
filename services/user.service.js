@@ -437,7 +437,7 @@ export class UserService {
     }
 
     static async updateProfile(type, id, data) {
-        const { email, ...profileData } = data;
+        const { email, branchId, ...profileData } = data;
         let profile;
         if (type === 'doctor') profile = await prisma.doctor.findUnique({ where: { id }, include: { user: true } });
         else if (type === 'therapist') profile = await prisma.therapist.findUnique({ where: { id }, include: { user: true } });
@@ -446,11 +446,42 @@ export class UserService {
 
         if (!profile) throw new Error(`${type} not found`);
 
+        // Validate branchId if provided
+        if (branchId) {
+            await this._validateBranchId(branchId);
+        }
+
         return prisma.$transaction(async (tx) => {
+            // Update email if changed
             if (email && email !== profile.user.email) {
                 if (await tx.user.findUnique({ where: { email } })) throw new Error('Email already in use');
                 await tx.user.update({ where: { id: profile.userId }, data: { email } });
             }
+
+            // Branch transfer: update the User record's branchId
+            if (branchId && branchId !== profile.user.branchId) {
+                const oldBranchId = profile.user.branchId;
+                await tx.user.update({ where: { id: profile.userId }, data: { branchId } });
+
+                // For patients, also update the Patient record's own branchId
+                if (type === 'patient') {
+                    await tx.patient.update({ where: { id }, data: { branchId } });
+                }
+
+                // Audit the branch transfer
+                await tx.auditLog.create({
+                    data: {
+                        userId: profile.userId,
+                        action: 'BRANCH_TRANSFER',
+                        entityType: type.toUpperCase(),
+                        entityId: id,
+                        oldData: { branchId: oldBranchId },
+                        newData: { branchId },
+                    }
+                });
+            }
+
+            // Update role-specific profile fields
             if (type === 'doctor') return tx.doctor.update({ where: { id }, data: profileData });
             if (type === 'therapist') return tx.therapist.update({ where: { id }, data: profileData });
             if (type === 'patient') return tx.patient.update({ where: { id }, data: profileData });

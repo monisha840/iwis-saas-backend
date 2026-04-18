@@ -65,7 +65,7 @@ const listOrdersSchema = z.object({
     status: z.string().optional(),
 });
 
-router.get('/medicines', authMiddleware, roleMiddleware(['ADMIN', 'PHARMACIST', 'ADMIN_DOCTOR', 'DOCTOR']), async (req, res, next) => {
+router.get('/medicines', authMiddleware, roleMiddleware(['ADMIN', 'PHARMACIST', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST']), async (req, res, next) => {
     try {
         const data = await PharmacyService.getAllMedicines(req.user.branchId);
         res.json(data);
@@ -122,7 +122,9 @@ router.post('/dispense', authMiddleware, roleMiddleware(['PHARMACIST', 'ADMIN_DO
 
 router.get('/dispenses', authMiddleware, roleMiddleware(['ADMIN', 'PHARMACIST', 'ADMIN_DOCTOR']), async (req, res, next) => {
     try {
-        const data = await PharmacyService.getDispenseHistory(req.user.branchId);
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 20;
+        const data = await PharmacyService.getDispenseHistory(req.user.branchId, { page, limit });
         res.json(data);
     } catch (err) {
         next(err);

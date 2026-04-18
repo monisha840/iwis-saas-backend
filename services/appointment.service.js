@@ -585,7 +585,68 @@ export class AppointmentService {
         return prisma.appointment.findUnique({ where: { id }, select: { id: true, status: true } });
     }
 
-    static async getAvailableSlots(clinicianId, date) {
-        return AvailabilityService.getAvailableSlots(clinicianId, date);
+    static async getAvailableSlots(clinicianId, date, branchId) {
+        const slots = await AvailabilityService.getAvailableSlots(clinicianId, date);
+
+        // Enhance slots with spotsLeft and isNearlyFull
+        // Check Redis for held slots
+        const { cacheService } = await import('./cache.service.js');
+
+        return Promise.all(slots.map(async (slot) => {
+            const holdKey = `slot:hold:${clinicianId}:${date}:${slot.startTime}`;
+            const held = await cacheService.get(holdKey);
+            const isHeld = !!held;
+            const spotsLeft = slot.status === 'AVAILABLE' && !isHeld ? 1 : 0;
+            return {
+                ...slot,
+                time: slot.startTime,
+                spotsLeft,
+                isNearlyFull: spotsLeft <= 1 && spotsLeft > 0,
+                isHeld,
+            };
+        }));
+    }
+
+    /**
+     * Hold a slot for 10 minutes to prevent double-booking during checkout.
+     */
+    static async holdSlot(clinicianId, date, time, userId) {
+        const { cacheService } = await import('./cache.service.js');
+        const holdKey = `slot:hold:${clinicianId}:${date}:${time}`;
+        const existing = await cacheService.get(holdKey);
+
+        if (existing && existing.userId !== userId) {
+            const error = new Error('This slot is currently being booked by another patient');
+            error.status = 409;
+            throw error;
+        }
+
+        // Hold for 10 minutes (600 seconds)
+        await cacheService.set(holdKey, { userId, heldAt: Date.now() }, 600);
+
+        return { held: true, expiresIn: 600 };
+    }
+
+    /**
+     * Verify a hold exists before confirming booking.
+     */
+    static async verifyHold(clinicianId, date, time, userId) {
+        const { cacheService } = await import('./cache.service.js');
+        const holdKey = `slot:hold:${clinicianId}:${date}:${time}`;
+        const hold = await cacheService.get(holdKey);
+
+        // Allow booking even if hold expired (graceful)
+        if (hold && hold.userId !== userId) {
+            const error = new Error('Slot is held by another patient');
+            error.status = 409;
+            throw error;
+        }
+
+        // Clear the hold after verification
+        if (hold) {
+            await cacheService.del(holdKey);
+        }
+
+        return true;
     }
 }

@@ -69,6 +69,32 @@ router.get('/stats/:patientId', authMiddleware, roleMiddleware(['PATIENT', 'DOCT
             }
         }
 
+        // IDOR protection: verify clinician is assigned to the patient
+        if (req.user.role === 'DOCTOR' || req.user.role === 'THERAPIST') {
+            const isAssigned = await prisma.appointment.findFirst({
+                where: {
+                    patientId,
+                    status: { in: ['CONFIRMED', 'COMPLETED', 'ASSIGNED'] },
+                    OR: [
+                        { doctor: { userId: req.user.id } },
+                        { therapist: { userId: req.user.id } },
+                    ]
+                }
+            });
+            if (!isAssigned) {
+                const journeyAssigned = await prisma.journey.findFirst({
+                    where: {
+                        patientId,
+                        OR: [
+                            { doctor: { userId: req.user.id } },
+                            { therapist: { userId: req.user.id } },
+                        ]
+                    }
+                });
+                if (!journeyAssigned) return res.status(403).json({ error: 'Forbidden: not assigned to this patient' });
+            }
+        }
+
         const stats = await AdherenceService.getAdherenceStats(patientId, days);
         res.json(stats);
     } catch (err) {

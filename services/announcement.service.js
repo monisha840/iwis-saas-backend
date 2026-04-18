@@ -1,0 +1,191 @@
+import prisma from '../lib/prisma.js';
+import logger from '../lib/logger.js';
+import { emitToUser } from '../websocket/index.js';
+import { userNameSelect, flattenUserName } from '../lib/userName.js';
+
+export class AnnouncementService {
+  /**
+   * Create a new announcement and notify relevant users via socket.
+   */
+  static async createAnnouncement(authorId, { branchId, title, message, priority, targetRoles, isPinned, expiresAt }) {
+    logger.info(`Creating announcement`, { authorId, branchId, title, priority });
+
+    const announcement = await prisma.announcement.create({
+      data: {
+        authorId,
+        branchId: branchId || null,
+        title,
+        message,
+        priority: priority || 'NORMAL',
+        targetRoles: targetRoles || [],
+        isPinned: isPinned || false,
+        expiresAt: expiresAt ? new Date(expiresAt) : null,
+      },
+      include: {
+        author: { select: userNameSelect },
+        branch: { select: { id: true, name: true } },
+      },
+    });
+
+    // Find all relevant users to notify
+    const userWhere = {};
+    if (branchId) {
+      userWhere.branchId = branchId;
+    }
+    if (targetRoles && targetRoles.length > 0) {
+      userWhere.role = { in: targetRoles };
+    }
+
+    const users = await prisma.user.findMany({
+      where: userWhere,
+      select: { id: true },
+    });
+
+    for (const user of users) {
+      emitToUser(user.id, 'new_announcement', announcement);
+    }
+
+    const flat = { ...announcement, author: flattenUserName(announcement.author) };
+    logger.info(`Announcement created and emitted to ${users.length} users`, { announcementId: announcement.id });
+    return flat;
+  }
+
+  /**
+   * Get announcements visible to a user (matching branch + role), with read status.
+   * Pinned first, then by createdAt desc. Excludes expired.
+   */
+  static async getAnnouncements(userId, userRole, userBranchId, { page = 1, limit = 20 } = {}) {
+    const currentPage = Math.max(1, parseInt(page) || 1);
+    const take = Math.min(parseInt(limit) || 20, 100);
+    const skip = (currentPage - 1) * take;
+
+    const now = new Date();
+
+    const where = {
+      // Branch: global (null) or user's branch
+      OR: [
+        { branchId: null },
+        { branchId: userBranchId },
+      ],
+      // Not expired
+      AND: [
+        {
+          OR: [
+            { expiresAt: null },
+            { expiresAt: { gt: now } },
+          ],
+        },
+      ],
+    };
+
+    const [announcements, total] = await Promise.all([
+      prisma.announcement.findMany({
+        where,
+        include: {
+          author: { select: userNameSelect },
+          branch: { select: { id: true, name: true } },
+          reads: {
+            where: { userId },
+            select: { readAt: true },
+          },
+        },
+        orderBy: [
+          { isPinned: 'desc' },
+          { createdAt: 'desc' },
+        ],
+        skip,
+        take,
+      }),
+      prisma.announcement.count({ where }),
+    ]);
+
+    // Filter by targetRoles in application layer (array contains check)
+    const filtered = announcements.filter(a =>
+      a.targetRoles.length === 0 || a.targetRoles.includes(userRole)
+    );
+
+    const data = filtered.map(({ reads, author, ...rest }) => ({
+      ...rest,
+      author: flattenUserName(author),
+      isRead: reads.length > 0,
+      readAt: reads.length > 0 ? reads[0].readAt : null,
+    }));
+
+    return {
+      data,
+      pagination: {
+        page: currentPage,
+        limit: take,
+        total,
+        totalPages: Math.ceil(total / take),
+      },
+    };
+  }
+
+  /**
+   * Mark an announcement as read by a user.
+   */
+  static async markAsRead(announcementId, userId) {
+    return prisma.announcementRead.upsert({
+      where: {
+        announcementId_userId: { announcementId, userId },
+      },
+      update: {},
+      create: {
+        announcementId,
+        userId,
+      },
+    });
+  }
+
+  /**
+   * Delete an announcement (only author or admin).
+   */
+  static async deleteAnnouncement(announcementId, userId) {
+    const announcement = await prisma.announcement.findUnique({
+      where: { id: announcementId },
+    });
+
+    if (!announcement) {
+      throw new Error('Announcement not found');
+    }
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { role: true },
+    });
+
+    if (announcement.authorId !== userId && user?.role !== 'ADMIN') {
+      throw new Error('Not authorized to delete this announcement');
+    }
+
+    await prisma.announcement.delete({
+      where: { id: announcementId },
+    });
+
+    return { success: true };
+  }
+
+  /**
+   * Update an announcement's title, message, priority, or pinned status.
+   */
+  static async updateAnnouncement(announcementId, data) {
+    const updateData = {};
+    if (data.title !== undefined) updateData.title = data.title;
+    if (data.message !== undefined) updateData.message = data.message;
+    if (data.priority !== undefined) updateData.priority = data.priority;
+    if (data.isPinned !== undefined) updateData.isPinned = data.isPinned;
+    if (data.targetRoles !== undefined) updateData.targetRoles = data.targetRoles;
+    if (data.expiresAt !== undefined) updateData.expiresAt = data.expiresAt ? new Date(data.expiresAt) : null;
+
+    const updated = await prisma.announcement.update({
+      where: { id: announcementId },
+      data: updateData,
+      include: {
+        author: { select: userNameSelect },
+        branch: { select: { id: true, name: true } },
+      },
+    });
+    return { ...updated, author: flattenUserName(updated.author) };
+  }
+}

@@ -3,171 +3,305 @@ import path from 'path';
 import logger from '../lib/logger.js';
 import { notificationService } from './notification.service.js';
 
-// ─── Triage Configuration ────────────────────────────────────────────────────
-// Each factor contributes a weighted sub-score to a 0–10 composite triageScore.
-// Weights must sum to 1.0.
-const TRIAGE_CONFIG = {
-    WEIGHTS: {
-        painSeverity: 0.50,   // Primary clinical signal — half the total weight
-        duration:     0.20,   // Chronic conditions are clinically more serious
-        symptomCount: 0.15,   // Multiple concurrent symptoms increase complexity
-        historyRisk:  0.15,   // Relevant medical history keywords raise baseline risk
-    },
-
-    // Duration buckets → normalised 0–10 sub-score
-    DURATION_SCORES: {
-        'Less than 24 hours': 2,
-        '1-3 days':           4,
-        '4-7 days':           5,
-        '1-2 weeks':          6,
-        '2-4 weeks':          7,
-        'More than 1 month':  9,
-    },
-
-    // High-risk history keywords — each match adds 1 point (capped at 10)
-    HISTORY_RISK_KEYWORDS: [
-        'diabetes', 'hypertension', 'heart', 'cancer', 'surgery', 'stroke',
-        'kidney', 'liver', 'asthma', 'epilepsy', 'chronic', 'allergy',
-    ],
-
-    // Thresholds applied to the composite triageScore (0–10)
-    THRESHOLDS: {
-        HIGH:   8.0,   // ≥ 8  → Senior Specialist / Escalation
-        MEDIUM: 4.5,   // ≥ 4.5 → Specialist
-        // < 4.5 → Standard / General Physician
-    },
-
-    SEVERITY_LABELS: {
-        HIGH:   { label: 'Senior Specialist', severity: 'HIGH',   classification: 'Escalation Required' },
-        MEDIUM: { label: 'Specialist',         severity: 'MEDIUM', classification: 'Specialist Required' },
-        LOW:    { label: 'Standard',           severity: 'LOW',    classification: 'Standard' },
-    },
-
-    // Symptom → specialty lookup (first match used for suggested specialty)
-    SPECIALTY_MAP: {
-        'Back Pain':      'Orthopedic',       'Joint Pain':   'Orthopedic',
-        'Stomach Pain':   'Gastroenterologist','Acid Reflux':  'Gastroenterologist',
-        'Skin Rash':      'Dermatologist',     'Acne':         'Dermatologist',
-        'Headache':       'Neurologist',       'Dizziness':    'Neurologist',
-        'Anxiety':        'Therapist',         'Depression':   'Therapist',
-        'Cough':          'General Physician', 'Fever':        'General Physician',
-    },
+// ─── Scoring Weights ────────────────────────────────────────────────────────
+const WEIGHTS = {
+    painIntensity:  0.35,    // max pain score across all regions (0-10)
+    regionCount:    0.10,    // number of affected regions
+    duration:       0.20,    // longer = higher urgency
+    characterFlags: 0.15,   // stabbing/numbness/radiation = higher
+    lifestyleFlags: 0.10,   // high stress + poor sleep = higher
+    medicalHistory: 0.10,   // comorbidities = higher
 };
 
-// ─── Composite Score Engine ───────────────────────────────────────────────────
+// Duration scoring map
+const DURATION_SCORES = {
+    'Just started':   3,
+    'Hours':          4,
+    'Days':           5,
+    'Weeks':          6,
+    'Months':         7,
+    'Over a year':    8,
+    // Legacy mappings
+    'Less than 24 hours': 3,
+    '1-3 days':       5,
+    '4-7 days':       5,
+    '1-2 weeks':      6,
+    '2-4 weeks':      6,
+    'More than 1 month': 7,
+};
+
+// High-risk pain character flags
+const HIGH_RISK_CHARACTERS = ['Stabbing', 'Numbness', 'Tingling'];
+
+// Specialty routing (tag-based)
+const SPECIALTY_ROUTING = [
+    { tags: ['joint', 'knee', 'shoulder', 'hip', 'back', 'neck', 'left-knee', 'right-knee', 'left-shoulder', 'right-shoulder', 'left-hip', 'right-hip', 'lower-back'], specialty: 'Orthopaedic & Joint Care' },
+    { tags: ['abdomen', 'digestive', 'bowel', 'nausea', 'bloating', 'stomach', 'acid'], specialty: 'Gastroenterology & Digestive Health' },
+    { tags: ['chest', 'respiratory', 'breathing', 'cough'], specialty: 'Respiratory & Pulmonary Care' },
+    { tags: ['head', 'stress', 'anxiety', 'sleep', 'mental', 'depression'], specialty: 'Mind & Wellness' },
+    { tags: ['skin', 'rash', 'hair', 'nail', 'acne'], specialty: 'Dermatology & Skin Care' },
+    { tags: ['female', 'menstrual', 'pelvic'], specialty: "Women's Health" },
+    { tags: ['metabolic', 'weight', 'thyroid', 'diabetes'], specialty: 'Metabolic & Endocrine Care' },
+];
+
+// Medical history risk keywords
+const HISTORY_RISK_KEYWORDS = [
+    'diabetes', 'hypertension', 'heart', 'cancer', 'surgery', 'stroke',
+    'kidney', 'liver', 'asthma', 'epilepsy', 'chronic', 'allergy', 'thyroid',
+];
+
+// Comorbidity conditions
+const COMORBIDITY_CONDITIONS = ['Diabetes', 'Hypertension', 'Thyroid', 'Heart disease', 'Asthma'];
+
 /**
- * Computes a weighted 0–10 composite triageScore from four clinical factors.
- * Returns { triageScore, confidenceScore, breakdown, reasoning[] }.
+ * Weighted composite scoring engine for triage.
+ * Returns compositeScore (0-10), urgencyLevel, suggestedSpecialty, etc.
  */
-function computeTriageScore({ painSeverity, duration, symptoms = [], medicalHistory = '' }) {
-    const w = TRIAGE_CONFIG.WEIGHTS;
-    const reasoning = [];
+function computeTriageScore({
+    painRegions = [],
+    painSeverity,
+    duration,
+    symptoms = [],
+    medicalHistory = '',
+    existingConditions = [],
+    lifestyleData = {},
+}) {
+    const flags = [];
 
-    // 1. Pain Severity (0–10 direct from input)
-    const painScore = Math.max(0, Math.min(10, Number(painSeverity)));
-    reasoning.push(`Pain severity ${painScore}/10 (weight ${w.painSeverity * 100}%).`);
-
-    // 2. Duration sub-score (0–10 via lookup table)
-    const durationScore = TRIAGE_CONFIG.DURATION_SCORES[duration] ?? 3;
-    reasoning.push(`Duration "${duration}" maps to sub-score ${durationScore}/10 (weight ${w.duration * 100}%).`);
-
-    // 3. Symptom count sub-score — each additional symptom exponentially increases complexity
-    //    Capped at 5 symptoms → 10 points to avoid over-weighting large lists
-    const symptomCount = Array.isArray(symptoms) ? symptoms.length : 0;
-    const symptomScore = Math.min(10, symptomCount * 2);
-    if (symptomCount > 0) {
-        reasoning.push(`${symptomCount} symptom(s) reported → sub-score ${symptomScore}/10 (weight ${w.symptomCount * 100}%).`);
+    // 1. Pain intensity — max pain across all body map regions, or direct painSeverity
+    let maxPainIntensity = 0;
+    if (painRegions.length > 0) {
+        maxPainIntensity = Math.max(...painRegions.map(r => r.intensity || 0));
+    } else if (painSeverity !== undefined) {
+        maxPainIntensity = Number(painSeverity);
     }
+    maxPainIntensity = Math.max(0, Math.min(10, maxPainIntensity));
+    const painScore = maxPainIntensity;
 
-    // 4. Medical history risk score — keyword matching (0–10, capped)
+    // 2. Region count score (normalized to 0-10)
+    const regionCount = painRegions.length || (painSeverity ? 1 : 0);
+    const regionScore = Math.min(10, regionCount * 2.5);
+
+    // 3. Duration score
+    const primaryDuration = painRegions[0]?.duration || duration || 'Days';
+    const durationScore = DURATION_SCORES[primaryDuration] ?? 5;
+
+    // 4. Character flags
+    let characterScore = 0;
+    const allCharacters = painRegions.flatMap(r => r.characters || []);
+    const hasHighRisk = allCharacters.some(c => HIGH_RISK_CHARACTERS.includes(c));
+    const hasRadiation = painRegions.some(r => r.radiatesTo);
+    if (hasHighRisk) { characterScore += 5; flags.push('high_risk_pain_character'); }
+    if (hasRadiation) { characterScore += 5; flags.push('radiation_present'); }
+    if (allCharacters.length > 3) characterScore = Math.min(10, characterScore + 2);
+    characterScore = Math.min(10, characterScore);
+
+    // 5. Lifestyle flags
+    let lifestyleScore = 0;
+    const { stressLevel, sleepQuality, bowelRegularity, appetite } = lifestyleData;
+    if (stressLevel && stressLevel >= 7) { lifestyleScore += 4; flags.push('high_stress'); }
+    if (sleepQuality && sleepQuality <= 2) { lifestyleScore += 3; flags.push('poor_sleep'); }
+    if (bowelRegularity === 'Constipated') lifestyleScore += 2;
+    if (appetite === 'Reduced') lifestyleScore += 1;
+    lifestyleScore = Math.min(10, lifestyleScore);
+
+    // 6. Medical history
+    let historyScore = 0;
     const historyLower = (medicalHistory || '').toLowerCase();
-    const matchedKeywords = TRIAGE_CONFIG.HISTORY_RISK_KEYWORDS.filter(kw => historyLower.includes(kw));
-    const historyScore = Math.min(10, matchedKeywords.length * 2.5);
-    if (matchedKeywords.length > 0) {
-        reasoning.push(`Medical history contains risk keywords (${matchedKeywords.join(', ')}) → sub-score ${historyScore}/10 (weight ${w.historyRisk * 100}%).`);
+    const matchedKeywords = HISTORY_RISK_KEYWORDS.filter(kw => historyLower.includes(kw));
+    historyScore += matchedKeywords.length * 2;
+    const matchedConditions = (existingConditions || []).filter(c => COMORBIDITY_CONDITIONS.includes(c));
+    historyScore += matchedConditions.length * 2;
+    historyScore = Math.min(10, historyScore);
+    if (matchedConditions.length > 0) flags.push('comorbidities');
+    if (maxPainIntensity >= 6 && durationScore >= 6) flags.push('chronic_pain');
+
+    // Weighted composite (0-10)
+    const compositeScore = Number((
+        painScore      * WEIGHTS.painIntensity +
+        regionScore    * WEIGHTS.regionCount +
+        durationScore  * WEIGHTS.duration +
+        characterScore * WEIGHTS.characterFlags +
+        lifestyleScore * WEIGHTS.lifestyleFlags +
+        historyScore   * WEIGHTS.medicalHistory
+    ).toFixed(2));
+
+    // Urgency level
+    let urgencyLevel;
+    if (compositeScore >= 8) urgencyLevel = 'CRITICAL';
+    else if (compositeScore >= 6) urgencyLevel = 'URGENT';
+    else if (compositeScore >= 4) urgencyLevel = 'MODERATE';
+    else urgencyLevel = 'ROUTINE';
+
+    // Specialty routing (tag-based matching)
+    const searchTags = [
+        ...painRegions.map(r => r.regionId?.toLowerCase()),
+        ...painRegions.map(r => r.regionLabel?.toLowerCase()),
+        ...(symptoms || []).map(s => s.toLowerCase()),
+        ...(allCharacters).map(c => c.toLowerCase()),
+    ].filter(Boolean);
+
+    let suggestedSpecialty = 'General Consultation';
+    let bestMatchCount = 0;
+    const alternativeSpecialties = [];
+
+    for (const route of SPECIALTY_ROUTING) {
+        const matchCount = route.tags.filter(tag =>
+            searchTags.some(st => st.includes(tag) || tag.includes(st))
+        ).length;
+        if (matchCount > bestMatchCount) {
+            if (suggestedSpecialty !== 'General Consultation') {
+                alternativeSpecialties.push(suggestedSpecialty);
+            }
+            bestMatchCount = matchCount;
+            suggestedSpecialty = route.specialty;
+        } else if (matchCount > 0 && matchCount === bestMatchCount) {
+            alternativeSpecialties.push(route.specialty);
+        }
     }
 
-    // 5. Weighted composite
-    const triageScore = Number(
-        (painScore   * w.painSeverity +
-         durationScore * w.duration +
-         symptomScore  * w.symptomCount +
-         historyScore  * w.historyRisk).toFixed(2)
-    );
+    // Confidence score (0-1)
+    const totalInputs = [painScore > 0, regionCount > 0, primaryDuration !== 'Days', allCharacters.length > 0, Object.keys(lifestyleData).length > 0, historyScore > 0].filter(Boolean).length;
+    const inputCompleteness = totalInputs / 6;
+    const tagMatchStrength = bestMatchCount > 0 ? Math.min(1, bestMatchCount / 3) : 0.3;
+    const confidenceScore = Number((inputCompleteness * 0.5 + tagMatchStrength * 0.5).toFixed(2));
 
-    // 6. Confidence score — how far the composite is from the nearest threshold border
-    //    Perfect confidence = 10 when the score is deep within a tier.
-    const thresholds = [TRIAGE_CONFIG.THRESHOLDS.HIGH, TRIAGE_CONFIG.THRESHOLDS.MEDIUM, 0];
-    const nearestBorder = thresholds.reduce((min, t) => Math.min(min, Math.abs(triageScore - t)), Infinity);
-    const confidenceScore = Math.round(Math.min(100, (nearestBorder / 2) * 100));
+    // Recommended appointment type
+    let recommendedAppointmentType = 'CONSULTATION';
+    if (urgencyLevel === 'CRITICAL') recommendedAppointmentType = 'EMERGENCY';
+    else if (urgencyLevel === 'URGENT') recommendedAppointmentType = 'PRIORITY_CONSULTATION';
 
-    return { triageScore, confidenceScore, breakdown: { painScore, durationScore, symptomScore, historyScore }, reasoning };
+    // Triage notes
+    const notes = [];
+    if (regionCount > 2) notes.push(`Multi-region involvement (${regionCount} areas) suggests systemic evaluation.`);
+    if (hasRadiation) notes.push('Radiation present — evaluate for nerve compression.');
+    if (hasHighRisk) notes.push('High-risk pain characteristics reported.');
+    if (flags.includes('chronic_pain')) notes.push('Chronic pain pattern detected.');
+    if (flags.includes('high_stress')) notes.push('Elevated stress levels may be contributing factor.');
+    const triageNotes = notes.join(' ') || 'Standard evaluation recommended.';
+
+    // Human-readable classification label
+    const classificationMap = {
+        CRITICAL: 'Escalation Required',
+        URGENT: 'Escalation Required',
+        MODERATE: 'Standard',
+        ROUTINE: 'Routine',
+    };
+    const classification = classificationMap[urgencyLevel] || 'Routine';
+
+    // Assessment reasoning — synthesize a human-readable explanation from the scoring
+    const reasoningParts = [];
+
+    if (painScore >= 7) {
+        reasoningParts.push(`Your reported pain intensity (${painScore}/10) indicates a significant level of discomfort requiring prompt attention.`);
+    } else if (painScore >= 4) {
+        reasoningParts.push(`Your pain intensity (${painScore}/10) suggests moderate discomfort that warrants clinical evaluation.`);
+    } else if (painScore > 0) {
+        reasoningParts.push(`Your pain intensity (${painScore}/10) is within a manageable range.`);
+    }
+
+    if (regionCount > 1) {
+        reasoningParts.push(`Pain across ${regionCount} body regions suggests a broader evaluation may be needed.`);
+    }
+
+    if (durationScore >= 7) {
+        reasoningParts.push(`The prolonged duration of your symptoms (${primaryDuration.toLowerCase()}) is a key factor in the assessment.`);
+    } else if (durationScore >= 5) {
+        reasoningParts.push(`The duration of your symptoms (${primaryDuration.toLowerCase()}) has been factored into the assessment.`);
+    }
+
+    if (hasHighRisk) {
+        reasoningParts.push('Certain pain characteristics you reported (such as stabbing, numbness, or tingling) raise the clinical priority.');
+    }
+    if (hasRadiation) {
+        reasoningParts.push('The fact that your pain radiates to other areas warrants nerve-related evaluation.');
+    }
+    if (matchedConditions.length > 0) {
+        reasoningParts.push(`Your existing conditions (${matchedConditions.join(', ')}) have been considered as they may influence treatment.`);
+    }
+    if (flags.includes('high_stress') || flags.includes('poor_sleep')) {
+        reasoningParts.push('Elevated stress or poor sleep quality can amplify symptoms and has been factored in.');
+    }
+
+    reasoningParts.push(`Based on these factors, we recommend ${suggestedSpecialty} with a composite score of ${compositeScore}/10 (${urgencyLevel.toLowerCase()} priority).`);
+
+    const reasoning = reasoningParts.join(' ');
+
+    return {
+        compositeScore,
+        urgencyLevel,
+        suggestedSpecialty,
+        confidenceScore,
+        alternativeSpecialties: [...new Set(alternativeSpecialties)].slice(0, 3),
+        flags,
+        recommendedAppointmentType,
+        triageNotes,
+        classification,
+        reasoning,
+        breakdown: { painScore, regionScore, durationScore, characterScore, lifestyleScore, historyScore },
+    };
 }
 
 export class TriageService {
     static async submitTriage(userId, data) {
-        const { painArea, painSeverity, duration, symptoms, medicalHistory, medications, documentIds } = data;
+        const {
+            painArea, painSeverity, duration, symptoms, medicalHistory, medications,
+            documentIds, painRegions, chiefComplaint, existingConditions, lifestyleData,
+            onsetPattern, allergies, currentMedications,
+        } = data;
 
-        // ── 1. Multi-Factor Composite Scoring Engine ─────────────────────────
-        const { triageScore, confidenceScore, breakdown, reasoning } =
-            computeTriageScore({ painSeverity, duration, symptoms, medicalHistory });
-
-        // ── 2. Tier Classification from composite score ───────────────────────
-        let tierKey;
-        if (triageScore >= TRIAGE_CONFIG.THRESHOLDS.HIGH) {
-            tierKey = 'HIGH';
-            reasoning.push(`Composite score ${triageScore}/10 ≥ ${TRIAGE_CONFIG.THRESHOLDS.HIGH} threshold → Escalation Required.`);
-        } else if (triageScore >= TRIAGE_CONFIG.THRESHOLDS.MEDIUM) {
-            tierKey = 'MEDIUM';
-            reasoning.push(`Composite score ${triageScore}/10 ≥ ${TRIAGE_CONFIG.THRESHOLDS.MEDIUM} threshold → Specialist Required.`);
-        } else {
-            tierKey = 'LOW';
-            reasoning.push(`Composite score ${triageScore}/10 below ${TRIAGE_CONFIG.THRESHOLDS.MEDIUM} threshold → Standard Consultation.`);
-        }
-
-        const { label, severity, classification } = TRIAGE_CONFIG.SEVERITY_LABELS[tierKey];
-
-        // ── 3. Specialty Mapping (first symptom match wins) ───────────────────
-        let suggestedSpecialty = 'General Physician';
-        if (Array.isArray(symptoms)) {
-            for (const symptom of symptoms) {
-                if (TRIAGE_CONFIG.SPECIALTY_MAP[symptom]) {
-                    suggestedSpecialty = TRIAGE_CONFIG.SPECIALTY_MAP[symptom];
-                    break;
-                }
-            }
-        }
+        const triageResult = computeTriageScore({
+            painRegions: painRegions || [],
+            painSeverity,
+            duration,
+            symptoms,
+            medicalHistory,
+            existingConditions,
+            lifestyleData: lifestyleData || {},
+        });
 
         const patientRecord = await prisma.patient.findUnique({ where: { userId } });
         if (!patientRecord) throw new Error('Patient profile not found');
 
+        // Map urgency to severity for backward compatibility
+        const severityMap = { CRITICAL: 'HIGH', URGENT: 'HIGH', MODERATE: 'MEDIUM', ROUTINE: 'LOW' };
+        const severity = severityMap[triageResult.urgencyLevel] || 'LOW';
+
         const triageSession = await prisma.triageSession.create({
             data: {
                 patientId: patientRecord.id,
+                branchId: patientRecord.branchId,
                 severity,
-                suggestedSpecialty,
-                isEscalated: tierKey === 'HIGH',
+                suggestedSpecialty: triageResult.suggestedSpecialty,
+                isEscalated: triageResult.urgencyLevel === 'CRITICAL' || triageResult.urgencyLevel === 'URGENT',
+                compositeScore: triageResult.compositeScore,
+                urgencyLevel: triageResult.urgencyLevel,
+                confidenceScore: triageResult.confidenceScore,
+                alternativeSpecialties: triageResult.alternativeSpecialties,
+                flags: triageResult.flags,
+                triageNotes: triageResult.triageNotes,
+                painRegions: painRegions || null,
+                lifestyleData: lifestyleData || null,
                 responses: {
-                    ...data,
-                    triageScore,
-                    confidenceScore,
-                    breakdown,
-                    classification,
-                    reasoning: reasoning.join(' | ')
+                    painArea, painSeverity, duration, symptoms, medicalHistory,
+                    medications, chiefComplaint, existingConditions,
+                    onsetPattern, allergies, currentMedications,
+                    triageScore: triageResult.compositeScore,
+                    confidenceScore: triageResult.confidenceScore,
+                    classification: triageResult.classification,
+                    reasoning: triageResult.reasoning,
+                    breakdown: triageResult.breakdown,
                 }
             }
         });
 
         logger.info(
-            `[Triage Decision] Patient: ${patientRecord.id} | ` +
-            `CompositeScore: ${triageScore} (confidence ${confidenceScore}%) | ` +
-            `Tier: ${tierKey} | Classification: ${classification}`
+            `[Triage] Patient: ${patientRecord.id} | Score: ${triageResult.compositeScore} | ` +
+            `Urgency: ${triageResult.urgencyLevel} | Specialty: ${triageResult.suggestedSpecialty}`
         );
 
-        // Notify Admin Doctors if priority is HIGH or Escalated
-        if (severity === 'HIGH' || triageSession.isEscalated) {
-            // If the patient has no branch, notify ALL admin doctors (branch-less filter
-            // with { branchId: null } would return zero results if all admins are branch-assigned).
+        // Notify Admin Doctors for URGENT/CRITICAL
+        if (triageResult.urgencyLevel === 'CRITICAL' || triageResult.urgencyLevel === 'URGENT') {
             const branchFilter = patientRecord.branchId ? { branchId: patientRecord.branchId } : {};
             const adminDoctors = await prisma.user.findMany({
                 where: { role: 'ADMIN_DOCTOR', ...branchFilter },
@@ -178,8 +312,8 @@ export class TriageService {
                 await notificationService.createNotification({
                     userId: admin.id,
                     type: 'TRIAGE_ESCALATION',
-                    title: '🚨 High Priority Triage Escalation',
-                    message: `A new high-severity triage assessment has been submitted by ${patientRecord.fullName || 'a patient'}. Immediate review required.`,
+                    title: 'High Priority Triage Escalation',
+                    message: `A ${triageResult.urgencyLevel} triage assessment from ${patientRecord.fullName || 'a patient'}. Score: ${triageResult.compositeScore}/10. Specialty: ${triageResult.suggestedSpecialty}.`,
                     priority: 'HIGH',
                     data: { triageSessionId: triageSession.id, patientId: patientRecord.id }
                 });
@@ -195,11 +329,7 @@ export class TriageService {
 
         return {
             ...triageSession,
-            classification,
-            triageScore,
-            confidenceScore,
-            breakdown,
-            reasoning: reasoning.join(' | ')
+            ...triageResult,
         };
     }
 
@@ -233,4 +363,32 @@ export class TriageService {
             include: { appointment: true }
         });
     }
+
+    static async getSessionById(sessionId, userId, userRole) {
+        const session = await prisma.triageSession.findUnique({
+            where: { id: sessionId },
+            include: { patient: true, documents: true, appointment: true }
+        });
+
+        if (!session) {
+            const error = new Error('Triage session not found');
+            error.status = 404;
+            throw error;
+        }
+
+        // IDOR protection: patients can only view their own sessions
+        if (userRole === 'PATIENT') {
+            const patientRecord = await prisma.patient.findUnique({ where: { userId } });
+            if (!patientRecord || session.patientId !== patientRecord.id) {
+                const error = new Error('Forbidden');
+                error.status = 403;
+                throw error;
+            }
+        }
+
+        return session;
+    }
 }
+
+// Export for testing
+export { computeTriageScore };

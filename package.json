@@ -7,16 +7,27 @@
     "dev": "nodemon index.js",
     "start": "node index.js",
     "prisma": "prisma",
-    "seed": "node prisma/seed.js"
+    "seed": "node prisma/seed.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "migrate:safe": "prisma migrate status && prisma migrate deploy",
+    "prestart": "npm run migrate:safe"
   },
   "prisma": {
     "seed": "node prisma/seed.js"
   },
   "dependencies": {
+    "@bull-board/api": "^6.21.1",
+    "@bull-board/express": "^6.21.1",
     "@prisma/client": "^5.22.0",
+    "@sentry/node": "^10.48.0",
+    "@sentry/profiling-node": "^10.48.0",
+    "@socket.io/redis-adapter": "^8.3.0",
     "archiver": "^7.0.1",
     "bcrypt": "^5.1.0",
     "bull": "^4.16.5",
+    "bullmq": "^5.73.5",
     "cors": "^2.8.5",
     "csv-parser": "^3.2.0",
     "csv-writer": "^1.6.0",
@@ -26,21 +37,31 @@
     "helmet": "^8.1.0",
     "i18next": "^25.8.4",
     "i18next-http-middleware": "^3.9.2",
+    "ioredis": "^5.10.1",
     "jsonwebtoken": "^9.0.2",
     "morgan": "^1.10.0",
     "multer": "^2.0.2",
     "node-cron": "^4.2.1",
     "nodemailer": "^8.0.0",
+    "otplib": "^13.4.0",
     "pdfkit": "^0.17.2",
+    "qrcode": "^1.5.4",
+    "razorpay": "^2.9.6",
     "redis": "^5.10.0",
     "socket.io": "^4.8.3",
+    "swagger-jsdoc": "^6.2.8",
+    "swagger-ui-express": "^5.0.1",
     "twilio": "^5.12.1",
     "web-push": "^3.6.7",
+    "winston-daily-rotate-file": "^5.0.0",
     "zod": "^3.22.4"
   },
   "devDependencies": {
+    "@types/qrcode": "^1.5.6",
     "cross-env": "^10.1.0",
     "nodemon": "^3.0.3",
-    "prisma": "^5.10.2"
+    "prisma": "^5.10.2",
+    "supertest": "^7.2.2",
+    "vitest": "^4.1.4"
   }
 }

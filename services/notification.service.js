@@ -3,6 +3,8 @@ import { emitToUser } from '../websocket/index.js';
 import logger from '../lib/logger.js';
 import config from '../config/index.js';
 import { enqueueAppointmentWebhook } from './queue.service.js';
+import { emailService } from './email.service.js';
+import { smsService } from './sms.service.js';
 
 // ─── SCALING NOTE ────────────────────────────────────────────────────────────
 // The previous module-level `processedIds = new Set()` was removed.
@@ -13,6 +15,28 @@ import { enqueueAppointmentWebhook } from './queue.service.js';
 // ─────────────────────────────────────────────────────────────────────────────
 
 export class NotificationService {
+    /**
+     * Track a delivery attempt for a notification (best-effort, never throws)
+     */
+    static async trackDelivery(notificationId, channel, { status, externalId, errorMessage } = {}) {
+        try {
+            return await prisma.notificationDelivery.create({
+                data: {
+                    notificationId,
+                    channel,
+                    status: status || 'SENT',
+                    externalId: externalId || null,
+                    errorMessage: errorMessage || null,
+                    attemptCount: 1,
+                    sentAt: status === 'SENT' || !status ? new Date() : null,
+                }
+            });
+        } catch (err) {
+            // Delivery tracking is best-effort — don't fail the notification
+            console.error(`[NotificationDelivery] Failed to track ${channel} delivery:`, err.message);
+        }
+    }
+
     /**
      * Send appointment confirmation to n8n webhook
      */
@@ -270,6 +294,10 @@ export class NotificationService {
             });
 
             emitToUser(userId, 'new_notification', notification);
+
+            // Track in-app delivery
+            await NotificationService.trackDelivery(notification.id, 'IN_APP', { status: 'SENT' });
+
             return notification;
         } catch (error) {
             logger.error(`[NotificationService] Failed to create notification`, error, { userId, type });
@@ -310,19 +338,32 @@ export class NotificationService {
     /**
      * Get user notifications
      */
-    async getUserNotifications(userId, { skip = 0, take = 20, unreadOnly = false } = {}) {
+    async getUserNotifications(userId, { page = 1, limit = 20, skip, take, unreadOnly = false } = {}) {
         const where = { userId };
         if (unreadOnly) where.isRead = false;
 
+        // Support both legacy skip/take and new page/limit params
+        const effectiveLimit = take ?? limit;
+        const effectiveSkip = skip ?? ((page - 1) * effectiveLimit);
+
         const [notifications, total, unreadCount] = await Promise.all([
             prisma.notification.findMany({
-                where, skip, take, orderBy: { createdAt: 'desc' }
+                where, skip: effectiveSkip, take: effectiveLimit, orderBy: { createdAt: 'desc' }
             }),
             prisma.notification.count({ where: { userId } }),
             prisma.notification.count({ where: { userId, isRead: false } })
         ]);
 
-        return { notifications, total, unreadCount };
+        const effectivePage = skip != null ? Math.floor(effectiveSkip / effectiveLimit) + 1 : page;
+
+        return {
+            data: notifications,
+            total,
+            page: effectivePage,
+            limit: effectiveLimit,
+            totalPages: Math.ceil(total / effectiveLimit),
+            unreadCount
+        };
     }
 
     /**
@@ -352,6 +393,46 @@ export class NotificationService {
         return await prisma.notification.count({
             where: { userId, isRead: false }
         });
+    }
+
+    /**
+     * Send an email and track the delivery against a notification record
+     */
+    async sendTrackedEmail(notificationId, to, title, message, data = {}) {
+        try {
+            const result = await emailService.sendNotification(to, title, message, data);
+            await NotificationService.trackDelivery(notificationId, 'EMAIL', {
+                status: 'SENT',
+                externalId: result?.messageId || null,
+            });
+            return result;
+        } catch (err) {
+            await NotificationService.trackDelivery(notificationId, 'EMAIL', {
+                status: 'FAILED',
+                errorMessage: err.message,
+            });
+            throw err;
+        }
+    }
+
+    /**
+     * Send an SMS and track the delivery against a notification record
+     */
+    async sendTrackedSMS(notificationId, to, message) {
+        try {
+            const result = await smsService.sendNotification(to, message);
+            await NotificationService.trackDelivery(notificationId, 'SMS', {
+                status: 'SENT',
+                externalId: result?.sid || null,
+            });
+            return result;
+        } catch (err) {
+            await NotificationService.trackDelivery(notificationId, 'SMS', {
+                status: 'FAILED',
+                errorMessage: err.message,
+            });
+            throw err;
+        }
     }
 }
 

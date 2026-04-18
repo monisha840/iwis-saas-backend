@@ -46,6 +46,31 @@ const updateAppointmentSchema = z.object({
   therapistDate: z.string().nullable().optional()
 });
 
+/**
+ * @swagger
+ * /appointments:
+ *   get:
+ *     tags: [Appointments]
+ *     summary: List appointments (role-scoped)
+ *     parameters:
+ *       - in: query
+ *         name: status
+ *         schema: { type: string, enum: [PENDING, CONFIRMED, COMPLETED, CANCELLED] }
+ *       - in: query
+ *         name: from
+ *         schema: { type: string, format: date }
+ *       - in: query
+ *         name: to
+ *         schema: { type: string, format: date }
+ *       - in: query
+ *         name: page
+ *         schema: { type: integer, default: 1 }
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, default: 20 }
+ *     responses:
+ *       200: { description: Paginated list of appointments }
+ */
 router.get('/', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST', 'PATIENT']), async (req, res, next) => {
   try {
     const appointments = await AppointmentService.getAppointments(req.user, req.query);
@@ -55,6 +80,33 @@ router.get('/', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR
   }
 });
 
+/**
+ * @swagger
+ * /appointments:
+ *   post:
+ *     tags: [Appointments]
+ *     summary: Create a new appointment
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [patientId, date, consultationType]
+ *             properties:
+ *               patientId: { type: string }
+ *               doctorId: { type: string }
+ *               therapistId: { type: string }
+ *               date: { type: string, format: date }
+ *               timeSlot: { type: string }
+ *               consultationType: { type: string, enum: [DOCTOR, THERAPIST, COMBINED] }
+ *               consultationMode: { type: string, enum: [OFFLINE, ONLINE] }
+ *               notes: { type: string }
+ *               branchId: { type: string }
+ *     responses:
+ *       201: { description: Appointment created }
+ *       400: { description: Validation error or slot unavailable }
+ */
 router.post('/', authMiddleware, roleMiddleware(['PATIENT', 'ADMIN', 'ADMIN_DOCTOR']), validate({ body: appointmentSchema }), auditAction('CREATE_APPOINTMENT', 'Appointment', () => null), async (req, res, next) => {
   try {
     // Strict control for PATIENT: ignore administrative fields
@@ -140,6 +192,47 @@ router.put('/:id/reject', authMiddleware, roleMiddleware(['DOCTOR', 'ADMIN', 'AD
       notes: reason ? `Rejected: ${reason}` : undefined
     });
     res.json(appointment);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/appointments/hold — soft-hold a slot for 10 minutes
+const holdSchema = z.object({
+  clinicianId: z.string(),
+  date: z.string(),
+  time: z.string(),
+});
+
+router.post('/hold', authMiddleware, validate({ body: holdSchema }), async (req, res, next) => {
+  try {
+    const result = await AppointmentService.holdSlot(
+      req.body.clinicianId,
+      req.body.date,
+      req.body.time,
+      req.user.id
+    );
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/appointments/slots — available slots with hold info
+const slotsQuerySchema = z.object({
+  clinicianId: z.string(),
+  date: z.string(),
+  branchId: z.string().optional(),
+});
+
+router.get('/slots', authMiddleware, async (req, res, next) => {
+  try {
+    const slots = await AppointmentService.getAvailableSlots(
+      req.query.clinicianId,
+      req.query.date,
+      req.query.branchId
+    );
+    res.json(slots);
   } catch (err) {
     next(err);
   }
