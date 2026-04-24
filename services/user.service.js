@@ -266,6 +266,7 @@ export class UserService {
 
         const {
             fullName, phoneNumber, profilePhoto, clinic,
+            bio, languages,
             dob, gender: rawGender, therapyType,
         } = data || {};
         const gender = rawGender !== undefined ? normaliseGender(rawGender) : undefined;
@@ -275,6 +276,16 @@ export class UserService {
             const err = new Error('Invalid phone number format'); err.status = 400; throw err;
         }
 
+        // Normalise languages once — trim, drop empties, dedupe (case-insensitive).
+        const normalisedLanguages = languages !== undefined
+            ? Array.from(new Map(
+                languages
+                    .map((l) => String(l || '').trim())
+                    .filter(Boolean)
+                    .map((l) => [l.toLowerCase(), l])
+              ).values())
+            : undefined;
+
         await prisma.$transaction(async (tx) => {
             if ((user.role === 'DOCTOR' || user.role === 'ADMIN_DOCTOR') && user.doctor) {
                 await tx.doctor.update({
@@ -283,6 +294,9 @@ export class UserService {
                         ...(fullName !== undefined && { fullName }),
                         ...(clinic !== undefined && { clinic: clinic || null }),
                         ...(profilePhoto !== undefined && { profilePhoto: profilePhoto || null }),
+                        ...(phoneNumber !== undefined && { phoneNumber: phoneNumber || null }),
+                        ...(bio !== undefined && { bio: bio || null }),
+                        ...(normalisedLanguages !== undefined && { languages: normalisedLanguages }),
                     },
                 });
             } else if (user.role === 'THERAPIST' && user.therapist) {
@@ -292,6 +306,9 @@ export class UserService {
                         ...(fullName !== undefined && { fullName }),
                         ...(clinic !== undefined && { clinic: clinic || null }),
                         ...(profilePhoto !== undefined && { profilePhoto: profilePhoto || null }),
+                        ...(phoneNumber !== undefined && { phoneNumber: phoneNumber || null }),
+                        ...(bio !== undefined && { bio: bio || null }),
+                        ...(normalisedLanguages !== undefined && { languages: normalisedLanguages }),
                     },
                 });
             } else if (user.role === 'PHARMACIST' && user.pharmacist) {
@@ -300,6 +317,9 @@ export class UserService {
                     data: {
                         ...(fullName !== undefined && { fullName }),
                         ...(profilePhoto !== undefined && { profilePhoto: profilePhoto || null }),
+                        ...(phoneNumber !== undefined && { phoneNumber: phoneNumber || null }),
+                        ...(bio !== undefined && { bio: bio || null }),
+                        ...(normalisedLanguages !== undefined && { languages: normalisedLanguages }),
                     },
                 });
             } else if (user.role === 'PATIENT' && user.patient) {

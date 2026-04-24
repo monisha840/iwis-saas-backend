@@ -31,6 +31,38 @@ const addPrescriptionSchema = z.object({
   sku: z.string().optional(),
 });
 
+// Advanced prescription search — text + status + date range + sort,
+// with role-aware scoping (PATIENT to own; DOCTOR/THERAPIST to authored;
+// ADMIN/ADMIN_DOCTOR/PHARMACIST to branch). Used by the new
+// PrescriptionManagement filter UI + the pharmacist verification queue.
+const prescriptionSearchSchema = z.object({
+  q: z.string().optional(),
+  status: z.enum(['ACTIVE', 'DISCONTINUED', 'FULLY_DISPENSED', 'OUT_OF_SUPPLY']).optional(),
+  patientId: z.string().optional(),
+  prescriberId: z.string().optional(),
+  medicineId: z.string().optional(),
+  hasVideo: z.preprocess(
+    (v) => v === undefined ? undefined : (v === 'true' || v === true ? true : v === 'false' || v === false ? false : v),
+    z.boolean().optional(),
+  ),
+  branchId: z.string().optional(),
+  dateFrom: z.string().optional(),
+  dateTo: z.string().optional(),
+  sortBy: z.enum(['createdAt', 'medicationName', 'totalQuantity', 'dispensedQty']).optional(),
+  sortOrder: z.enum(['asc', 'desc']).optional(),
+  page: z.string().optional().transform(v => v ? parseInt(v, 10) : undefined),
+  limit: z.string().optional().transform(v => v ? parseInt(v, 10) : undefined),
+});
+
+router.get('/search', authMiddleware, validate({ query: prescriptionSearchSchema }), async (req, res, next) => {
+  try {
+    const result = await PrescriptionService.searchPrescriptions(req.user, req.query);
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.get('/patient/:id', authMiddleware, async (req, res, next) => {
   try {
     const patientId = req.params.id;

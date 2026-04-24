@@ -96,6 +96,11 @@ model User {
   followUpsCreated           AppointmentFollowUp[]   @relation("FollowUpCreator")
   // Critical-journey flags this clinician has marked as resolved
   criticalFlagsResolved      PatientCriticalFlag[]   @relation("CriticalFlagResolver")
+  // Staff messaging (DMs + group chats)
+  staffThreadsCreated        StaffThread[]           @relation("StaffThreadCreator")
+  staffThreadMemberships     StaffThreadMember[]     @relation("StaffThreadMembership")
+  staffThreadMembersAdded    StaffThreadMember[]     @relation("StaffMemberAddedBy")
+  staffMessagesSent          StaffMessage[]          @relation("StaffMessageSender")
 
   @@index([branchId])
   @@index([hospitalId])
@@ -181,6 +186,8 @@ model Branch {
   selfExamSubmissions SelfExamSubmission[]
   // Critical-journey flags scoped to this branch (for branch-filtered admin dashboards)
   criticalFlags       PatientCriticalFlag[]
+  // Staff group chats scoped to this branch
+  staffThreads        StaffThread[]
 }
 
 model AuditLog {
@@ -217,6 +224,10 @@ model Doctor {
   // board). Nullable on the schema for back-compat; required at the form
   // and route layer for new records.
   registrationNumber String?
+  // Self-editable personal details surfaced on ProfilePage.
+  phoneNumber        String?
+  bio                String?
+  languages          String[]            @default([])
   appointments       Appointment[]
   conversations      Conversation[]
   user               User                @relation(fields: [userId], references: [id])
@@ -308,6 +319,10 @@ model Therapist {
   // Nullable on the schema for back-compat; required at the form and route
   // layer for new records.
   registrationNumber String?
+  // Self-editable personal details surfaced on ProfilePage.
+  phoneNumber        String?
+  bio                String?
+  languages          String[]            @default([])
   appointments       Appointment[]
   availability       Availability[]
   conversations      Conversation[]
@@ -329,6 +344,10 @@ model Pharmacist {
   profilePhoto    String?
   qualification   String?
   yearsExperience Int?
+  // Self-editable personal details surfaced on ProfilePage.
+  phoneNumber     String?
+  bio             String?
+  languages       String[] @default([])
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
   user            User     @relation(fields: [userId], references: [id])
@@ -1064,6 +1083,100 @@ model Message {
 
   @@index([conversationId, createdAt]) // Composite covers single-column conversationId queries
   @@index([createdAt])
+}
+
+// ─── Staff messaging (DMs + branch group chats) ──────────────────────────
+// Separate from the patient-clinician `Conversation` table so the polymorphic
+// thread shape (1-on-1 staff DM vs. multi-member group) doesn't pollute the
+// existing patient chat domain. Tenancy isolation via `hospitalId` is
+// enforced in the service layer on every read/write.
+
+enum StaffThreadKind {
+  DIRECT
+  GROUP
+}
+
+enum StaffThreadMemberRole {
+  OWNER   // group creator
+  ADMIN   // can add/remove members (admin doctor auto-included as ADMIN)
+  MEMBER  // can read/write only
+}
+
+enum StaffMessageKind {
+  TEXT
+  SYSTEM   // "Alice was added by Bob" — sender may be null
+}
+
+model StaffThread {
+  id          String                @id @default(uuid())
+  kind        StaffThreadKind
+  // Display name for groups; null for DIRECT (rendered from the partner's name).
+  title       String?
+  hospitalId  String
+  // Optional branch scope for groups. Cross-branch DMs leave it null.
+  branchId    String?
+  // Sorted-pair key for DIRECT threads ("uidA:uidB" with uidA < uidB).
+  // Null for GROUP. Unique index dedupes DMs at the DB level.
+  directKey   String?               @unique
+  createdById String
+  archivedAt  DateTime?
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+
+  hospital    Hospital              @relation(fields: [hospitalId], references: [id])
+  branch      Branch?               @relation(fields: [branchId], references: [id])
+  createdBy   User                  @relation("StaffThreadCreator", fields: [createdById], references: [id])
+  members     StaffThreadMember[]
+  messages    StaffMessage[]
+
+  @@index([hospitalId])
+  @@index([branchId])
+  @@index([kind])
+  @@index([updatedAt])
+}
+
+model StaffThreadMember {
+  id             String                @id @default(uuid())
+  threadId       String
+  userId         String
+  role           StaffThreadMemberRole @default(MEMBER)
+  // True for admin doctors auto-included on group creation. The flag prevents
+  // group OWNERs from removing oversight members; only system ADMIN can.
+  isAutoIncluded Boolean               @default(false)
+  joinedAt       DateTime              @default(now())
+  // Used for unread-count math: messages with createdAt > lastReadAt count.
+  lastReadAt     DateTime?
+  // Soft-remove so we can show a complete history audit. Excluded from active
+  // member lists and message broadcast.
+  removedAt      DateTime?
+  addedById      String?
+
+  thread         StaffThread           @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  user           User                  @relation("StaffThreadMembership", fields: [userId], references: [id])
+  addedBy        User?                 @relation("StaffMemberAddedBy", fields: [addedById], references: [id])
+
+  @@unique([threadId, userId])
+  @@index([userId, removedAt])
+  @@index([threadId, removedAt])
+}
+
+model StaffMessage {
+  id        String           @id @default(uuid())
+  threadId  String
+  // Null for SYSTEM messages (member-add / member-remove notices).
+  senderId  String?
+  kind      StaffMessageKind @default(TEXT)
+  content   String
+  editedAt  DateTime?
+  // Soft delete — UI renders a tombstone "message removed" so threading reads
+  // still make sense after a deletion.
+  deletedAt DateTime?
+  createdAt DateTime         @default(now())
+
+  thread    StaffThread      @relation(fields: [threadId], references: [id], onDelete: Cascade)
+  sender    User?            @relation("StaffMessageSender", fields: [senderId], references: [id])
+
+  @@index([threadId, createdAt])
 }
 
 enum Role {
@@ -2139,6 +2252,7 @@ model Hospital {
   messageTemplates MessageTemplate[]
   reminderSetting  ReminderSetting?
   reminderDeliveryLogs ReminderDeliveryLog[]
+  staffThreads     StaffThread[]
 
   @@index([status])
   @@index([plan])
@@ -3043,6 +3157,9 @@ enum ReminderKind {
   DAILY_CHECKIN
   APPOINTMENT_CONFIRMATION
   APPOINTMENT_REMINDER
+  MEDICATION_MISSED_FOLLOWUP
+  MEDICATION_REFILL_3D
+  MEDICATION_REFILL_LAST_DAY
 }
 
 enum DeliveryStatus {

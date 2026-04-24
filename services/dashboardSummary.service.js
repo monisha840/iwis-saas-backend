@@ -368,6 +368,7 @@ export class DashboardSummaryService {
         const scope = (!branchId || branchId === 'ALL') ? null : branchId;
         const today = startOfToday();
         const tomorrow = endOfToday();
+        const monthStart = startOfMonth();
 
         const baseWhere = scope ? { branchId: scope } : {};
         const [
@@ -381,6 +382,8 @@ export class DashboardSummaryService {
             todos,
             assignedByMe,
             leaderboard,
+            scopeMonthlyCompleted,
+            scopeMonthlyTotal,
         ] = await Promise.all([
             prisma.appointment.count({
                 where: { ...baseWhere, date: { gte: today, lte: tomorrow } },
@@ -442,6 +445,12 @@ export class DashboardSummaryService {
                 take: 15,
             }),
             ClinicianXPService.getLeaderboard({ branchId: scope, limit: 5 }),
+            prisma.appointment.count({
+                where: { ...baseWhere, status: 'COMPLETED', date: { gte: monthStart } },
+            }),
+            prisma.appointment.count({
+                where: { ...baseWhere, date: { gte: monthStart } },
+            }),
         ]);
 
         // Critical Journey count — exposed as a separate top-level stat
@@ -453,27 +462,50 @@ export class DashboardSummaryService {
             .count({ where: adminDocCriticalWhere })
             .catch(() => 0);
 
-        // Enrich staffTable with workload numbers
+        // Enrich staffTable with workload + analytics + gamification metrics.
+        // Admin doctor has full oversight visibility: they see clinical
+        // throughput (completion / no-show rates) AND the gamification
+        // signals (XP / level / title) so they can supervise the engagement
+        // program without participating in it themselves.
         const enrichedStaff = [];
         for (const u of staffTable) {
             const profileId = u.doctor?.id || u.therapist?.id;
             if (!profileId) continue;
             const isTherapist = u.role === 'THERAPIST';
-            const [apptsToday, pendingApprovals, patientLoad] = await Promise.all([
+            const idWhere = isTherapist ? { therapistId: profileId } : { doctorId: profileId };
+            const [
+                apptsToday,
+                pendingApprovals,
+                patientLoad,
+                monthlyCompleted,
+                monthlyTotal,
+                monthlyNoShow,
+            ] = await Promise.all([
                 prisma.appointment.count({
-                    where: isTherapist
-                        ? { therapistId: profileId, date: { gte: today, lte: tomorrow } }
-                        : { doctorId: profileId, date: { gte: today, lte: tomorrow } },
+                    where: { ...idWhere, date: { gte: today, lte: tomorrow } },
                 }),
                 prisma.appointment.count({
-                    where: isTherapist
-                        ? { therapistId: profileId, status: { in: ['REQUESTED', 'PENDING'] } }
-                        : { doctorId: profileId, status: { in: ['REQUESTED', 'PENDING'] } },
+                    where: { ...idWhere, status: { in: ['REQUESTED', 'PENDING'] } },
                 }),
                 prisma.treatmentJourney.count({
                     where: { doctorId: u.id, status: 'ACTIVE' },
                 }),
+                prisma.appointment.count({
+                    where: { ...idWhere, status: 'COMPLETED', date: { gte: monthStart } },
+                }),
+                prisma.appointment.count({
+                    where: { ...idWhere, date: { gte: monthStart } },
+                }),
+                prisma.appointment.count({
+                    where: { ...idWhere, status: 'NO_SHOW', date: { gte: monthStart } },
+                }).catch(() => 0),
             ]);
+            const completionRate = monthlyTotal > 0
+                ? Math.round((monthlyCompleted / monthlyTotal) * 100)
+                : null;
+            const noShowRate = monthlyTotal > 0
+                ? Math.round((monthlyNoShow / monthlyTotal) * 100)
+                : null;
             enrichedStaff.push({
                 id: u.id,
                 name: u.doctor?.fullName || u.therapist?.fullName || u.email,
@@ -484,8 +516,73 @@ export class DashboardSummaryService {
                 appointmentsToday: apptsToday,
                 pendingApprovals,
                 patientLoad,
+                monthlyCompleted,
+                monthlyTotal,
+                completionRate,
+                noShowRate,
             });
         }
+
+        // Workload distribution buckets — how many clinicians fall into each
+        // monthly-completed band. Replaces the old XP-level histogram.
+        const workloadDistribution = (() => {
+            const buckets = [
+                { label: '0',      min: 0,   max: 0,        count: 0 },
+                { label: '1-10',   min: 1,   max: 10,       count: 0 },
+                { label: '11-25',  min: 11,  max: 25,       count: 0 },
+                { label: '26-50',  min: 26,  max: 50,       count: 0 },
+                { label: '51-100', min: 51,  max: 100,      count: 0 },
+                { label: '100+',   min: 101, max: Infinity, count: 0 },
+            ];
+            for (const s of enrichedStaff) {
+                const b = buckets.find(bk => s.monthlyCompleted >= bk.min && s.monthlyCompleted <= bk.max);
+                if (b) b.count += 1;
+            }
+            return buckets.map(({ min: _min, max: _max, ...rest }) => rest);
+        })();
+
+        // Top 3 performers by monthly completed consults — analytics ranking,
+        // not a leaderboard. Ties broken by completion rate.
+        const topPerformers = [...enrichedStaff]
+            .filter(s => s.monthlyCompleted > 0)
+            .sort((a, b) => {
+                if (b.monthlyCompleted !== a.monthlyCompleted) return b.monthlyCompleted - a.monthlyCompleted;
+                return (b.completionRate || 0) - (a.completionRate || 0);
+            })
+            .slice(0, 3)
+            .map(s => ({
+                userId: s.id,
+                name: s.name,
+                role: s.role,
+                monthlyCompleted: s.monthlyCompleted,
+                completionRate: s.completionRate,
+            }));
+
+        // Weekly delegation-follow-through — how often todos this admin-doctor
+        // (or any assigner) hands out actually get finished. Kept because it's
+        // an operational KPI for admin oversight, not a gamified score.
+        const todoCompletionRate = await (async () => {
+            const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+            try {
+                const rows = await prisma.todo.findMany({
+                    where: {
+                        ...(scope ? { branchId: scope } : {}),
+                        createdAt: { gte: weekAgo },
+                    },
+                    select: { status: true, createdById: true, assignedToId: true },
+                });
+                const assigned = rows.filter(r => r.createdById !== r.assignedToId);
+                if (assigned.length === 0) return null;
+                const completed = assigned.filter(r => r.status === 'COMPLETED').length;
+                return Math.round((completed / assigned.length) * 100);
+            } catch {
+                return null;
+            }
+        })();
+
+        const scopeCompletionRate = scopeMonthlyTotal > 0
+            ? Math.round((scopeMonthlyCompleted / scopeMonthlyTotal) * 100)
+            : null;
 
         return {
             greeting: {
@@ -526,6 +623,17 @@ export class DashboardSummaryService {
                     name: t.assignedTo.doctor?.fullName || t.assignedTo.therapist?.fullName || t.assignedTo.email,
                 },
             })),
+            analytics: {
+                topPerformers,
+                workloadDistribution,
+                todoCompletionRate,
+                monthlyCompleted: scopeMonthlyCompleted,
+                monthlyTotal: scopeMonthlyTotal,
+                monthlyCompletionRate: scopeCompletionRate,
+            },
+            // Gamification oversight for admin doctor — they supervise the
+            // program so they need full visibility into leaderboard standings
+            // and XP distribution without being participants themselves.
             gamification: {
                 topPodium: leaderboard.slice(0, 3),
                 xpDistribution: await (async () => {
@@ -535,26 +643,7 @@ export class DashboardSummaryService {
                     }).catch(() => []);
                     return rows.map(r => ({ level: r.level, count: r._count.userId }));
                 })(),
-                todoCompletionRate: await (async () => {
-                    // "Assigned" = createdBy != assignedTo; we approximate by counting rows
-                    // where createdById differs, via raw filter.
-                    const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
-                    try {
-                        const rows = await prisma.todo.findMany({
-                            where: {
-                                ...(scope ? { branchId: scope } : {}),
-                                createdAt: { gte: weekAgo },
-                            },
-                            select: { status: true, createdById: true, assignedToId: true },
-                        });
-                        const assigned = rows.filter(r => r.createdById !== r.assignedToId);
-                        if (assigned.length === 0) return null;
-                        const completed = assigned.filter(r => r.status === 'COMPLETED').length;
-                        return Math.round((completed / assigned.length) * 100);
-                    } catch {
-                        return null;
-                    }
-                })(),
+                todoCompletionRate,
             },
         };
     }

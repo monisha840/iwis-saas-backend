@@ -32,6 +32,7 @@ import pharmacyRoutes from './routes/pharmacy.js';
 import triageRoutes from './routes/triage.js';
 import wellnessRoutes from './routes/wellness.js';
 import chatRoutes from './routes/chat.js';
+import staffChatRoutes from './routes/staff-chat.js';
 import branchRoutes from './routes/branch.js';
 import availabilityRoutes from './routes/availability.js';
 import adherenceRoutes from './routes/adherence.js';
@@ -186,6 +187,9 @@ app.use('/api/pharmacy', pharmacyRoutes);
 app.use('/api/triage', triageRoutes);
 app.use('/api/wellness', wellnessRoutes);
 app.use('/api/chat', chatRoutes);
+// Staff DMs + branch group chats — separate domain from patient chat,
+// see services/staffChat.service.js for RBAC + tenancy rules.
+app.use('/api/staff-chat', staffChatRoutes);
 app.use('/api/branches', branchRoutes);
 app.use('/api/availability', availabilityRoutes);
 app.use('/api/adherence', adherenceRoutes);

@@ -370,10 +370,7 @@ export async function runMissedDoseSweep() {
 
             await DeliveryService.send({
                 userId,
-                // Reuse existing ReminderKind; extending the enum would force a
-                // migration-order issue (enum values cannot be used in the same
-                // transaction they are added in on Postgres).
-                kind: 'APPOINTMENT_REMINDER',
+                kind: 'MEDICATION_MISSED_FOLLOWUP',
                 channels: ['WHATSAPP', 'SMS', 'IN_APP'],
                 body,
                 subject: rendered?.subject || null,
@@ -474,7 +471,7 @@ export async function runRefillForecastSweep() {
                     const body = rendered?.body || fallback;
                     await DeliveryService.send({
                         userId,
-                        kind: 'APPOINTMENT_REMINDER',
+                        kind: 'MEDICATION_REFILL_LAST_DAY',
                         channels: ['WHATSAPP', 'SMS', 'IN_APP'],
                         body,
                         subject: rendered?.subject || null,

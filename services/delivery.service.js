@@ -35,7 +35,7 @@ export class DeliveryService {
      * @param {string=}  opts.hospitalId     — optional; stored on log
      * @param {string=}  opts.appointmentId  — optional; stored on log
      * @param {string=}  opts.templateId     — optional; stored on log
-     * @param {'DAILY_CHECKIN'|'APPOINTMENT_CONFIRMATION'|'APPOINTMENT_REMINDER'} opts.kind
+     * @param {'DAILY_CHECKIN'|'APPOINTMENT_CONFIRMATION'|'APPOINTMENT_REMINDER'|'MEDICATION_MISSED_FOLLOWUP'|'MEDICATION_REFILL_3D'|'MEDICATION_REFILL_LAST_DAY'} opts.kind
      * @param {string[]=} opts.channels      — ordered channel list; defaults to WA→SMS→EMAIL
      * @param {string}   opts.body           — rendered message body
      * @param {string=}  opts.subject        — email subject; ignored for SMS/WA
@@ -230,9 +230,12 @@ export class DeliveryService {
 
 function kindToNotificationType(kind) {
     switch (kind) {
-        case 'DAILY_CHECKIN':            return 'DAILY_CHECKIN_REMINDER';
-        case 'APPOINTMENT_CONFIRMATION': return 'APPOINTMENT_CONFIRMATION';
-        case 'APPOINTMENT_REMINDER':     return 'APPOINTMENT_REMINDER';
+        case 'DAILY_CHECKIN':                return 'DAILY_CHECKIN_REMINDER';
+        case 'APPOINTMENT_CONFIRMATION':     return 'APPOINTMENT_CONFIRMATION';
+        case 'APPOINTMENT_REMINDER':         return 'APPOINTMENT_REMINDER';
+        case 'MEDICATION_MISSED_FOLLOWUP':   return 'MEDICATION_MISSED_FOLLOWUP';
+        case 'MEDICATION_REFILL_3D':         return 'MEDICATION_REFILL_3D';
+        case 'MEDICATION_REFILL_LAST_DAY':   return 'MEDICATION_REFILL_LAST_DAY';
         default: return 'GENERAL';
     }
 }

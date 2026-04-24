@@ -7,6 +7,10 @@ const includeDetails = {
     therapist: { include: { user: true } },
 };
 
+// Empty-result placeholders for the search RBAC short-circuit paths.
+const emptyFacets = () => ({ active: 0, discontinued: 0, withVideo: 0 });
+const emptyPagination = (page, limit) => ({ total: 0, page, limit, totalPages: 1 });
+
 export class PrescriptionService {
     static async getPatientPrescriptions(patientId, user) {
         let allowed = false;
@@ -206,6 +210,159 @@ export class PrescriptionService {
             include: includeDetails,
             orderBy: { createdAt: 'desc' }
         });
+    }
+
+    /**
+     * Advanced prescription search for the pharmacy verification queue
+     * + clinician dashboards. Combines text search across medication
+     * name / SKU / patient name with status (active / discontinued /
+     * fully-dispensed), date range, prescriber, and a hasVideo toggle.
+     * Returns a paginated envelope plus facet counts.
+     *
+     * RBAC scoping:
+     *   - PATIENT: limited to own prescriptions (patientId derived from user).
+     *   - DOCTOR / THERAPIST: own-prescribed only (doctor.userId or therapist.userId match).
+     *   - ADMIN_DOCTOR / ADMIN / PHARMACIST: hospital scope (via branchId).
+     *
+     * Filter contract:
+     *   q              — substring match on medicationName, sku, patient.fullName
+     *   status         — ACTIVE | DISCONTINUED | FULLY_DISPENSED | OUT_OF_SUPPLY
+     *   patientId      — Patient.id (admin/clinician use)
+     *   prescriberId   — User.id of prescribing doctor or therapist
+     *   medicineId     — exact Medicine.id
+     *   hasVideo       — boolean
+     *   branchId       — restricts to a specific branch
+     *   dateFrom/To    — ISO date strings (createdAt range)
+     *   sortBy         — createdAt | medicationName | totalQuantity
+     *   sortOrder      — asc | desc
+     *   page / limit   — pagination (default 1 / 20, max 100)
+     */
+    static async searchPrescriptions(user, filters = {}) {
+        const {
+            q, status, patientId, prescriberId, medicineId, hasVideo,
+            branchId, dateFrom, dateTo,
+            sortBy = 'createdAt', sortOrder = 'desc',
+            page = 1, limit = 20,
+        } = filters;
+
+        const pageInt = Math.max(1, parseInt(page, 10) || 1);
+        const limitInt = Math.min(100, Math.max(1, parseInt(limit, 10) || 20));
+
+        const where = {};
+
+        // RBAC scoping ------------------------------------------------
+        if (user.role === 'PATIENT') {
+            const patientRecord = await prisma.patient.findUnique({
+                where: { userId: user.id }, select: { id: true },
+            });
+            if (!patientRecord) {
+                return { prescriptions: [], facets: emptyFacets(), pagination: emptyPagination(pageInt, limitInt) };
+            }
+            where.patientId = patientRecord.id;
+        } else if (user.role === 'DOCTOR') {
+            const doctor = await prisma.doctor.findUnique({ where: { userId: user.id }, select: { id: true } });
+            if (doctor) where.doctorId = doctor.id;
+            else where.id = '__none__'; // no doctor profile → no results
+        } else if (user.role === 'THERAPIST') {
+            const therapist = await prisma.therapist.findUnique({ where: { userId: user.id }, select: { id: true } });
+            if (therapist) where.therapistId = therapist.id;
+            else where.id = '__none__';
+        } else if (user.role === 'PHARMACIST' || user.role === 'ADMIN_DOCTOR' || user.role === 'ADMIN') {
+            // Branch-scoped staff fall back to their own branch unless
+            // an explicit branchId was passed (admin-doctor cross-branch).
+            if (user.branchId) where.branchId = user.branchId;
+        }
+
+        // Caller-supplied scope overrides (admins only)
+        if (branchId && (user.role === 'ADMIN' || user.role === 'ADMIN_DOCTOR')) {
+            where.branchId = branchId;
+        }
+        if (patientId) where.patientId = patientId;
+        if (medicineId) where.medicineId = medicineId;
+
+        if (prescriberId) {
+            // Match either doctor or therapist user.id
+            where.OR = [
+                { doctor: { userId: prescriberId } },
+                { therapist: { userId: prescriberId } },
+            ];
+        }
+
+        if (q && q.trim()) {
+            const term = q.trim();
+            const textOr = [
+                { medicationName: { contains: term, mode: 'insensitive' } },
+                { sku:            { contains: term, mode: 'insensitive' } },
+                { patient: { fullName: { contains: term, mode: 'insensitive' } } },
+                { medicine: { name: { contains: term, mode: 'insensitive' } } },
+            ];
+            // Merge with any existing OR (prescriberId) — combine via AND
+            if (where.OR) {
+                where.AND = [{ OR: where.OR }, { OR: textOr }];
+                delete where.OR;
+            } else {
+                where.OR = textOr;
+            }
+        }
+
+        if (hasVideo === true || hasVideo === 'true') where.videoUrl = { not: null };
+
+        if (status === 'DISCONTINUED') where.discontinuedAt = { not: null };
+        if (status === 'ACTIVE') where.discontinuedAt = null;
+        if (status === 'FULLY_DISPENSED') {
+            // Active and fully dispensed (rare clinical state — usually
+            // means the patient finished the course).
+            where.discontinuedAt = null;
+            where.AND = [...(where.AND || []), { dispensedQty: { gt: 0 } }];
+        }
+        if (status === 'OUT_OF_SUPPLY') {
+            where.discontinuedAt = null;
+            where.totalQuantity = { lte: 0 };
+        }
+
+        if (dateFrom || dateTo) {
+            where.createdAt = {};
+            if (dateFrom) where.createdAt.gte = new Date(dateFrom);
+            if (dateTo)   where.createdAt.lte = new Date(dateTo);
+        }
+
+        const sortable = new Set(['createdAt', 'medicationName', 'totalQuantity', 'dispensedQty']);
+        const orderBy = sortable.has(sortBy)
+            ? { [sortBy]: sortOrder === 'asc' ? 'asc' : 'desc' }
+            : { createdAt: 'desc' };
+
+        const [rows, total, activeCount, discontinuedCount, withVideoCount] = await Promise.all([
+            prisma.prescription.findMany({
+                where,
+                include: {
+                    ...includeDetails,
+                    patient: { select: { id: true, fullName: true, phoneNumber: true } },
+                    medicine: { select: { id: true, name: true, sku: true, videoUrl: true } },
+                },
+                orderBy,
+                skip: (pageInt - 1) * limitInt,
+                take: limitInt,
+            }),
+            prisma.prescription.count({ where }),
+            prisma.prescription.count({ where: { ...where, discontinuedAt: null } }),
+            prisma.prescription.count({ where: { ...where, discontinuedAt: { not: null } } }),
+            prisma.prescription.count({ where: { ...where, videoUrl: { not: null } } }),
+        ]);
+
+        return {
+            prescriptions: rows,
+            facets: {
+                active: activeCount,
+                discontinued: discontinuedCount,
+                withVideo: withVideoCount,
+            },
+            pagination: {
+                total,
+                page: pageInt,
+                limit: limitInt,
+                totalPages: Math.max(1, Math.ceil(total / limitInt)),
+            },
+        };
     }
 
     /**

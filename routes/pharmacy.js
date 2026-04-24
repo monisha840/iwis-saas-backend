@@ -30,8 +30,36 @@ const medicineSchema = z.object({
     manufacturer: z.string().optional(),
     composition: z.string().optional(),
     description: z.string().optional(),
+    riskLevel: z.string().optional(),
+    // Optional YouTube URL for patient education / dosage instructions.
+    // Service-level validator (assertYouTubeUrl) enforces the URL is YouTube.
+    videoUrl: z.string().optional().nullable(),
     stock: z.number().or(z.string()).transform(v => typeof v === 'string' ? parseInt(v) : v).refine(v => v >= 0 && v <= 100000, { message: 'Stock must be between 0 and 100,000' }).optional().default(0),
     price: z.number().or(z.string()).transform(v => typeof v === 'string' ? parseFloat(v) : v),
+});
+
+// Coerce truthy/falsey strings without choking on undefined.
+const boolish = z.preprocess(
+    (v) => v === undefined ? undefined : (v === 'true' || v === true ? true : v === 'false' || v === false ? false : v),
+    z.boolean().optional(),
+);
+
+const inventorySearchSchema = z.object({
+    q: z.string().optional(),
+    category: z.string().optional(),
+    type: z.string().optional(),
+    manufacturer: z.string().optional(),
+    riskLevel: z.string().optional(),
+    availability: z.enum(['IN_STOCK', 'LOW_STOCK', 'OUT_OF_STOCK']).optional(),
+    hasVideo: boolish,
+    expiringInDays: z.string().optional().transform(v => v ? parseInt(v, 10) : undefined),
+    priceMin: z.string().optional().transform(v => v ? parseFloat(v) : undefined),
+    priceMax: z.string().optional().transform(v => v ? parseFloat(v) : undefined),
+    sortBy: z.enum(['name', 'price', 'totalStock', 'createdAt', 'sku', 'category']).optional(),
+    sortOrder: z.enum(['asc', 'desc']).optional(),
+    page: z.string().optional().transform(v => v ? parseInt(v, 10) : undefined),
+    limit: z.string().optional().transform(v => v ? parseInt(v, 10) : undefined),
+    branchId: z.string().optional(),
 });
 
 const positiveInt = z.number().or(z.string())
@@ -87,6 +115,33 @@ router.get('/medicines', authMiddleware, roleMiddleware(['ADMIN', 'PHARMACIST', 
         const isAdmin = req.user.role === 'ADMIN' || req.user.role === 'ADMIN_DOCTOR';
         const branchId = isAdmin ? (req.query.branchId || null) : req.user.branchId;
         const data = await PharmacyService.getAllMedicines(branchId);
+        res.json(data);
+    } catch (err) {
+        next(err);
+    }
+});
+
+// Advanced inventory search — superset of /medicines that supports text
+// search, categorical filters, availability buckets, and a paginated
+// envelope with facet counts. UI uses this for the new filter controls.
+router.get('/medicines/search', authMiddleware, roleMiddleware(['ADMIN', 'PHARMACIST', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST']), validate({ query: inventorySearchSchema }), async (req, res, next) => {
+    try {
+        const isAdmin = req.user.role === 'ADMIN' || req.user.role === 'ADMIN_DOCTOR';
+        const branchId = isAdmin ? (req.query.branchId || null) : req.user.branchId;
+        const data = await PharmacyService.searchMedicines(branchId, req.query);
+        res.json(data);
+    } catch (err) {
+        next(err);
+    }
+});
+
+// Distinct attribute lists for the inventory filter dropdowns. Light
+// query — used to populate <Select> options from the actual data set.
+router.get('/medicines/filter-options', authMiddleware, roleMiddleware(['ADMIN', 'PHARMACIST', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST']), async (req, res, next) => {
+    try {
+        const isAdmin = req.user.role === 'ADMIN' || req.user.role === 'ADMIN_DOCTOR';
+        const branchId = isAdmin ? (req.query.branchId || null) : req.user.branchId;
+        const data = await PharmacyService.getInventoryFilterOptions(branchId);
         res.json(data);
     } catch (err) {
         next(err);

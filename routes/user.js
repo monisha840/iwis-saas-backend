@@ -267,11 +267,15 @@ router.get('/features', authMiddleware, async (req, res, next) => {
 
 // Self-service profile update. Email / role / branch are intentionally excluded —
 // those are identity/tenancy changes that must go through an admin.
+// phoneNumber / bio / languages apply to clinicians (DOCTOR / ADMIN_DOCTOR /
+// THERAPIST / PHARMACIST) and patients — the service layer picks the right row.
 const updateMeSchema = z.object({
   fullName: z.string().min(2).max(100).optional(),
-  phoneNumber: z.string().regex(/^\+?[0-9]{7,15}$/).optional(),
+  phoneNumber: z.string().regex(/^\+?[0-9]{7,15}$/).nullable().optional(),
   profilePhoto: z.string().url().nullable().optional(),
   clinic: z.string().max(200).nullable().optional(),
+  bio: z.string().max(1000).nullable().optional(),
+  languages: z.array(z.string().trim().min(1).max(40)).max(10).optional(),
   dob: dobShape.optional(),
   gender: z.enum(GENDERS).optional(),
   therapyType: z.string().max(100).nullable().optional(),
