@@ -65,8 +65,8 @@ export class AppointmentsController {
   static async update(req, res, next) {
     try {
       const appointment = await AppointmentService.updateAppointment(
-        req.user,
         req.params.id,
+        req.user,
         req.body
       );
       res.json(appointment);
@@ -77,7 +77,7 @@ export class AppointmentsController {
 
   static async cancel(req, res, next) {
     try {
-      await AppointmentService.cancelAppointment(req.user, req.params.id);
+      await AppointmentService.cancelAppointment(req.params.id, req.user);
       res.json({ message: 'Appointment cancelled successfully' });
     } catch (err) {
       next(err);
@@ -86,9 +86,22 @@ export class AppointmentsController {
 
   static async getById(req, res, next) {
     try {
-      const appointment = await AppointmentService.getAppointmentById(req.user, req.params.id);
+      const appointment = await AppointmentService.getAppointmentById(req.params.id);
       if (!appointment) return res.status(404).json({ error: 'Appointment not found' });
       res.json(appointment);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  static async updateReminderTemplate(req, res, next) {
+    try {
+      const updated = await AppointmentService.updateReminderTemplate(
+        req.params.id,
+        req.user,
+        req.body,
+      );
+      res.json({ data: updated });
     } catch (err) {
       next(err);
     }

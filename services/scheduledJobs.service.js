@@ -24,6 +24,8 @@ const JOB_DEFINITIONS = [
     { name: 'post-session-followups', cron: '0 9 * * *', handler: 'postSessionFollowups' },
     { name: 'care-gap-alerts', cron: '0 8 * * 1', handler: 'careGapAlerts' },
     { name: 'medication-adherence-reminders', cron: '0 20 * * *', handler: 'medicationReminders' },
+    // Supply-based refill forecast: 3-day in-app + last-day WhatsApp (daily at 9am)
+    { name: 'medication-refill-forecast', cron: '0 9 * * *', handler: 'medicationRefillForecast' },
     { name: 'expiring-prescriptions', cron: '0 8 * * *', handler: 'expiringPrescriptions' },
     { name: 'detect-no-shows', cron: '*/15 * * * *', handler: 'detectNoShows' },
     { name: 'csat-surveys', cron: '*/15 * * * *', handler: 'csatSurveys' },
@@ -33,6 +35,21 @@ const JOB_DEFINITIONS = [
     { name: 'branch-competitions', cron: '0 3 * * *', handler: 'branchCompetitions' },
     { name: 'weekly-gamification-digest', cron: '0 9 * * 1', handler: 'weeklyDigest' },
     { name: 'streak-at-risk', cron: '0 20 * * *', handler: 'streakAtRisk' },
+    { name: 'feature-registry-sync', cron: '30 2 * * *', handler: 'featureRegistrySync' },
+    // Daily check-in broadcast — every minute. The handler itself matches the
+    // current HH:MM against each hospital's configured `dailyReminderTime`.
+    { name: 'daily-checkin-reminder', cron: '* * * * *', handler: 'dailyCheckinReminder' },
+    { name: 'wellness-decline-check', cron: '0 18 * * *', handler: 'wellnessDeclineCheck' },
+    // Dashboard refactor — todo overdue reminder sweep (every 30 min)
+    { name: 'todo-overdue-reminders', cron: '*/30 * * * *', handler: 'todoOverdueReminders' },
+    // Online consultation pre-call reminders (30 min + 5 min windows, single sweep every 5 min)
+    { name: 'online-call-reminders', cron: '*/5 * * * *', handler: 'onlineCallReminders' },
+    // Fallback auto-complete for ONLINE appointments whose end is >2h past (every 30 min)
+    { name: 'auto-complete-online-calls', cron: '*/30 * * * *', handler: 'autoCompleteOnlineCalls' },
+    // Flip PENDING follow-ups past their dueDate to MISSED (hourly)
+    { name: 'missed-followup-sweep', cron: '15 * * * *', handler: 'missedFollowUpSweep' },
+    // Detect adherence-based critical patients (every 4 hours)
+    { name: 'critical-journey-scan', cron: '0 */4 * * *', handler: 'criticalJourneyScan' },
 ];
 
 async function processJob(job) {
@@ -50,6 +67,7 @@ async function processJob(job) {
         postSessionFollowups: () => schedulerService.sendPostSessionFollowUps?.(),
         careGapAlerts: () => schedulerService.sendCareGapAlerts?.(),
         medicationReminders: () => schedulerService.sendMedicationAdherenceReminders?.(),
+        medicationRefillForecast: () => schedulerService.runMedicationRefillForecast?.(),
         expiringPrescriptions: () => schedulerService.checkExpiringPrescriptions?.(),
         detectNoShows: () => schedulerService.detectNoShows?.(),
         csatSurveys: () => schedulerService.sendCSATSurveys?.(),
@@ -59,6 +77,29 @@ async function processJob(job) {
         branchCompetitions: () => schedulerService.recalculateBranchCompetitions?.(),
         weeklyDigest: () => schedulerService.sendWeeklyGamificationDigest?.(),
         streakAtRisk: () => schedulerService.sendStreakAtRiskNotifications?.(),
+        featureRegistrySync: async () => {
+            const { runFeatureRegistrySync } = await import('./featureRegistrySync.service.js');
+            return runFeatureRegistrySync();
+        },
+        dailyCheckinReminder: async () => {
+            const { runDailyReminderTick } = await import('./dailyReminder.service.js');
+            return runDailyReminderTick();
+        },
+        wellnessDeclineCheck: () => schedulerService.detectWellnessDecline?.(),
+        todoOverdueReminders: async () => {
+            const { TodoService } = await import('./todo.service.js');
+            return TodoService.runOverdueReminderSweep();
+        },
+        onlineCallReminders:      () => schedulerService.sendOnlineCallReminders?.(),
+        autoCompleteOnlineCalls:  () => schedulerService.autoCompleteExpiredOnlineCalls?.(),
+        missedFollowUpSweep: async () => {
+            const { FollowUpService } = await import('./followUp.service.js');
+            return FollowUpService.detectMissedFollowUps();
+        },
+        criticalJourneyScan: async () => {
+            const { CriticalJourneyService } = await import('./criticalJourney.service.js');
+            return CriticalJourneyService.detect();
+        },
     };
 
     const fn = handlers[handler];

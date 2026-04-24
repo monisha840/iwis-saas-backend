@@ -46,15 +46,15 @@ class InventoryService {
     async deductStock(tx, items) {
         for (const item of items) {
             if (item.stockId) {
-                // Deduct from specific batch
-                const stock = await tx.medicineStock.findUnique({ where: { id: item.stockId } });
-                if (!stock || stock.quantity < item.quantity) {
-                    throw new Error(`Insufficient stock for batch ${item.stockId}`);
-                }
-                await tx.medicineStock.update({
-                    where: { id: item.stockId },
+                // Deduct from specific batch — guarded so we can't go negative
+                // under concurrent dispenses against the same batch.
+                const res = await tx.medicineStock.updateMany({
+                    where: { id: item.stockId, quantity: { gte: item.quantity } },
                     data: { quantity: { decrement: item.quantity } }
                 });
+                if (res.count === 0) {
+                    throw new Error(`Insufficient stock for batch ${item.stockId}`);
+                }
             } else {
                 // Auto-pick batches (FIFO: oldest first by expiry)
                 let remainingToDeduct = item.quantity;
@@ -74,10 +74,16 @@ class InventoryService {
                 for (const stock of stocks) {
                     if (remainingToDeduct === 0) break;
                     const deductFromThisStock = Math.min(stock.quantity, remainingToDeduct);
-                    const updatedStock = await tx.medicineStock.update({
-                        where: { id: stock.id },
+                    // Guarded decrement: refuse to go negative if a concurrent
+                    // transaction already drained this batch.
+                    const res = await tx.medicineStock.updateMany({
+                        where: { id: stock.id, quantity: { gte: deductFromThisStock } },
                         data: { quantity: { decrement: deductFromThisStock } }
                     });
+                    if (res.count === 0) {
+                        throw new Error(`Stock batch ${stock.id} changed during dispense — retry`);
+                    }
+                    const updatedStock = await tx.medicineStock.findUnique({ where: { id: stock.id } });
                     remainingToDeduct -= deductFromThisStock;
 
                     // Trigger low stock alert if needed

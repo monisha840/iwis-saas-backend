@@ -7,8 +7,10 @@ import { AuthService } from '../services/auth.service.js';
 export class AuthController {
   static async login(req, res, next) {
     try {
-      const { email, password } = req.body;
-      const result = await AuthService.login(email, password);
+      const result = await AuthService.login(req.body, {
+        ip: req.ip,
+        userAgent: req.headers['user-agent']
+      });
       res.json(result);
     } catch (err) {
       next(err);
@@ -28,7 +30,10 @@ export class AuthController {
     try {
       const { refreshToken } = req.body;
       if (!refreshToken) return res.status(400).json({ error: 'refreshToken required' });
-      const result = await AuthService.refreshToken(refreshToken);
+      const result = await AuthService.refresh(refreshToken, {
+        ip: req.ip,
+        userAgent: req.headers['user-agent']
+      });
       res.json(result);
     } catch (err) {
       next(err);
@@ -37,32 +42,13 @@ export class AuthController {
 
   static async logout(req, res, next) {
     try {
-      // Stateless JWT — client drops tokens; optionally revoke refresh token in DB
-      if (req.body.refreshToken) {
-        await AuthService.revokeRefreshToken(req.body.refreshToken).catch(() => {});
-      }
+      const authHeader = req.headers['authorization'];
+      const accessToken = authHeader && authHeader.split(' ')[1];
+      await AuthService.logout(req.body.refreshToken, accessToken);
       res.json({ message: 'Logged out successfully' });
     } catch (err) {
       next(err);
     }
   }
 
-  static async me(req, res, next) {
-    try {
-      const profile = await AuthService.getProfile(req.user.id);
-      res.json(profile);
-    } catch (err) {
-      next(err);
-    }
-  }
-
-  static async changePassword(req, res, next) {
-    try {
-      const { oldPassword, newPassword } = req.body;
-      await AuthService.changePassword(req.user.id, oldPassword, newPassword);
-      res.json({ message: 'Password changed successfully' });
-    } catch (err) {
-      next(err);
-    }
-  }
 }

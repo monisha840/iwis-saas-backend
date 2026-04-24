@@ -3,16 +3,23 @@ import logger from '../lib/logger.js';
 import { emitToUser } from '../websocket/index.js';
 
 /**
- * HealthAvatarService — virtual companion that grows as patients engage.
+ * HealthAvatarService — virtual companion that visually reflects patient
+ * engagement.
  *
  * Avatar types: PLANT, PET, CHARACTER
  *
- * Levels (by XP):
- *   Level 1: Seedling/Hatchling/Novice     (0 XP)
- *   Level 2: Sprout/Puppy/Apprentice       (100 XP)
- *   Level 3: Sapling/Adult/Journeyman      (300 XP)
- *   Level 4: Tree/Champion/Expert           (600 XP)
- *   Level 5: Ancient/Legend/Master          (1000 XP)
+ * **Single source of truth**: avatar level/XP is derived from
+ * `Patient.zenPoints`. The `HealthAvatar.xp` column is now a cache that
+ * mirrors zenPoints — ZenPointsService.awardPoints() calls syncFromZenPoints()
+ * after every award so the avatar never drifts. Avatar-specific state
+ * (health/happiness/lastFedAt/appearance) remains owned by this service.
+ *
+ * Level thresholds match ZenPointsService:
+ *   Level 1: Seedling/Hatchling/Novice     (0   pts)  — Zen Seedling
+ *   Level 2: Sprout/Puppy/Apprentice       (100 pts)  — Wellness Sprout
+ *   Level 3: Sapling/Adult/Journeyman      (300 pts)  — Harmony Seeker
+ *   Level 4: Tree/Champion/Expert          (600 pts)  — Balance Master
+ *   Level 5: Ancient/Legend/Master         (1000 pts) — Zen Sage
  */
 export class HealthAvatarService {
     static LEVEL_THRESHOLDS = [
@@ -29,13 +36,15 @@ export class HealthAvatarService {
         CHARACTER: ['Novice', 'Apprentice', 'Journeyman', 'Expert', 'Master']
     };
 
-    static ACTIVITY_XP = {
-        VITAL_LOG: 5,
-        CHECKIN: 5,
-        EXERCISE: 10,
-        MEDICATION: 5,
-        QUEST_COMPLETE: 20,
-        STREAK_BONUS: 15
+    // Activity → wellness boost. (XP comes exclusively from ZenPointsService now.)
+    // health/happiness deltas only.
+    static ACTIVITY_BOOST = {
+        VITAL_LOG:      { health: 5,  happiness: 5  },
+        CHECKIN:        { health: 5,  happiness: 10 },
+        EXERCISE:       { health: 10, happiness: 10 },
+        MEDICATION:     { health: 5,  happiness: 5  },
+        QUEST_COMPLETE: { health: 10, happiness: 20 },
+        STREAK_BONUS:   { health: 5,  happiness: 15 },
     };
 
     /**
@@ -58,46 +67,101 @@ export class HealthAvatarService {
     }
 
     /**
-     * Get or create avatar for a patient.
+     * Get or create avatar for a patient. The avatar's xp/level mirror the
+     * patient's current zenPoints — see syncFromZenPoints().
      */
     static async getOrCreateAvatar(patientId) {
         let avatar = await prisma.healthAvatar.findUnique({ where: { patientId } });
 
         if (!avatar) {
+            const patient = await prisma.patient.findUnique({
+                where: { id: patientId },
+                select: { zenPoints: true },
+            });
+            const zen = patient?.zenPoints || 0;
+            const initialLevel = this._calculateLevel(zen);
             avatar = await prisma.healthAvatar.create({
                 data: {
                     patientId,
                     avatarType: 'PLANT',
                     name: 'Sprout',
-                    level: 1,
+                    level: initialLevel,
                     health: 50,
                     happiness: 50,
-                    xp: 0,
-                    appearance: JSON.stringify({ stage: 'Seedling', accessories: [], color: 'green' })
+                    xp: zen,
+                    appearance: JSON.stringify({
+                        stage: this._getStageName('PLANT', initialLevel),
+                        accessories: [],
+                        color: 'green',
+                    }),
                 }
             });
             logger.info(`[HealthAvatar] Created avatar for patient ${patientId}`);
+        } else {
+            // Cheap reconciliation in case the cache drifted.
+            avatar = await this._reconcileXp(avatar);
         }
 
         return this._formatAvatar(avatar);
     }
 
     /**
-     * Feed avatar when patient completes an activity.
-     * Awards XP, increases health and happiness, recalculates level.
+     * "Feed" the avatar when the patient completes an activity. This now
+     * only bumps wellness state (health/happiness) and re-syncs the level
+     * from Patient.zenPoints. XP is granted exclusively by ZenPointsService.
      */
     static async feedAvatar(patientId, activityType) {
         let avatar = await prisma.healthAvatar.findUnique({ where: { patientId } });
         if (!avatar) {
-            avatar = await prisma.healthAvatar.create({
-                data: { patientId }
-            });
+            avatar = (await this.getOrCreateAvatar(patientId)) && await prisma.healthAvatar.findUnique({ where: { patientId } });
         }
 
-        const xpGain = this.ACTIVITY_XP[activityType] || 5;
-        const newXp = avatar.xp + xpGain;
-        const newHealth = Math.min(100, avatar.health + 5);
-        const newHappiness = Math.min(100, avatar.happiness + 10);
+        const boost = this.ACTIVITY_BOOST[activityType] || { health: 5, happiness: 5 };
+        const newHealth = Math.min(100, avatar.health + boost.health);
+        const newHappiness = Math.min(100, avatar.happiness + boost.happiness);
+
+        await prisma.healthAvatar.update({
+            where: { patientId },
+            data: {
+                health: newHealth,
+                happiness: newHappiness,
+                lastFedAt: new Date(),
+            },
+        });
+
+        // Single-source-of-truth refresh — pulls xp/level from Patient.zenPoints
+        // and emits a level-up event/notification when crossing a threshold.
+        return this.syncFromZenPoints(patientId);
+    }
+
+    /**
+     * Mirror Patient.zenPoints into HealthAvatar.{xp,level}. Called by
+     * ZenPointsService.awardPoints after every grant so the avatar's
+     * progress always equals the patient's overall progress.
+     *
+     * Emits 'achievement_unlocked' when crossing a level boundary.
+     */
+    static async syncFromZenPoints(patientId) {
+        const [patient, avatar] = await Promise.all([
+            prisma.patient.findUnique({
+                where: { id: patientId },
+                select: { zenPoints: true, userId: true },
+            }),
+            prisma.healthAvatar.findUnique({ where: { patientId } }),
+        ]);
+        if (!patient) return null;
+
+        // No avatar yet — create one (which seeds from zenPoints).
+        if (!avatar) {
+            return this.getOrCreateAvatar(patientId);
+        }
+
+        const newXp = patient.zenPoints || 0;
+        if (newXp === avatar.xp) {
+            // Already in sync — no-op.
+            return this._formatAvatar(avatar);
+        }
+
         const oldLevel = avatar.level;
         const newLevel = this._calculateLevel(newXp);
         const stageName = this._getStageName(avatar.avatarType, newLevel);
@@ -111,28 +175,18 @@ export class HealthAvatarService {
             where: { patientId },
             data: {
                 xp: newXp,
-                health: newHealth,
-                happiness: newHappiness,
                 level: newLevel,
-                lastFedAt: new Date(),
-                appearance: JSON.stringify(appearance)
-            }
+                appearance: JSON.stringify(appearance),
+            },
         });
 
-        // Level up notification
         if (newLevel > oldLevel) {
-            const patient = await prisma.patient.findUnique({
-                where: { id: patientId },
-                select: { userId: true }
-            });
-
-            if (patient) {
+            try {
                 emitToUser(patient.userId, 'achievement_unlocked', {
                     type: 'AVATAR_LEVEL_UP',
                     title: `${avatar.name} evolved to ${stageName}!`,
-                    level: newLevel
+                    level: newLevel,
                 });
-
                 await prisma.notification.create({
                     data: {
                         userId: patient.userId,
@@ -140,23 +194,44 @@ export class HealthAvatarService {
                         title: 'Avatar Level Up!',
                         message: `Your avatar ${avatar.name} evolved to ${stageName} (Level ${newLevel})!`,
                         priority: 'MEDIUM',
-                        data: { avatarName: avatar.name, newLevel, stageName }
-                    }
+                        data: { avatarName: avatar.name, newLevel, stageName },
+                    },
                 });
+                logger.info(`[HealthAvatar] Patient ${patientId} avatar leveled up to ${newLevel} (${stageName})`);
+            } catch (err) {
+                logger.warn('[HealthAvatar] level-up notify failed', { err: err.message });
             }
-
-            logger.info(`[HealthAvatar] Patient ${patientId} avatar leveled up to ${newLevel} (${stageName})`);
         }
 
         return this._formatAvatar(updated);
     }
 
     /**
+     * Internal: ensure the cached xp matches Patient.zenPoints without
+     * the side-effects of syncFromZenPoints (no level-up notification).
+     */
+    static async _reconcileXp(avatar) {
+        const patient = await prisma.patient.findUnique({
+            where: { id: avatar.patientId },
+            select: { zenPoints: true },
+        });
+        const zen = patient?.zenPoints || 0;
+        if (zen === avatar.xp) return avatar;
+        const newLevel = this._calculateLevel(zen);
+        return prisma.healthAvatar.update({
+            where: { id: avatar.id },
+            data: { xp: zen, level: newLevel },
+        });
+    }
+
+    /**
      * Get full avatar state with stage name, next level info, and progress.
+     * Reconciles cached xp against Patient.zenPoints on read.
      */
     static async getAvatarState(patientId) {
-        const avatar = await prisma.healthAvatar.findUnique({ where: { patientId } });
+        let avatar = await prisma.healthAvatar.findUnique({ where: { patientId } });
         if (!avatar) return null;
+        avatar = await this._reconcileXp(avatar);
         return this._formatAvatar(avatar);
     }
 

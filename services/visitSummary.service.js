@@ -179,7 +179,8 @@ export class VisitSummaryService {
       throw new Error('Appointment not found');
     }
 
-    // Get prescriptions created on the same date as the appointment
+    // Prefer prescriptions explicitly linked to this appointment; fall back
+    // to a same-day window for legacy rows written before the link existed.
     const appointmentDate = new Date(appointment.date);
     const dayStart = new Date(appointmentDate);
     dayStart.setHours(0, 0, 0, 0);
@@ -190,7 +191,10 @@ export class VisitSummaryService {
       prisma.prescription.findMany({
         where: {
           patientId: appointment.patientId,
-          createdAt: { gte: dayStart, lte: dayEnd },
+          OR: [
+            { appointmentId },
+            { appointmentId: null, createdAt: { gte: dayStart, lte: dayEnd } },
+          ],
         },
         select: {
           medicationName: true,

@@ -1,5 +1,5 @@
 import express from 'express';
-import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
+import { authMiddleware, roleMiddleware, resolvePatientId } from '../middleware/auth.js';
 import { GamificationController } from '../controllers/gamification.controller.js';
 import { z } from 'zod';
 import { validate } from '../middleware/validate.js';
@@ -49,16 +49,16 @@ router.post('/competitions', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOC
 // ── Zen Points (patient) ─────────────────────────────────────────────────────
 
 /** GET /api/gamification/zen-profile — patient's gamification profile */
-router.get('/zen-profile', authMiddleware, roleMiddleware(['PATIENT']), GamificationController.getZenProfile);
+router.get('/zen-profile', authMiddleware, roleMiddleware(['PATIENT']), resolvePatientId, GamificationController.getZenProfile);
 
 /** GET /api/gamification/challenges — today's daily challenges */
-router.get('/challenges', authMiddleware, roleMiddleware(['PATIENT']), GamificationController.getDailyChallenges);
+router.get('/challenges', authMiddleware, roleMiddleware(['PATIENT']), resolvePatientId, GamificationController.getDailyChallenges);
 
 /** POST /api/gamification/challenges/:challengeId/complete — complete a challenge */
-router.post('/challenges/:challengeId/complete', authMiddleware, roleMiddleware(['PATIENT']), GamificationController.completeChallenge);
+router.post('/challenges/:challengeId/complete', authMiddleware, roleMiddleware(['PATIENT']), resolvePatientId, GamificationController.completeChallenge);
 
 /** GET /api/gamification/social-proof — anonymized peer activity stats */
-router.get('/social-proof', authMiddleware, roleMiddleware(['PATIENT']), GamificationController.getSocialProof);
+router.get('/social-proof', authMiddleware, roleMiddleware(['PATIENT']), resolvePatientId, GamificationController.getSocialProof);
 
 // ── Anti-gaming (admin) ──────────────────────────────────────────────────────
 

@@ -34,14 +34,15 @@ export class ClinicianXPService {
     ];
 
     static XP_ACTIONS = {
-        CONSULTATION:      10,
-        ON_TIME_ARRIVAL:    5,
-        POSITIVE_FEEDBACK: 15,
-        PATIENT_OUTCOME:   25,
-        QUEST_COMPLETE:     0, // varies
-        BADGE_EARNED:      50,
-        MENTOR_SESSION:    30,
-        STREAK_BONUS:       0, // currentStreak * 2
+        CONSULTATION:          10,
+        ON_TIME_ARRIVAL:        5,
+        POSITIVE_FEEDBACK:     15,
+        PATIENT_OUTCOME:       25,
+        QUEST_COMPLETE:         0, // varies
+        BADGE_EARNED:          50,
+        MENTOR_SESSION:        30,
+        STREAK_BONUS:           0, // currentStreak * 2
+        DIET_PACKAGE_APPROVED: 25, // suggested default; admin can override per-approval
     };
 
     /**

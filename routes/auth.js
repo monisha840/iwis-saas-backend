@@ -144,7 +144,7 @@ const logoutSchema = z.object({
   refreshToken: z.string().optional()
 });
 
-router.post('/logout', async (req, res, next) => {
+router.post('/logout', authMiddleware, async (req, res, next) => {
   try {
     const authHeader = req.headers['authorization'];
     const accessToken = authHeader && authHeader.split(' ')[1];

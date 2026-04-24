@@ -1,8 +1,32 @@
 import express from 'express';
 import { ChatService } from '../services/chat.service.js';
-import { authMiddleware } from '../middleware/auth.js';
+import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
+import prisma from '../lib/prisma.js';
 
 const router = express.Router();
+
+// All chat endpoints require an authenticated staff or patient role.
+const CHAT_ROLES = ['PATIENT', 'DOCTOR', 'ADMIN_DOCTOR', 'THERAPIST', 'PHARMACIST', 'ADMIN'];
+router.use(authMiddleware);
+router.use(roleMiddleware(CHAT_ROLES));
+
+// When a PATIENT initiates a conversation via /conversation, they must match
+// their own patientId — clinicians can specify any patient they're allowed to see.
+async function enforcePatientSelfOnConversation(req, res, next) {
+  if (req.user.role !== 'PATIENT') return next();
+  const { patientId } = req.body || {};
+  if (!patientId) return next();
+  try {
+    const patient = await prisma.patient.findUnique({
+      where: { id: patientId },
+      select: { userId: true },
+    });
+    if (!patient || patient.userId !== req.user.id) {
+      return res.status(403).json({ error: 'Forbidden — patient id does not match caller' });
+    }
+    next();
+  } catch (err) { next(err); }
+}
 
 /**
  * @swagger
@@ -22,7 +46,7 @@ const router = express.Router();
  *     responses:
  *       200: { description: Conversation created or returned }
  */
-router.post('/initiate', authMiddleware, async (req, res, next) => {
+router.post('/initiate', async (req, res, next) => {
     try {
         const { partnerId } = req.body;
         const conversation = await ChatService.initiateConversation(req.user.id, partnerId);
@@ -52,7 +76,7 @@ router.post('/initiate', authMiddleware, async (req, res, next) => {
  *     responses:
  *       200: { description: Conversation returned }
  */
-router.post('/conversation', authMiddleware, async (req, res, next) => {
+router.post('/conversation', enforcePatientSelfOnConversation, async (req, res, next) => {
     try {
         const { patientId, doctorId, therapistId, pharmacistId } = req.body;
 
@@ -89,7 +113,7 @@ router.post('/conversation', authMiddleware, async (req, res, next) => {
  *     responses:
  *       200: { description: Array of conversations }
  */
-router.get('/conversations', authMiddleware, async (req, res, next) => {
+router.get('/conversations', async (req, res, next) => {
     try {
         const conversations = await ChatService.listUserConversations(req.user.id);
         res.json(conversations);
@@ -119,7 +143,7 @@ router.get('/conversations', authMiddleware, async (req, res, next) => {
  *       200: { description: Paginated messages }
  *       403: { description: Unauthorized access to conversation }
  */
-router.get('/messages/:conversationId', authMiddleware, async (req, res, next) => {
+router.get('/messages/:conversationId', async (req, res, next) => {
     try {
         const { cursor, limit } = req.query;
         const result = await ChatService.getMessages(

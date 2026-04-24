@@ -3,6 +3,33 @@ import logger from '../lib/logger.js';
 import crypto from 'crypto';
 import { notificationService } from './notification.service.js';
 import { AvailabilityService } from './availability.service.js';
+import { VideoService } from './video.service.js';
+import { HandoffNoteService } from './handoffNote.service.js';
+import { FollowUpService } from './followUp.service.js';
+
+// Appointment.status is stored as a plain String in Prisma. This set is the only
+// canonical source of valid values — any write outside this list is a bug.
+// Keep in sync with allowed transitions in `updateAppointment` / `approveAppointment`.
+export const APPOINTMENT_STATUSES = Object.freeze(new Set([
+    'PENDING',
+    'CONFIRMED',
+    'ACCEPTED',
+    'PENDING_DOCTOR_APPROVAL',
+    'PENDING_THERAPIST_APPROVAL',
+    'REJECTED',
+    'CANCELLED',
+    'COMPLETED',
+    'NO_SHOW',
+    'ASSIGNED',
+]));
+
+export function assertValidAppointmentStatus(status) {
+    if (!APPOINTMENT_STATUSES.has(status)) {
+        const err = new Error(`Invalid appointment status: ${status}`);
+        err.status = 400;
+        throw err;
+    }
+}
 
 const includeDetails = {
     doctor: { include: { user: { select: { email: true } } } },
@@ -112,7 +139,12 @@ export class AppointmentService {
     }
 
     static async createAppointment(user, data) {
-        const { patientId, doctorId, therapistId, date, status, notes, triageSessionId, contactDetails, consultationType, consultationMode } = data;
+        const {
+            patientId, doctorId, therapistId, date, status, notes, triageSessionId,
+            contactDetails, consultationType, consultationMode,
+            // Custom reminder template attached at booking time by admin / doctor
+            customReminderTemplateId, customReminderBody, customReminderSubject, customReminderChannels,
+        } = data;
 
         let actualPatientId;
         if (user.role === 'PATIENT') {
@@ -137,18 +169,39 @@ export class AppointmentService {
             throw error;
         }
 
-        const [startTimeStr] = (data.slot || appointmentDate.toTimeString().slice(0, 5)).split(' - ');
+        // Use UTC HH:MM so the stored date and derived string are always in
+        // the same frame — toTimeString() renders local time and caused
+        // DST/timezone drift when the server and client disagreed.
+        const [startTimeStr] = (data.slot || appointmentDate.toISOString().substring(11, 16)).split(' - ');
 
         // Mandatory Branch Selection
-        const branchIdToUse = data.branchId || user.branchId;
-        if (!branchIdToUse) throw new Error('Branch selection is required');
+        // For PATIENT callers, fall back to the patient's onboarding-selected
+        // branch if the request body doesn't include one.
+        let branchIdToUse = data.branchId || user.branchId;
+        if (!branchIdToUse && user.role === 'PATIENT') {
+            const me = await prisma.patient.findUnique({
+                where: { userId: user.id },
+                select: { branchId: true },
+            });
+            branchIdToUse = me?.branchId || null;
+        }
+        if (!branchIdToUse) {
+            const err = new Error(
+                user.role === 'PATIENT'
+                    ? 'No branch selected. Please complete onboarding to choose your branch before booking.'
+                    : 'Branch selection is required',
+            );
+            err.status = 400;
+            throw err;
+        }
 
         // Dynamic Validation based on Consultation Type
         if (consultationType === 'DOCTOR' && !doctorId) throw new Error('Doctor selection is required for Doctor consultation');
         if (consultationType === 'THERAPIST' && !therapistId) throw new Error('Therapist selection is required for Therapist consultation');
         if (consultationType === 'COMBINED' && (!doctorId || !therapistId)) throw new Error('Both Doctor and Therapist are required for Combined consultation');
 
-        // 1. Doctor Availability Check
+        // 1. Doctor Availability Check (schedule/leave-block only; double-booking
+        //    is enforced inside the transaction below to eliminate TOCTOU).
         if (doctorId && (consultationType === 'DOCTOR' || consultationType === 'COMBINED')) {
             const appointmentEndTime = new Date(appointmentDate.getTime() + 60 * 60 * 1000); // 1 hr duration
             const endTimeStr = appointmentEndTime.toTimeString().slice(0, 5);
@@ -157,23 +210,11 @@ export class AppointmentService {
                 doctorId, appointmentDate.toISOString(), startTimeStr, endTimeStr
             );
             if (!docAvailability.available) throw new Error(`Doctor unavailable: ${docAvailability.reason}`);
-
-            // Double booking check for doctor
-            const docBusy = await prisma.appointment.findFirst({
-                where: { doctorId, date: appointmentDate, status: { notIn: ['CANCELLED', 'REJECTED'] } }
-            });
-            if (docBusy) {
-                const suggestion = await AvailabilityService.findNextAvailableSlot(doctorId, appointmentDate);
-                const error = new Error('The selected doctor is already booked at this time.');
-                error.status = 409;
-                error.suggestedSlot = suggestion;
-                throw error;
-            }
         }
 
         const actualTherapistDate = data.therapistDate ? new Date(data.therapistDate) : appointmentDate;
 
-        // 2. Therapist Availability Check
+        // 2. Therapist Availability Check (schedule/leave-block only; see above).
         if (therapistId && (consultationType === 'THERAPIST' || consultationType === 'COMBINED')) {
             const tStartTimeStr = actualTherapistDate.toTimeString().slice(0, 5);
             const tEndTime = new Date(actualTherapistDate.getTime() + 60 * 60 * 1000); // 1 hr duration
@@ -183,25 +224,6 @@ export class AppointmentService {
                 therapistId, actualTherapistDate.toISOString(), tStartTimeStr, tEndTimeStr
             );
             if (!therapistAvailability.available) throw new Error(`Therapist unavailable: ${therapistAvailability.reason}`);
-
-            // Double booking check for therapist
-            const therapistBusy = await prisma.appointment.findFirst({
-                where: {
-                    therapistId,
-                    OR: [
-                        { date: actualTherapistDate },
-                        { therapistDate: actualTherapistDate }
-                    ],
-                    status: { notIn: ['CANCELLED', 'REJECTED'] }
-                }
-            });
-            if (therapistBusy) {
-                const suggestion = await AvailabilityService.findNextAvailableSlot(therapistId, actualTherapistDate);
-                const error = new Error('The selected therapist is already booked at this time.');
-                error.status = 409;
-                error.suggestedSlot = suggestion;
-                throw error;
-            }
         }
 
         // Triage Validation for Admin Doctor
@@ -241,10 +263,29 @@ export class AppointmentService {
             }
         }
 
-        // Online meeting generation
+        // Online meeting generation — delegated to VideoService which picks
+        // Daily.co when DAILY_API_KEY is set (waiting room, expiry, webhooks)
+        // and falls back to public Jitsi Meet otherwise.
+        // A pre-appointment id is used for the room name; tolerates race on
+        // room create vs final appointment.id by generating a short UUID here
+        // then updating the room name is unnecessary — we just thread through.
         let meetingLink = null;
         if (consultationMode === 'ONLINE') {
-            meetingLink = `https://meet.jit.si/al-shifa-${crypto.randomBytes(12).toString('hex')}`;  // cryptographically random, not Math.random()
+            const provisionalId = crypto.randomUUID();
+            try {
+                const room = await VideoService.createRoom({
+                    appointmentId: provisionalId,
+                    startAt: appointmentDate,
+                    // endAt defaults to start + 30min inside VideoService
+                });
+                meetingLink = room.url;
+            } catch (err) {
+                // Extremely defensive — VideoService already falls back to Jitsi
+                // internally, so this branch shouldn't be reachable. If it is,
+                // fall back to a raw Jitsi link so booking doesn't fail.
+                logger.error('[Appointment] VideoService.createRoom threw', { err: err.message });
+                meetingLink = `https://meet.jit.si/al-shifa-${crypto.randomBytes(12).toString('hex')}`;
+            }
         }
 
         // 3. Clinical Recommendation Enforcement
@@ -269,6 +310,8 @@ export class AppointmentService {
         // H-2: Wrap create inside a serializable transaction so the double-booking check
         //       and the insert are atomic — eliminates the TOCTOU race condition.
         const appointment = await prisma.$transaction(async (tx) => {
+            // Re-check availability (leave/block) inside the tx so a clinician going
+            // off-duty between the earlier check and the insert still blocks booking.
             if (doctorId && consultationType !== 'THERAPIST') {
                 const conflict = await tx.appointment.findFirst({
                     where: { doctorId, date: appointmentDate, status: { notIn: ['CANCELLED', 'REJECTED'] } },
@@ -298,24 +341,76 @@ export class AppointmentService {
                     throw err;
                 }
             }
-            return tx.appointment.create({
+            // Validate & normalize custom-reminder payload if the caller supplied one.
+            // PATIENT role cannot set these — only staff authoring the booking.
+            const reminderFields = {};
+            if (user.role !== 'PATIENT' && (customReminderTemplateId || customReminderBody || customReminderChannels?.length || customReminderSubject)) {
+                if (customReminderTemplateId) {
+                    const tpl = await tx.messageTemplate.findUnique({
+                        where: { id: customReminderTemplateId },
+                        select: { id: true, hospitalId: true, isActive: true },
+                    });
+                    if (!tpl) {
+                        const err = new Error('customReminderTemplateId does not exist'); err.status = 400; throw err;
+                    }
+                    if (!tpl.isActive) {
+                        const err = new Error('customReminderTemplateId refers to an inactive template'); err.status = 400; throw err;
+                    }
+                    if (user.hospitalId && tpl.hospitalId !== user.hospitalId && user.role !== 'SUPER_ADMIN') {
+                        const err = new Error('Template belongs to another hospital'); err.status = 403; throw err;
+                    }
+                    reminderFields.customReminderTemplateId = tpl.id;
+                }
+                if (customReminderBody !== undefined)     reminderFields.customReminderBody = customReminderBody ? String(customReminderBody) : null;
+                if (customReminderSubject !== undefined)  reminderFields.customReminderSubject = customReminderSubject ? String(customReminderSubject) : null;
+                if (Array.isArray(customReminderChannels)) {
+                    const channels = customReminderChannels.map((c) => String(c).toUpperCase());
+                    for (const c of channels) {
+                        if (!['WHATSAPP', 'SMS', 'EMAIL', 'IN_APP'].includes(c)) {
+                            const err = new Error(`Unsupported channel: ${c}`); err.status = 400; throw err;
+                        }
+                    }
+                    reminderFields.customReminderChannels = channels;
+                }
+                reminderFields.customReminderUpdatedAt = new Date();
+                reminderFields.customReminderUpdatedById = user.id;
+            }
+
+            const created = await tx.appointment.create({
                 data: {
                     patientId: actualPatientId,
                     doctorId: (consultationType === 'THERAPIST' || !doctorId) ? null : doctorId,
                     therapistId: (consultationType === 'DOCTOR' || !therapistId) ? null : therapistId,
                     date: appointmentDate,
                     therapistDate: (consultationType === 'COMBINED' || consultationType === 'THERAPIST') ? actualTherapistDate : null,
-                    status: user.role === 'PATIENT' ? 'PENDING' : (status || 'CONFIRMED'),
+                    status: (() => {
+                        const s = user.role === 'PATIENT' ? 'PENDING' : (status || 'CONFIRMED');
+                        assertValidAppointmentStatus(s);
+                        return s;
+                    })(),
                     notes,
                     triageSessionId: triageSessionId || null,
                     consultationType: consultationType || 'DOCTOR',
                     consultationMode: consultationMode || 'OFFLINE',
                     meetingLink,
-                    branchId: branchIdToUse
+                    branchId: branchIdToUse,
+                    ...reminderFields,
                 },
                 include: { ...includeDetails, triageSession: true }
             });
-        });
+
+            // Link any pre-created self-exam DRAFT to this appointment so the
+            // booked doctor sees the bundle tied to this visit. triageSessionId
+            // is @unique on SelfExamSubmission, so updateMany hits ≤1 row.
+            if (triageSessionId) {
+                await tx.selfExamSubmission.updateMany({
+                    where: { triageSessionId, appointmentId: null },
+                    data:  { appointmentId: created.id }
+                });
+            }
+
+            return created;
+        }, { isolationLevel: 'Serializable' });
 
         // Notify Clinicians of New Appointment (INFO priority)
         if (appointment.doctorId && appointment.doctor?.userId) {
@@ -339,7 +434,94 @@ export class AppointmentService {
             });
         }
 
+        // Acknowledge to the patient that their booking was received —
+        // previously patients only learned about it by checking the dashboard.
+        if (appointment.patient?.userId) {
+            const clinicianName =
+                appointment.doctor?.fullName ||
+                appointment.therapist?.fullName ||
+                'your clinician';
+            const whenStr = appointmentDate.toLocaleString('en-US', {
+                weekday: 'short', month: 'short', day: 'numeric',
+                hour: '2-digit', minute: '2-digit',
+            });
+            try {
+                await notificationService.createNotification({
+                    userId: appointment.patient.userId,
+                    type: 'APPOINTMENT_BOOKED',
+                    title: 'Appointment requested',
+                    message: `Your appointment with ${clinicianName} on ${whenStr} has been received. You'll be notified once it's confirmed.`,
+                    priority: 'INFO',
+                    data: { appointmentId: appointment.id },
+                });
+            } catch (err) {
+                // Non-fatal — don't roll back the booking
+            }
+        }
+
         return appointment;
+    }
+
+    /**
+     * Attach / edit the per-appointment reminder template.
+     * ADMIN / ADMIN_DOCTOR can edit any appointment in their hospital.
+     * DOCTOR / THERAPIST can edit only appointments where they are the clinician.
+     */
+    static async updateReminderTemplate(id, user, data) {
+        if (user.role === 'PATIENT') {
+            const err = new Error('Patients cannot edit reminder templates'); err.status = 403; throw err;
+        }
+        const existing = await prisma.appointment.findUnique({
+            where: { id },
+            include: { doctor: { select: { userId: true, branch: { select: { hospitalId: true } } } },
+                       therapist: { select: { userId: true, branch: { select: { hospitalId: true } } } },
+                       branch: { select: { hospitalId: true } } },
+        });
+        if (!existing) { const err = new Error('Appointment not found'); err.status = 404; throw err; }
+
+        const apptHospitalId = existing.branch?.hospitalId || existing.doctor?.branch?.hospitalId || existing.therapist?.branch?.hospitalId;
+        if (user.role !== 'SUPER_ADMIN' && user.hospitalId && apptHospitalId && apptHospitalId !== user.hospitalId) {
+            const err = new Error('Appointment belongs to another hospital'); err.status = 403; throw err;
+        }
+        if (['DOCTOR', 'THERAPIST'].includes(user.role)) {
+            const doctorUserId = existing.doctor?.userId;
+            const therapistUserId = existing.therapist?.userId;
+            if (doctorUserId !== user.id && therapistUserId !== user.id) {
+                const err = new Error('Only the assigned clinician can edit this appointment\'s reminder'); err.status = 403; throw err;
+            }
+        }
+
+        const updates = { customReminderUpdatedAt: new Date(), customReminderUpdatedById: user.id };
+        if (data.templateId !== undefined) {
+            if (data.templateId === null) {
+                updates.customReminderTemplateId = null;
+            } else {
+                const tpl = await prisma.messageTemplate.findUnique({
+                    where: { id: data.templateId },
+                    select: { id: true, hospitalId: true, isActive: true },
+                });
+                if (!tpl) { const err = new Error('Template not found'); err.status = 400; throw err; }
+                if (!tpl.isActive) { const err = new Error('Template is inactive'); err.status = 400; throw err; }
+                if (apptHospitalId && tpl.hospitalId !== apptHospitalId && user.role !== 'SUPER_ADMIN') {
+                    const err = new Error('Template belongs to another hospital'); err.status = 403; throw err;
+                }
+                updates.customReminderTemplateId = tpl.id;
+            }
+        }
+        if (data.body !== undefined)    updates.customReminderBody = data.body ? String(data.body) : null;
+        if (data.subject !== undefined) updates.customReminderSubject = data.subject ? String(data.subject) : null;
+        if (data.channels !== undefined) {
+            if (!Array.isArray(data.channels)) { const err = new Error('channels must be an array'); err.status = 400; throw err; }
+            const channels = data.channels.map((c) => String(c).toUpperCase());
+            for (const c of channels) {
+                if (!['WHATSAPP', 'SMS', 'EMAIL', 'IN_APP'].includes(c)) {
+                    const err = new Error(`Unsupported channel: ${c}`); err.status = 400; throw err;
+                }
+            }
+            updates.customReminderChannels = channels;
+        }
+
+        return prisma.appointment.update({ where: { id }, data: updates });
     }
 
     static async updateAppointment(id, user, data) {
@@ -382,6 +564,7 @@ export class AppointmentService {
             }
         }
 
+        if (data.status) assertValidAppointmentStatus(data.status);
         const updateData = {
             ...(data.date && { date: new Date(data.date) }),
             ...(data.therapistDate && { therapistDate: new Date(data.therapistDate) }),
@@ -389,17 +572,57 @@ export class AppointmentService {
             ...(data.notes !== undefined && { notes: data.notes }),
         };
 
-        const appointment = await prisma.appointment.update({
-            where: { id },
-            data: updateData,
-            include: includeDetails
+        const isCompleting = data.status === 'COMPLETED' && existing.status !== 'COMPLETED';
+
+        // Completing a consultation without a follow-up decision is a
+        // clinical workflow violation — require the caller to supply
+        // `followUp: { interval, daysOffset?, notes? }` alongside the
+        // status change. A previously-set follow-up on the row is
+        // re-used so back-end callers that flipped status in two steps
+        // (edge-case) aren't broken.
+        if (isCompleting && !data.followUp) {
+            const alreadySet = await prisma.appointmentFollowUp.findUnique({
+                where: { appointmentId: id },
+                select: { id: true },
+            });
+            if (!alreadySet) {
+                const err = new Error('Follow-up decision is required when marking a consultation COMPLETED. Supply { followUp: { interval, daysOffset?, notes? } }.');
+                err.status = 400;
+                err.code = 'FOLLOWUP_REQUIRED';
+                throw err;
+            }
+        }
+
+        const appointment = await prisma.$transaction(async (tx) => {
+            const updated = await tx.appointment.update({
+                where: { id },
+                data: updateData,
+                include: includeDetails,
+            });
+
+            if (isCompleting && data.followUp) {
+                await FollowUpService.upsertForAppointment(tx, {
+                    appointment: updated,
+                    user,
+                    payload: data.followUp,
+                });
+            }
+
+            return updated;
         });
 
-        if (data.status === 'COMPLETED' && existing.status !== 'COMPLETED') {
+        if (isCompleting) {
             await prisma.patient.update({
                 where: { id: appointment.patientId },
                 data: { zenPoints: { increment: 100 } }
             });
+
+            // Advisory — failures here must never roll back clinical completion.
+            try {
+                await HandoffNoteService._autoDraftFromAppointment(appointment, user);
+            } catch (err) {
+                logger.warn(`[handoff] auto-draft failed for appt ${appointment.id}: ${err.message}`);
+            }
         }
 
         // H-6: Duplicate trigger removed — approveAppointment() already handles the
@@ -479,6 +702,38 @@ export class AppointmentService {
         }
 
         return updated;
+    }
+
+    /**
+     * Attach (or replace) the follow-up plan on an appointment without
+     * flipping its status. Used when the doctor decides the follow-up
+     * plan ahead of marking COMPLETED, or edits it later.
+     */
+    static async attachFollowUp(id, user, followUpPayload) {
+        const existing = await prisma.appointment.findUnique({
+            where: { id },
+            include: { doctor: { select: { userId: true } }, therapist: { select: { userId: true } } },
+        });
+        if (!existing) {
+            const err = new Error('Appointment not found');
+            err.status = 404;
+            throw err;
+        }
+
+        const isAdmin = ['ADMIN', 'ADMIN_DOCTOR'].includes(user.role);
+        if (!isAdmin) {
+            const ownsAppointment = existing.doctor?.userId === user.id
+                || existing.therapist?.userId === user.id;
+            if (!ownsAppointment) {
+                const err = new Error('Forbidden: You are not assigned to this appointment');
+                err.status = 403;
+                throw err;
+            }
+        }
+
+        return prisma.$transaction(async (tx) =>
+            FollowUpService.upsertForAppointment(tx, { appointment: existing, user, payload: followUpPayload })
+        );
     }
 
     static async cancelAppointment(id, user) {
@@ -591,10 +846,12 @@ export class AppointmentService {
         // Enhance slots with spotsLeft and isNearlyFull
         // Check Redis for held slots
         const { cacheService } = await import('./cache.service.js');
+        const { circuitOpen, available } = cacheService.getStatus();
+        const cacheStatus = (!available || circuitOpen) ? 'degraded' : 'ok';
 
-        return Promise.all(slots.map(async (slot) => {
+        const enriched = await Promise.all(slots.map(async (slot) => {
             const holdKey = `slot:hold:${clinicianId}:${date}:${slot.startTime}`;
-            const held = await cacheService.get(holdKey);
+            const held = cacheStatus === 'ok' ? await cacheService.get(holdKey) : null;
             const isHeld = !!held;
             const spotsLeft = slot.status === 'AVAILABLE' && !isHeld ? 1 : 0;
             return {
@@ -605,6 +862,8 @@ export class AppointmentService {
                 isHeld,
             };
         }));
+
+        return { slots: enriched, cacheStatus };
     }
 
     /**
@@ -628,7 +887,10 @@ export class AppointmentService {
     }
 
     /**
-     * Verify a hold exists before confirming booking.
+     * Verify a hold exists before confirming booking. The hold is intentionally
+     * NOT cleared here — the caller should clear it AFTER the appointment row
+     * is committed so that a mid-flight failure leaves the slot locked (the
+     * Redis TTL expires it naturally). See releaseHold().
      */
     static async verifyHold(clinicianId, date, time, userId) {
         const { cacheService } = await import('./cache.service.js');
@@ -642,11 +904,15 @@ export class AppointmentService {
             throw error;
         }
 
-        // Clear the hold after verification
-        if (hold) {
-            await cacheService.del(holdKey);
-        }
-
         return true;
+    }
+
+    /**
+     * Release a hold after a successful booking commit. If the booking failed
+     * the caller should skip this and let the TTL expire the key.
+     */
+    static async releaseHold(clinicianId, date, time) {
+        const { cacheService } = await import('./cache.service.js');
+        await cacheService.del(`slot:hold:${clinicianId}:${date}:${time}`);
     }
 }

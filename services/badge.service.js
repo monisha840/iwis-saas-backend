@@ -18,6 +18,10 @@ export class BadgeService {
      * Seed default badge definitions if they don't exist.
      */
     static async seedDefaults() {
+        // Always (idempotently) seed todo-related badges — the early-return below
+        // only skips the legacy seed when any badge already exists.
+        await this.seedTodoBadges();
+
         const existing = await prisma.badge.count();
         if (existing > 0) return;
 
@@ -49,6 +53,27 @@ export class BadgeService {
 
         await prisma.badge.createMany({ data: defaults });
         logger.info(`[BadgeService] Seeded ${defaults.length} default badge definitions`);
+    }
+
+    /**
+     * Idempotent seed of todo-completion badges (spec §7.5).
+     * Safe to call on every startup — uses skipDuplicates on unique `code`.
+     */
+    static async seedTodoBadges() {
+        const todoBadges = [
+            { code: 'TASK_STARTER', name: 'Task Starter', description: 'Completed your first task', icon: 'CheckSquare', tier: 'BRONZE', criteria: { type: 'milestone', metric: 'todosCompleted', threshold: 1 } },
+            { code: 'TASK_CONSISTENT_7', name: '7-Day Task Streak', description: 'Completed at least one task per day for 7 days', icon: 'Flame', tier: 'SILVER', criteria: { type: 'streak', metric: 'todoStreak', threshold: 7 } },
+            { code: 'TASK_CONSISTENT_30', name: '30-Day Task Streak', description: 'Completed at least one task per day for 30 days', icon: 'Flame', tier: 'GOLD', criteria: { type: 'streak', metric: 'todoStreak', threshold: 30 } },
+            { code: 'TASK_MASTER_50', name: 'Task Master', description: 'Completed 50 assigned tasks', icon: 'Trophy', tier: 'GOLD', criteria: { type: 'cumulative', metric: 'todosCompletedAssigned', threshold: 50 } },
+            { code: 'TASK_MASTER_200', name: 'Task Legend', description: 'Completed 200 assigned tasks', icon: 'Crown', tier: 'PLATINUM', criteria: { type: 'cumulative', metric: 'todosCompletedAssigned', threshold: 200 } },
+            { code: 'DELEGATION_PRO', name: 'Delegation Pro', description: 'Assigned 50 tasks to others', icon: 'Users', tier: 'SILVER', criteria: { type: 'cumulative', metric: 'todosAssignedToOthers', threshold: 50 } },
+        ];
+        try {
+            await prisma.badge.createMany({ data: todoBadges, skipDuplicates: true });
+            logger.info('[BadgeService] Todo badges seed complete');
+        } catch (err) {
+            logger.warn(`[BadgeService] Todo badge seed failed: ${err.message}`);
+        }
     }
 
     /**
@@ -150,7 +175,10 @@ export class BadgeService {
     static _meetsThreshold(stats, criteria) {
         const { type, metric, threshold, comparison = 'gte' } = criteria;
         const value = stats[metric];
-        if (value === undefined) return false;
+        if (value === undefined) {
+            logger.warn(`[BadgeService] criteria references unknown metric '${metric}'`, { type, threshold });
+            return false;
+        }
 
         if (comparison === 'lt') return value < threshold;
         if (comparison === 'lte') return value <= threshold;

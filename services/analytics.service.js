@@ -10,7 +10,7 @@ class AnalyticsService {
      * @param {Object} filters - Date range and other filters
      */
     async getPatientProgress(filters = {}) {
-        const { startDate, endDate, doctorId, status } = filters;
+        const { startDate, endDate, doctorId, status, branchId } = filters;
 
         const where = {};
         if (startDate || endDate) {
@@ -20,6 +20,8 @@ class AnalyticsService {
         }
         if (doctorId) where.doctorId = doctorId;
         if (status) where.status = status;
+        // Journey has no direct branchId — scope via the assigned doctor's branch.
+        if (branchId) where.doctor = { ...(where.doctor || {}), user: { branchId } };
 
         const journeys = await prisma.journey.findMany({
             where,
@@ -49,7 +51,7 @@ class AnalyticsService {
      * @param {Object} filters - Date range and doctor filters
      */
     async getDoctorPerformance(filters = {}) {
-        const { startDate, endDate } = filters;
+        const { startDate, endDate, branchId } = filters;
 
         const where = {};
         if (startDate || endDate) {
@@ -58,13 +60,20 @@ class AnalyticsService {
             if (endDate) where.createdAt.lte = new Date(endDate);
         }
 
+        // Limit roster to doctors whose user belongs to the scoped branch.
+        const doctorWhere = branchId ? { user: { branchId } } : {};
+        // Within each doctor's nested appointment/prescription counts we also
+        // restrict to the same branch so cross-branch activity isn't double-counted.
+        const nestedWhere = { ...where, ...(branchId ? { branchId } : {}) };
+
         const doctors = await prisma.doctor.findMany({
+            where: doctorWhere,
             include: {
                 appointments: {
-                    where,
+                    where: nestedWhere,
                 },
                 prescriptions: {
-                    where,
+                    where: nestedWhere,
                 },
             },
         });
@@ -99,7 +108,7 @@ class AnalyticsService {
      * @param {Object} filters - Date range and status filters
      */
     async getAppointmentAnalytics(filters = {}) {
-        const { startDate, endDate, status, doctorId, therapistId } = filters;
+        const { startDate, endDate, status, doctorId, therapistId, branchId } = filters;
 
         const where = {};
         if (startDate || endDate) {
@@ -110,6 +119,7 @@ class AnalyticsService {
         if (status) where.status = status;
         if (doctorId) where.doctorId = doctorId;
         if (therapistId) where.therapistId = therapistId;
+        if (branchId) where.branchId = branchId;
 
         const appointments = await prisma.appointment.findMany({
             where,
@@ -162,7 +172,7 @@ class AnalyticsService {
      * Get prescription analytics
      */
     async getPrescriptionAnalytics(filters = {}) {
-        const { startDate, endDate, doctorId, patientId } = filters;
+        const { startDate, endDate, doctorId, patientId, branchId } = filters;
 
         const where = {};
         if (startDate || endDate) {
@@ -172,6 +182,8 @@ class AnalyticsService {
         }
         if (doctorId) where.doctorId = doctorId;
         if (patientId) where.patientId = patientId;
+        // Prescription has a direct branchId column on the model (see schema.prisma).
+        if (branchId) where.branchId = branchId;
 
         const prescriptions = await prisma.prescription.findMany({
             where,
@@ -460,8 +472,10 @@ class AnalyticsService {
             if (therapist) where.therapistId = therapist.id;
         }
 
-        // Branch filtering
-        if (branchId && role !== 'ADMIN' && role !== 'ADMIN_DOCTOR') {
+        // Branch filtering — when a branchId is provided (explicitly by an
+        // admin via ?branchId, or implicitly from the caller's own
+        // user.branchId for non-admins) scope the query to that branch.
+        if (branchId) {
             where.branchId = branchId;
         }
 
@@ -563,9 +577,9 @@ class AnalyticsService {
      * Get per-branch summary statistics for comparison.
      * Accessible by ADMIN and ADMIN_DOCTOR.
      */
-    async getBranchSummary() {
+    async getBranchSummary({ branchId } = {}) {
         const branches = await prisma.branch.findMany({
-            where: { isActive: true },
+            where: { isActive: true, ...(branchId ? { id: branchId } : {}) },
             include: {
                 appointments: {
                     select: { id: true, status: true },

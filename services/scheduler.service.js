@@ -60,6 +60,13 @@ class SchedulerService {
             })
         );
 
+        // Medication refill forecast — runs daily at 9am
+        this.jobs.push(
+            cron.schedule('0 9 * * *', () => {
+                this.runMedicationRefillForecast();
+            })
+        );
+
         // Prescription expiry alerts — runs daily at 8am
         this.jobs.push(
             cron.schedule('0 8 * * *', () => {
@@ -374,6 +381,135 @@ class SchedulerService {
     }
 
     /**
+     * ONLINE-appointment pre-call reminders with the embedded meeting link.
+     * Two windows are swept each run so one cron (every 5 min) covers both:
+     *   - [27, 32) min before start → "starts in 30 minutes"
+     *   - [3, 7) min before start   → "starts in 5 minutes, join now"
+     * Runs only for ONLINE appointments with a populated meetingLink.
+     * Deduplication is handled by the in-app notification `data.kind` check
+     * so a single appointment is never reminded twice for the same window.
+     */
+    async sendOnlineCallReminders() {
+        const now = new Date();
+        const windows = [
+            { kind: 'online_reminder_30m', startOffset: 27, endOffset: 32, minutesBefore: 30 },
+            { kind: 'online_reminder_5m',  startOffset: 3,  endOffset: 7,  minutesBefore: 5  },
+        ];
+
+        for (const w of windows) {
+            try {
+                const winStart = new Date(now.getTime() + w.startOffset * 60_000);
+                const winEnd   = new Date(now.getTime() + w.endOffset   * 60_000);
+
+                const appointments = await prisma.appointment.findMany({
+                    where: {
+                        consultationMode: 'ONLINE',
+                        meetingLink: { not: null },
+                        date: { gte: winStart, lt: winEnd },
+                        status: { in: ['SCHEDULED', 'CONFIRMED', 'ACCEPTED'] },
+                    },
+                    include: {
+                        patient: { include: { user: { select: { id: true } } } },
+                        doctor:  { select: { userId: true } },
+                        therapist: { select: { userId: true } },
+                    },
+                });
+
+                for (const appt of appointments) {
+                    // Dedupe check: have we already reminded for this window?
+                    const already = await prisma.notification.findFirst({
+                        where: {
+                            type: 'APPOINTMENT_REMINDER',
+                            // Match on appointmentId + kind inside the JSON `data` column.
+                            // Prisma supports path-based JSON filters on Postgres.
+                            AND: [
+                                { data: { path: ['appointmentId'], equals: appt.id } },
+                                { data: { path: ['kind'],          equals: w.kind  } },
+                            ],
+                        },
+                        select: { id: true },
+                    });
+                    if (already) continue;
+
+                    const targets = [
+                        appt.patient?.user?.id,
+                        appt.doctor?.userId,
+                        appt.therapist?.userId,
+                    ].filter(Boolean);
+
+                    const title = `Your online consultation starts in ${w.minutesBefore} minutes`;
+                    const message = `Join the video call when you're ready. The waiting room opens 15 minutes before the start time.`;
+
+                    await Promise.all(targets.map((userId) =>
+                        notificationService.createNotification({
+                            userId,
+                            type: 'APPOINTMENT_REMINDER',
+                            title,
+                            message,
+                            priority: w.minutesBefore <= 5 ? 'HIGH' : 'MEDIUM',
+                            data: {
+                                kind: w.kind,
+                                appointmentId: appt.id,
+                                meetingLink: appt.meetingLink,
+                                startAt: appt.date,
+                            },
+                        }).catch(() => { /* best-effort */ })
+                    ));
+                }
+
+                logger.info(
+                    `[SchedulerService] online-reminder ${w.kind} → ${appointments.length} appointments`
+                );
+            } catch (err) {
+                logger.error(`[SchedulerService] online-reminder ${w.kind} failed`, { err: err.message });
+            }
+        }
+    }
+
+    /**
+     * Fallback auto-complete for ONLINE appointments.
+     *
+     * The Daily.co `meeting.ended` webhook normally flips status to COMPLETED.
+     * For Jitsi-mode tenants (no DAILY_API_KEY) there is NO webhook, so this
+     * sweep closes the gap: any ONLINE appointment whose scheduled end is >2h
+     * in the past and is still in a non-terminal state gets marked COMPLETED.
+     * Using the same path as the webhook so all status-transition side effects
+     * (zen points, CSAT cron pickup) still fire.
+     */
+    async autoCompleteExpiredOnlineCalls() {
+        const { AppointmentService } = await import('./appointment.service.js');
+        try {
+            const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60_000);
+            const stale = await prisma.appointment.findMany({
+                where: {
+                    consultationMode: 'ONLINE',
+                    date: { lt: twoHoursAgo },
+                    status: { notIn: ['COMPLETED', 'CANCELLED', 'REJECTED', 'NO_SHOW'] },
+                },
+                select: { id: true },
+            });
+            for (const { id } of stale) {
+                try {
+                    await AppointmentService.updateAppointment(
+                        id,
+                        { id: 'system', role: 'ADMIN' },
+                        { status: 'COMPLETED' }
+                    );
+                } catch (err) {
+                    logger.warn('[SchedulerService] autoCompleteExpiredOnlineCalls: update failed', {
+                        appointmentId: id, err: err.message,
+                    });
+                }
+            }
+            if (stale.length > 0) {
+                logger.info(`[SchedulerService] Auto-completed ${stale.length} stale ONLINE appointments`);
+            }
+        } catch (err) {
+            logger.error('[SchedulerService] autoCompleteExpiredOnlineCalls failed', { err: err.message });
+        }
+    }
+
+    /**
      * Clean up notifications older than 30 days
      */
     async cleanupOldNotifications() {
@@ -533,62 +669,123 @@ class SchedulerService {
     }
 
     /**
-     * Medication adherence reminders: notify patients who have active prescriptions
-     * but have not logged any medication intake today.
+     * Medication missed-dose sweep. Delegates to MedicationLifecycleService —
+     * per-prescription streak tracking, day-1 in-app nudge, day-2 WhatsApp
+     * follow-up with 48h dedup.
      * Runs: daily at 8pm
      */
     async sendMedicationAdherenceReminders() {
         try {
+            const { runMissedDoseSweep } = await import('./medicationLifecycle.service.js');
+            const pinged = await runMissedDoseSweep();
+            logger.info(`[SchedulerService] Missed-dose sweep pinged ${pinged} patients`);
+        } catch (error) {
+            logger.error('[SchedulerService] Error running missed-dose sweep:', error);
+        }
+    }
+
+    /**
+     * Supply-based refill forecast sweep. Delegates to MedicationLifecycleService.
+     * 3 days before run-out → in-app reminder; last day → WhatsApp final nudge;
+     * overdue → clinician notification (once per 48h).
+     * Runs: daily at 9am
+     */
+    async runMedicationRefillForecast() {
+        try {
+            const { runRefillForecastSweep } = await import('./medicationLifecycle.service.js');
+            const sent = await runRefillForecastSweep();
+            logger.info(`[SchedulerService] Refill forecast sweep sent ${sent} reminders`);
+        } catch (error) {
+            logger.error('[SchedulerService] Error running refill forecast sweep:', error);
+        }
+    }
+
+    /**
+     * Daily check-in reminder — sent at 10:00 AM to patients who haven't
+     * completed today's check-in. Quiet-hours: skip patients whose
+     * NotificationPreference disables push.
+     */
+    async sendDailyCheckInReminders() {
+        try {
             const todayStart = new Date();
             todayStart.setHours(0, 0, 0, 0);
 
-            const todayEnd = new Date();
-            todayEnd.setHours(23, 59, 59, 999);
+            // Patients with no DailyCheckIn today
+            const patients = await prisma.patient.findMany({
+                where: {
+                    onboardingCompleted: true,
+                    NOT: { dailyCheckIns: { some: { createdAt: { gte: todayStart } } } },
+                },
+                include: { user: { select: { id: true } } },
+                take: 500,
+            });
 
-            // Find prescriptions that are still within their expected active window
-            // Duration is a string like "7 days", "1 month" — we compare createdAt
-            // to a generous 90-day window (covers all common durations)
-            const ninetyDaysAgo = new Date();
-            ninetyDaysAgo.setDate(ninetyDaysAgo.getDate() - 90);
+            let sent = 0;
+            for (const patient of patients) {
+                if (!patient.user?.id) continue;
+                const pref = await prisma.notificationPreference.findUnique({
+                    where: { userId: patient.user.id },
+                });
+                if (pref && !pref.pushEnabled && !pref.whatsappEnabled) continue;
 
-            const activePrescriptions = await prisma.prescription.findMany({
-                where: { createdAt: { gte: ninetyDaysAgo } },
+                await notificationService.createNotification({
+                    userId: patient.user.id,
+                    type: 'DAILY_CHECKIN_REMINDER',
+                    title: 'Time for your daily check-in',
+                    message: 'Take 60 seconds to log how you\'re feeling today. Your care team uses this to track your progress.',
+                    priority: 'MEDIUM',
+                    data: { kind: 'OPEN_CHECKIN_MODAL' },
+                });
+                sent++;
+            }
+
+            logger.info(`[SchedulerService] Daily check-in reminders sent: ${sent}`);
+        } catch (error) {
+            logger.error('[SchedulerService] Error sending daily check-in reminders:', error);
+        }
+    }
+
+    /**
+     * Wellness decline detection — flags patients whose 3 most recent check-ins
+     * show monotonically rising pain levels and sends an encouragement message.
+     */
+    async detectWellnessDecline() {
+        try {
+            const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+            const recentCheckIns = await prisma.dailyCheckIn.findMany({
+                where: { createdAt: { gte: sevenDaysAgo } },
+                orderBy: { createdAt: 'desc' },
                 include: { patient: { include: { user: true } } },
             });
 
-            // Group by patientId to send one notification per patient (not per prescription)
-            const patientMap = new Map();
-            for (const rx of activePrescriptions) {
-                if (!rx.patient?.userId) continue;
+            // Group by patient, take 3 most recent
+            const byPatient = new Map();
+            for (const c of recentCheckIns) {
+                if (!byPatient.has(c.patientId)) byPatient.set(c.patientId, []);
+                if (byPatient.get(c.patientId).length < 3) byPatient.get(c.patientId).push(c);
+            }
 
-                // Check if patient logged any medication for this prescription today
-                const logsToday = await prisma.medicationLog.count({
-                    where: {
-                        prescriptionId: rx.id,
-                        takenAt: { gte: todayStart, lte: todayEnd },
-                        taken: true,
-                    },
-                });
-
-                if (logsToday === 0 && !patientMap.has(rx.patientId)) {
-                    patientMap.set(rx.patientId, rx.patient);
+            let alerted = 0;
+            for (const [, list] of byPatient) {
+                if (list.length < 3) continue;
+                const [a, b, c] = list; // most recent first
+                if (a.painLevel > b.painLevel && b.painLevel > c.painLevel && a.painLevel >= 6) {
+                    const userId = list[0].patient?.user?.id;
+                    if (!userId) continue;
+                    await notificationService.createNotification({
+                        userId,
+                        type: 'WELLNESS_DECLINE',
+                        title: 'We\'re here to help',
+                        message: 'Your pain levels have risen for 3 days in a row. Consider messaging your doctor or completing a fresh check-in.',
+                        priority: 'HIGH',
+                        data: { kind: 'OPEN_CHECKIN_MODAL' },
+                    });
+                    alerted++;
                 }
             }
-
-            for (const [, patient] of patientMap) {
-                await notificationService.createNotification({
-                    userId: patient.userId,
-                    type: 'MEDICATION_ADHERENCE_REMINDER',
-                    title: '💊 Medication reminder',
-                    message: `Don't forget to take your medication today and log it in your wellness tracker to maintain your health streak.`,
-                    priority: 'LOW',
-                    data: {},
-                });
-            }
-
-            logger.info(`[SchedulerService] Medication adherence reminders sent to ${patientMap.size} patients`);
+            logger.info(`[SchedulerService] Wellness decline alerts sent: ${alerted}`);
         } catch (error) {
-            logger.error('[SchedulerService] Error sending medication adherence reminders:', error);
+            logger.error('[SchedulerService] Error in detectWellnessDecline:', error);
         }
     }
 
@@ -659,13 +856,15 @@ class SchedulerService {
      */
     async sendCSATSurveys() {
         try {
+            // `csatSentAt` is the idempotency flag — the old 1-hour window could
+            // drop surveys on cron blips or duplicate them across overlapping runs.
             const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
-            const threeHoursAgo = new Date(Date.now() - 3 * 60 * 60 * 1000);
 
             const appointments = await prisma.appointment.findMany({
                 where: {
                     status: 'COMPLETED',
-                    updatedAt: { gte: threeHoursAgo, lte: twoHoursAgo },
+                    updatedAt: { lte: twoHoursAgo },
+                    csatSentAt: null,
                     feedback: null,
                 },
                 include: { patient: true, doctor: { include: { user: true } } }
@@ -673,6 +872,15 @@ class SchedulerService {
 
             for (const appt of appointments) {
                 if (!appt.patient?.userId) continue;
+
+                // Claim the survey slot first — updateMany with the csatSentAt=null
+                // guard acts as a CAS, so only one cron run can send per appointment
+                // even if runs overlap.
+                const claimed = await prisma.appointment.updateMany({
+                    where: { id: appt.id, csatSentAt: null },
+                    data: { csatSentAt: new Date() },
+                });
+                if (claimed.count === 0) continue;
 
                 const doctorName = appt.doctor?.fullName || 'your doctor';
                 await notificationService.createNotification({

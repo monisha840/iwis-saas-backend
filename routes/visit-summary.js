@@ -1,13 +1,15 @@
 import express from 'express';
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
+import { requireFeature } from '../utils/featureGate.js';
 import { PortalController } from '../controllers/portal.controller.js';
 
 const router = express.Router();
 
 const clinicianRoles = ['DOCTOR', 'THERAPIST', 'ADMIN_DOCTOR'];
 
-// All routes require authentication
+// All routes require authentication + feature flag
 router.use(authMiddleware);
+router.use(requireFeature('VISIT_SUMMARY'));
 
 // POST / — create visit summary
 router.post(

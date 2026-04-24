@@ -81,13 +81,25 @@ export class ZenPointsService {
         if (streak && streak.currentStreak > 0 && streak.currentStreak % 7 === 0) {
             const bonusAllowed = await AntiGamingService.canEarnPoints(patientId, 'STREAK_BONUS');
             if (bonusAllowed.allowed) {
-                await prisma.zenPointsLedger.create({
-                    data: { patientId, action: 'STREAK_BONUS', points: 50, sourceId: `streak_${streak.currentStreak}` }
-                });
-                await prisma.patient.update({
-                    where: { id: patientId },
-                    data: { zenPoints: { increment: 50 } }
-                });
+                const bonusSourceId = `streak_${streak.currentStreak}`;
+                try {
+                    await prisma.$transaction(async (tx) => {
+                        const existing = await tx.zenPointsLedger.findFirst({
+                            where: { patientId, action: 'STREAK_BONUS', sourceId: bonusSourceId },
+                            select: { id: true },
+                        });
+                        if (existing) return;
+                        await tx.zenPointsLedger.create({
+                            data: { patientId, action: 'STREAK_BONUS', points: 50, sourceId: bonusSourceId }
+                        });
+                        await tx.patient.update({
+                            where: { id: patientId },
+                            data: { zenPoints: { increment: 50 } }
+                        });
+                    }, { isolationLevel: 'Serializable' });
+                } catch (err) {
+                    logger.warn('[ZenPoints] streak bonus race', { err: err.message });
+                }
             }
         }
 
@@ -106,6 +118,16 @@ export class ZenPointsService {
                 level,
                 streak: streak?.currentStreak || 0
             });
+        }
+
+        // Mirror the new total into the patient's HealthAvatar so the
+        // avatar level always tracks Zen progress. Best-effort — a sync
+        // failure must not roll back the points award.
+        try {
+            const { HealthAvatarService } = await import('./healthAvatar.service.js');
+            await HealthAvatarService.syncFromZenPoints(patientId);
+        } catch (err) {
+            logger.warn('[ZenPoints] Avatar sync failed', { err: err.message });
         }
 
         return { points, total: patient?.zenPoints || 0 };

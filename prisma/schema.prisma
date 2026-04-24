@@ -3,8 +3,14 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  // Migrations + introspection go through the DIRECT (session / unpooled)
+  // URL so `prisma migrate` can hold a transaction across the whole run.
+  // Runtime queries use the pooled DATABASE_URL. On Supabase this is:
+  //   DATABASE_URL=pooler:6543?pgbouncer=true   (transaction mode)
+  //   DIRECT_URL  =pooler:5432                  (session mode)
+  directUrl = env("DIRECT_URL")
 }
 
 model User {
@@ -13,6 +19,7 @@ model User {
   password               String
   role                   Role
   emailVerifiedAt        DateTime?
+  tokensRevokedAt        DateTime?
   mfaEnabled             Boolean                 @default(false)
   mfaSecret              String?
   mfaBackupCodes         String[]
@@ -32,6 +39,8 @@ model User {
   therapist              Therapist?
   branch                 Branch?                 @relation(fields: [branchId], references: [id])
   branchId               String?
+  hospital               Hospital?               @relation(fields: [hospitalId], references: [id])
+  hospitalId             String?
   auditLogs              AuditLog[]
   refillRequests         RefillRequest[]
   refreshTokens          RefreshToken[]
@@ -57,8 +66,39 @@ model User {
   announcementReads      AnnouncementRead[]
   handoffsFrom           HandoffNote[]       @relation("HandoffFrom")
   handoffsTo             HandoffNote[]       @relation("HandoffTo")
+  // SUPER_ADMIN relations
+  enabledFeatureFlags    HospitalFeatureFlag[] @relation("FeatureFlagEnabledBy")
+  superAdminAuditLogs    SuperAdminAuditLog[]  @relation("SuperAdminActor")
+  // Triage v2
+  triageOverridesReviewed TriageOverride[]     @relation("TriageOverrideReviewer")
+  // Dashboard refactor — todos
+  todosCreated            Todo[]               @relation("TodoCreatedBy")
+  todosAssigned           Todo[]               @relation("TodoAssignedTo")
+  // Vitals this clinician has prescribed for patients
+  prescribedVitals        PrescribedVital[]    @relation("PrescribedVitalAuthor")
+  // Self-examination protocol — clinician reviewer
+  selfExamReviews         SelfExamSubmission[] @relation("SelfExamReviewer")
+  // Admin-tunable per-zone test protocol overrides
+  selfExamProtocolEdits   SelfExamProtocolOverride[] @relation("SelfExamProtocolEditor")
+  // Diet package authoring & approval
+  dietPackagesCreated     DietPackage[]              @relation("DietPackageCreator")
+  dietPackagesApproved    DietPackage[]              @relation("DietPackageApprover")
+  // Patient assignments this admin / admin-doctor has made
+  patientAssignmentsMade  PatientAssignment[]        @relation("PatientAssignedBy")
+  // Messaging template authorship
+  messageTemplatesCreated MessageTemplate[]          @relation("TemplateCreator")
+  messageTemplatesEdited  MessageTemplate[]          @relation("TemplateEditor")
+  // Appointment reminder authorship (per-appointment override)
+  appointmentRemindersEdited Appointment[]           @relation("AppointmentReminderEditor")
+  // Reminder deliveries targeted at this user (patient)
+  reminderDeliveriesReceived ReminderDeliveryLog[]   @relation("ReminderTarget")
+  // Follow-up schedules this clinician has assigned after a completed consultation
+  followUpsCreated           AppointmentFollowUp[]   @relation("FollowUpCreator")
+  // Critical-journey flags this clinician has marked as resolved
+  criticalFlagsResolved      PatientCriticalFlag[]   @relation("CriticalFlagResolver")
 
   @@index([branchId])
+  @@index([hospitalId])
 }
 
 model RefreshToken {
@@ -97,6 +137,17 @@ model Branch {
   isActive          Boolean             @default(true)
   createdAt         DateTime            @default(now())
   updatedAt         DateTime            @updatedAt
+  hospitalId        String
+  hospital          Hospital            @relation(fields: [hospitalId], references: [id])
+  // Capacity & operations (IWIS competitor feature 0)
+  totalBeds          Int?
+  availableBeds      Int?
+  totalRooms         Int?
+  totalTherapyRooms  Int?
+  ipdEnabled         Boolean             @default(false)
+  opdEnabled         Boolean             @default(true)
+  operatingHoursFrom String?
+  operatingHoursTo   String?
   users             User[]
   patients          Patient[]
   appointments      Appointment[]
@@ -118,9 +169,18 @@ model Branch {
   transfersTo        StockTransfer[]      @relation("TransferTo")
   staffActivities    StaffActivity[]      @relation("StaffBranchActivity")
   branchAttendance   StaffAttendance[]    @relation("BranchAttendance")
-  teamQuests         TeamQuest[]
-  announcements      Announcement[]       @relation("BranchAnnouncements")
+  announcements      Announcement[]       @relation("AnnouncementTargetBranches")
   handoffNotes       HandoffNote[]        @relation("HandoffToBranch")
+  // IWIS competitor features
+  therapyRooms       TherapyRoom[]
+  treatmentPackages  TreatmentPackage[]
+  groupSessions      GroupSession[]
+  // Dashboard refactor — todos scoped to this branch
+  todos              Todo[]               @relation("TodoBranch")
+  // Self-examination protocol submissions (branch-scoped for admin review)
+  selfExamSubmissions SelfExamSubmission[]
+  // Critical-journey flags scoped to this branch (for branch-filtered admin dashboards)
+  criticalFlags       PatientCriticalFlag[]
 }
 
 model AuditLog {
@@ -153,6 +213,10 @@ model Doctor {
   qualification      String?
   specialization     String?
   yearsExperience    Int?
+  // Certificate / medical registration number (e.g. CCIM, state AYUSH
+  // board). Nullable on the schema for back-compat; required at the form
+  // and route layer for new records.
+  registrationNumber String?
   appointments       Appointment[]
   conversations      Conversation[]
   user               User                @relation(fields: [userId], references: [id])
@@ -160,6 +224,51 @@ model Doctor {
   prescriptions      Prescription[]
   videoPrescriptions VideoPrescription[]
   blockedSlots       BlockedSlot[]
+  // IWIS competitor features
+  dietPrescriptions  DietPrescription[]
+  patientAssignments PatientAssignment[]
+}
+
+// Canonical record of who's looking after a patient. Supersedes the old
+// "create a fake Appointment with status=ASSIGNED" hack.
+//
+//  - PRIMARY: the patient's main clinician. At most one ACTIVE PRIMARY at a
+//    time; assigning a new PRIMARY automatically flips any previous ACTIVE
+//    PRIMARY to REPLACED (preserving history).
+//  - CONSULTING: secondary / specialist opinion. Multiple allowed.
+//  - TEMPORARY: short-term cross-branch cover. Multiple allowed.
+//
+// Rows are never deleted — status transitions preserve the audit trail.
+model PatientAssignment {
+  id           String           @id @default(cuid())
+  patientId    String
+  patient      Patient          @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  doctorId     String
+  doctor       Doctor           @relation(fields: [doctorId], references: [id])
+  type         AssignmentType   @default(PRIMARY)
+  status       AssignmentStatus @default(ACTIVE)
+  reason       String?
+  assignedById String
+  assignedBy   User             @relation("PatientAssignedBy", fields: [assignedById], references: [id])
+  assignedAt   DateTime         @default(now())
+  endedAt      DateTime?
+  endReason    String?
+
+  @@index([patientId, status])
+  @@index([doctorId, status])
+  @@index([assignedById])
+}
+
+enum AssignmentType {
+  PRIMARY
+  CONSULTING
+  TEMPORARY
+}
+
+enum AssignmentStatus {
+  ACTIVE
+  ENDED
+  REPLACED
 }
 
 model BlockedSlot {
@@ -195,6 +304,10 @@ model Therapist {
   qualification      String?
   specialization     String?
   yearsExperience    Int?
+  // Certificate / registration number (e.g. AYUSH / state therapy board).
+  // Nullable on the schema for back-compat; required at the form and route
+  // layer for new records.
+  registrationNumber String?
   appointments       Appointment[]
   availability       Availability[]
   conversations      Conversation[]
@@ -203,6 +316,10 @@ model Therapist {
   user               User                @relation(fields: [userId], references: [id])
   videoPrescriptions VideoPrescription[]
   blockedSlots       BlockedSlot[]
+  // IWIS competitor features
+  therapistSkills    TherapistSkill[]
+  groupSessions      GroupSession[]
+  packageSessionLogs PackageSessionLog[] @relation("PackageSessionConductor")
 }
 
 model Pharmacist {
@@ -227,6 +344,7 @@ model Patient {
   dob                 DateTime?
   fullName            String?
   gender              String?
+  profilePhoto        String?
   patientId           String?             @unique
   phoneNumber         String?
   therapyType         String?
@@ -264,6 +382,29 @@ model Patient {
   contentUnlocks      ContentUnlock[]
   handoffNotes        HandoffNote[]
   visitSummaries      VisitSummary[]
+  // IWIS competitor features
+  dietPrescriptions   DietPrescription[]
+  dietAdherenceLogs   DietAdherenceLog[]
+  clinicalPhotos      ClinicalPhoto[]
+  packageEnrolments   PackageEnrolment[]
+  // Dashboard refactor — todos linked to this patient for context
+  todos               Todo[]              @relation("TodoRelatedPatient")
+  // Vitals the doctor has prescribed this patient to track
+  prescribedVitals    PrescribedVital[]
+  // Self-examination protocol (IWIS pre-consultation workflow)
+  selfExamSubmissions SelfExamSubmission[]
+  tongueObservations  TongueObservation[]
+  stoolLogs           StoolLog[]
+  urineLogs           UrineLog[]
+  constitutionProfile ConstitutionProfile?
+  // Primary-care doctor history (canonical source of who's looking after
+  // this patient). Join table supports history, reassignment audit, and
+  // future primary-vs-consulting doctor splits.
+  patientAssignments  PatientAssignment[]
+  // Follow-up schedules assigned at consultation completion
+  followUps           AppointmentFollowUp[]
+  // Critical-journey flag (at most one active row per patient — upsert-based)
+  criticalFlag        PatientCriticalFlag?
 
   @@index([branchId]) // branch-scoped patient queries (listPatients, triage dispatch)
 }
@@ -337,9 +478,36 @@ model Appointment {
   doctorApproved   Boolean        @default(false)
   therapistApproved Boolean       @default(false)
   notificationSent  Boolean       @default(false)
+  csatSentAt       DateTime?
   retentionChecklist RetentionChecklist?
   feedback           AppointmentFeedback?
   visitSummary       VisitSummary?
+  // IWIS competitor features
+  therapyRoomId      String?
+  therapyRoomBooking TherapyRoomBooking?
+  groupSessionId     String?
+  groupSession       GroupSession?  @relation(fields: [groupSessionId], references: [id])
+  isGroupBooking     Boolean        @default(false)
+  packageSessionLogs PackageSessionLog[]
+  prescriptions      Prescription[]
+  // Dashboard refactor — todos linked to this appointment
+  todos              Todo[]         @relation("TodoRelatedAppointment")
+  // Self-examination protocol submission prepared for this Vaidya visit
+  selfExamSubmissions SelfExamSubmission[]
+  // Auto-seeded handoff draft created when this appointment is marked COMPLETED
+  handoffNoteDraft    HandoffNote? @relation("AppointmentHandoffDraft")
+  // Per-appointment custom reminder message — set at booking time by admin/doctor
+  customReminderTemplateId   String?
+  customReminderTemplate     MessageTemplate? @relation("AppointmentCustomTemplate", fields: [customReminderTemplateId], references: [id], onDelete: SetNull)
+  customReminderBody         String?
+  customReminderSubject      String?
+  customReminderChannels     DeliveryChannel[] @default([])
+  customReminderUpdatedAt    DateTime?
+  customReminderUpdatedById  String?
+  customReminderUpdatedBy    User?            @relation("AppointmentReminderEditor", fields: [customReminderUpdatedById], references: [id], onDelete: SetNull)
+  reminderDeliveryLogs       ReminderDeliveryLog[]
+  // Follow-up schedule captured at consultation completion (1:1)
+  followUp                   AppointmentFollowUp?
 
   @@index([patientId])
   @@index([doctorId])
@@ -370,8 +538,23 @@ model Prescription {
   frequency         String
   duration          String
   notes             String?
+  // Legacy counter — retained for back-compat. dispensedQty / consumedQty are
+  // the new source of truth for supply tracking (see medicationLifecycle.service.js).
   totalQuantity     Int             @default(0)
   lowStockThreshold Int             @default(5)
+  refillNotifiedAt  DateTime?
+  // ── Lifecycle tracking ─────────────────────────────────────────────────
+  startDate             DateTime?
+  expectedEndDate       DateTime?
+  dailyDoseCount        Int?
+  dispensedQty          Int       @default(0)
+  consumedQty           Int       @default(0)
+  missedDoseNotifiedAt  DateTime?
+  missedDoseStreak      Int       @default(0)
+  threeDayNotifiedAt    DateTime?
+  lastDayNotifiedAt     DateTime?
+  discontinuedAt        DateTime?
+  discontinuedReason    String?
   createdAt         DateTime        @default(now())
   updatedAt         DateTime        @updatedAt
   videoUrl          String?
@@ -386,12 +569,18 @@ model Prescription {
   branch            Branch?            @relation(fields: [branchId], references: [id])
   branchId          String?
   refillRequests    RefillRequest[]
+  // Optional: prescription written during a specific appointment. Used by
+  // VisitSummary to surface the exact prescriptions authored during the visit.
+  appointmentId     String?
+  appointment       Appointment?       @relation(fields: [appointmentId], references: [id], onDelete: SetNull)
 
   @@index([patientId])
   @@index([doctorId])
   @@index([therapistId])
   @@index([createdAt])
   @@index([branchId])
+  @@index([appointmentId])
+  @@index([discontinuedAt, expectedEndDate])
 }
 
 model Availability {
@@ -464,9 +653,12 @@ model NotificationPreference {
   emailEnabled         Boolean @default(true)
   smsEnabled           Boolean @default(false)
   pushEnabled          Boolean @default(true)
+  whatsappEnabled      Boolean @default(false)
+  whatsappNumber       String?
   appointmentReminders Boolean @default(true)
   systemAlerts         Boolean @default(true)
   prescriptionUpdates  Boolean @default(true)
+  medicationReminders  Boolean @default(true)
   user                 User    @relation(fields: [userId], references: [id])
 }
 
@@ -594,6 +786,13 @@ model Medicine {
   updatedAt     DateTime        @updatedAt
   videoUrl      String?
   sku           String?         @unique
+  hsn                 String?
+  pharmacologicalName String?
+  riskLevel           String?
+  maxSalesDiscount    Float?
+  tax                 Float?
+  purchaseUnit        String?
+  qtyPerPurchaseUnit  Int?
   dispenseItems DispenseItem[]
   invoiceItems       InvoiceItem[]
   stocks             MedicineStock[]
@@ -612,12 +811,14 @@ model MedicineStock {
   quantity    Int
   minStock    Int      @default(10)
   location    String?
+  purchasePrice Float?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
   medicine    Medicine @relation(fields: [medicineId], references: [id])
   branch      Branch?  @relation(fields: [branchId], references: [id])
   branchId    String?
 
+  @@unique([medicineId, branchId, batchNumber])
   @@index([medicineId])
   @@index([expiryDate])
   @@index([branchId])
@@ -702,7 +903,7 @@ model Invoice {
   taxAmount   Float?        @default(0)
   discount    Float?        @default(0)
   netAmount   Float
-  status      String        @default("UNPAID")
+  status      InvoiceStatus @default(UNPAID)
   dueDate     DateTime?
   createdAt   DateTime      @default(now())
   updatedAt   DateTime      @updatedAt
@@ -711,6 +912,7 @@ model Invoice {
   payments    Payment[]
   branch      Branch?       @relation(fields: [branchId], references: [id])
   branchId    String?
+  packageEnrolment PackageEnrolment?
 
   @@index([patientId])
   @@index([status])
@@ -729,31 +931,99 @@ model InvoiceItem {
   medicine    Medicine? @relation(fields: [medicineId], references: [id])
 }
 
+enum InvoiceStatus {
+  UNPAID
+  PARTIAL
+  PAID
+  REFUNDED
+}
+
 model TriageSession {
-  id                    String       @id @default(uuid())
-  patientId             String
-  responses             Json
-  severity              String
-  suggestedSpecialty    String?
-  isEscalated           Boolean      @default(false)
-  compositeScore        Float?
-  urgencyLevel          String?
-  confidenceScore       Float?
+  id                     String       @id @default(uuid())
+  patientId              String
+  responses              Json
+  severity               String
+  suggestedSpecialty     String?
+  isEscalated            Boolean      @default(false)
+  compositeScore         Float?
+  urgencyLevel           String?
+  confidenceScore        Float?
   alternativeSpecialties String[]
-  flags                 String[]
-  triageNotes           String?
-  painRegions           Json?
-  lifestyleData         Json?
-  createdAt             DateTime     @default(now())
-  updatedAt             DateTime     @updatedAt
-  appointment           Appointment?
-  documents             Document[]
-  patient               Patient      @relation(fields: [patientId], references: [id])
-  branch                Branch?      @relation(fields: [branchId], references: [id])
-  branchId              String?
+  flags                  String[]
+  triageNotes            String?
+  painRegions            Json?
+  lifestyleData          Json?
+  // Split confidence signals
+  inputCompleteness      Float?
+  routingMatchStrength   Float?
+  // Red-flag override chain
+  redFlagsMatched        String[]
+  redFlagForced          Boolean      @default(false)
+  // Re-triage history (monotonic counter + last-known state)
+  reviewCount            Int          @default(0)
+  previousScore          Float?
+  previousUrgencyLevel   String?
+  escalatedAfterUpdate   Boolean      @default(false)
+  deEscalatedAfterUpdate Boolean      @default(false)
+  // Auto-hold audit trail (what the server reserved on URGENT/CRITICAL)
+  heldSlotClinicianId    String?
+  heldSlotDate           DateTime?
+  heldSlotTime           String?
+  // Clinician override (feedback loop → weight tuning)
+  reviewedByUserId       String?
+  reviewedAt             DateTime?
+  overriddenUrgencyLevel String?
+  overriddenSpecialty    String?
+  overrideReason         String?
+  createdAt              DateTime     @default(now())
+  updatedAt              DateTime     @updatedAt
+  appointment            Appointment?
+  documents              Document[]
+  patient                Patient      @relation(fields: [patientId], references: [id])
+  branch                 Branch?      @relation(fields: [branchId], references: [id])
+  branchId               String?
+  overrides              TriageOverride[]
+  selfExam               SelfExamSubmission?
 
   @@index([patientId])
   @@index([branchId])
+  @@index([urgencyLevel])
+  @@index([reviewedByUserId])
+}
+
+// Per-override ledger — every clinician re-classification is appended here
+// so the scoring weights can be tuned from disagreement rate per factor.
+model TriageOverride {
+  id                      String        @id @default(uuid())
+  triageSessionId         String
+  triageSession           TriageSession @relation(fields: [triageSessionId], references: [id], onDelete: Cascade)
+  reviewerUserId          String?
+  reviewer                User?         @relation("TriageOverrideReviewer", fields: [reviewerUserId], references: [id], onDelete: SetNull)
+  originalUrgencyLevel    String?
+  overriddenUrgencyLevel  String?
+  originalSpecialty       String?
+  overriddenSpecialty     String?
+  reason                  String?
+  factorDisagreement      Json?
+  createdAt               DateTime      @default(now())
+
+  @@index([triageSessionId])
+  @@index([reviewerUserId])
+  @@index([createdAt])
+}
+
+// DB-backed specialty routing vocabulary — ADMIN_DOCTOR can tune without a deploy.
+// Tags are exact-match (normalized lowercase) against region ids, symptom strings, and pain character flags.
+model SpecialtyRoute {
+  id         String   @id @default(uuid())
+  specialty  String   @unique
+  tags       String[]
+  priority   Int      @default(0)
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([isActive, priority])
 }
 
 model Conversation {
@@ -797,6 +1067,7 @@ model Message {
 }
 
 enum Role {
+  SUPER_ADMIN
   ADMIN_DOCTOR
   DOCTOR
   THERAPIST
@@ -961,6 +1232,7 @@ model TreatmentJourney {
   phases          JourneyPhase[]
   milestones      JourneyMilestone[]
   vitals          PatientVital[]
+  clinicalPhotos  ClinicalPhoto[]
   wellnessScore   Float             @default(0)
   createdAt       DateTime          @default(now())
   updatedAt       DateTime          @updatedAt
@@ -980,6 +1252,7 @@ model JourneyPhase {
   durationDays Int
   status       PhaseStatus      @default(UPCOMING)
   tasks        PhaseTask[]
+  clinicalPhotos ClinicalPhoto[]
   startedAt    DateTime?
   completedAt  DateTime?
 
@@ -1042,6 +1315,27 @@ model PatientVital {
   @@index([journeyId])
   @@index([patientId])
   @@index([type, recordedAt])
+}
+
+// Vitals the doctor has prescribed a patient to track. Drives the
+// Patient dashboard's vital tiles — only prescribed vitals are surfaced.
+model PrescribedVital {
+  id              String     @id @default(cuid())
+  patientId       String     // Patient.id (NOT User.id — billing/clinical scope)
+  vitalType       VitalType
+  frequency       String     @default("DAILY")  // DAILY | WEEKLY | TWICE_DAILY
+  notes           String?    // Doctor's instruction (e.g. "Morning, fasting")
+  active          Boolean    @default(true)
+  prescribedById  String     // User.id of the prescribing doctor/admin-doctor
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  patient         Patient    @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  prescribedBy    User       @relation("PrescribedVitalAuthor", fields: [prescribedById], references: [id])
+
+  @@unique([patientId, vitalType])
+  @@index([patientId, active])
+  @@index([prescribedById])
 }
 
 enum JourneyStatus {
@@ -1263,11 +1557,11 @@ model AdaptiveTarget {
 model ResourceSharing {
   id            String   @id @default(cuid())
   userId        String
-  user          User     @relation("SharedStaff", fields: [userId], references: [id])
+  user          User     @relation("SharedStaff", fields: [userId], references: [id], onDelete: Cascade)
   fromBranchId  String
-  fromBranch    Branch   @relation("SharingFrom", fields: [fromBranchId], references: [id])
+  fromBranch    Branch   @relation("SharingFrom", fields: [fromBranchId], references: [id], onDelete: Cascade)
   toBranchId    String
-  toBranch      Branch   @relation("SharingTo", fields: [toBranchId], references: [id])
+  toBranch      Branch   @relation("SharingTo", fields: [toBranchId], references: [id], onDelete: Cascade)
   date          DateTime
   startTime     String
   endTime       String
@@ -1517,32 +1811,6 @@ model SeasonalChallengeProgress {
   @@index([participantId])
 }
 
-// ── Feature 16: Team Quests ─────────────────────────────────────────────────
-
-model TeamQuest {
-  id          String   @id @default(cuid())
-  branchId    String
-  branch      Branch   @relation(fields: [branchId], references: [id])
-  title       String
-  description String
-  icon        String   @default("Users")
-  metric      String   // avg_wait_time, patient_satisfaction, appointments_completed
-  target      Float
-  startDate   DateTime
-  endDate     DateTime
-  rewardXP    Int      @default(200)
-  currentValue Float   @default(0)
-  completed   Boolean  @default(false)
-  completedAt DateTime?
-  createdBy   String
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  @@index([branchId])
-  @@index([completed])
-  @@index([startDate, endDate])
-}
-
 // ── Feature 18: Reward Store ────────────────────────────────────────────────
 
 model RewardItem {
@@ -1737,8 +2005,8 @@ model Announcement {
   id          String    @id @default(cuid())
   authorId    String
   author      User      @relation("Announcements", fields: [authorId], references: [id])
-  branchId    String?   // null = all branches
-  branch      Branch?   @relation("BranchAnnouncements", fields: [branchId], references: [id])
+  // Empty set = broadcast to all branches. Populated = target exactly those branches.
+  branches    Branch[]  @relation("AnnouncementTargetBranches")
   title       String
   message     String
   priority    AnnouncementPriority @default(NORMAL)
@@ -1749,7 +2017,6 @@ model Announcement {
   updatedAt   DateTime  @updatedAt
   reads       AnnouncementRead[]
 
-  @@index([branchId])
   @@index([authorId])
   @@index([createdAt])
   @@index([isPinned])
@@ -1776,6 +2043,12 @@ enum AnnouncementPriority {
 
 // ── Feature 35: Handoff Notes ───────────────────────────────────────────────
 
+enum HandoffStatus {
+  DRAFT
+  SENT
+  ARCHIVED
+}
+
 model HandoffNote {
   id              String   @id @default(cuid())
   patientId       String
@@ -1795,11 +2068,19 @@ model HandoffNote {
   readAt          DateTime?
   createdAt       DateTime @default(now())
 
+  status              HandoffStatus @default(SENT)
+  isAutoGenerated     Boolean       @default(false)
+  sourceAppointmentId String?       @unique
+  sourceAppointment   Appointment?  @relation("AppointmentHandoffDraft", fields: [sourceAppointmentId], references: [id], onDelete: SetNull)
+  sentAt              DateTime?
+
   @@index([patientId])
   @@index([fromClinicianId])
   @@index([toClinicianId])
   @@index([toBranchId])
   @@index([isRead])
+  @@index([status])
+  @@index([fromClinicianId, status])
 }
 
 // ── Feature 39: Post-Visit Summary ──────────────────────────────────────────
@@ -1827,4 +2108,1103 @@ model VisitSummary {
   @@index([patientId])
   @@index([clinicianId])
   @@index([appointmentId])
+}
+
+// ── IWIS Super Admin (platform-level tenancy) ───────────────────────────────
+
+model Hospital {
+  id            String          @id @default(cuid())
+  name          String
+  slug          String          @unique
+  logoUrl       String?
+  contactEmail  String
+  contactPhone  String?
+  address       String?
+  country       String          @default("IN")
+  timezone      String          @default("Asia/Kolkata")
+  status        HospitalStatus  @default(ACTIVE)
+  plan          HospitalPlan    @default(STARTER)
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+  suspendedAt   DateTime?
+  suspendedById String?
+
+  branches     Branch[]
+  users        User[]
+  featureFlags HospitalFeatureFlag[]
+  auditLogs    SuperAdminAuditLog[]
+  selfExamSubmissions SelfExamSubmission[]
+  selfExamProtocolOverrides SelfExamProtocolOverride[]
+  dietPackages DietPackage[]
+  messageTemplates MessageTemplate[]
+  reminderSetting  ReminderSetting?
+  reminderDeliveryLogs ReminderDeliveryLog[]
+
+  @@index([status])
+  @@index([plan])
+}
+
+enum HospitalStatus {
+  ACTIVE
+  SUSPENDED
+  PENDING_SETUP
+  DECOMMISSIONED
+}
+
+enum HospitalPlan {
+  STARTER
+  PROFESSIONAL
+  ENTERPRISE
+}
+
+model FeatureRegistry {
+  id             String       @id @default(cuid())
+  key            String       @unique
+  displayName    String
+  description    String?
+  phase          String
+  minPlan        HospitalPlan
+  isCore         Boolean      @default(false)
+  defaultEnabled Boolean      @default(false)
+  addedInVersion String?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  hospitalFlags HospitalFeatureFlag[]
+
+  @@index([phase])
+  @@index([minPlan])
+}
+
+model HospitalFeatureFlag {
+  id          String          @id @default(cuid())
+  hospitalId  String
+  hospital    Hospital        @relation(fields: [hospitalId], references: [id], onDelete: Cascade)
+  featureKey  String
+  feature     FeatureRegistry @relation(fields: [featureKey], references: [key], onDelete: Cascade)
+  enabled     Boolean         @default(false)
+  enabledAt   DateTime?
+  enabledById String?
+  enabledBy   User?           @relation("FeatureFlagEnabledBy", fields: [enabledById], references: [id])
+  notes       String?
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  @@unique([hospitalId, featureKey])
+  @@index([featureKey])
+  @@index([hospitalId])
+}
+
+model SuperAdminAuditLog {
+  id           String    @id @default(cuid())
+  superAdminId String
+  superAdmin   User      @relation("SuperAdminActor", fields: [superAdminId], references: [id])
+  action       String
+  hospitalId   String?
+  hospital     Hospital? @relation(fields: [hospitalId], references: [id])
+  featureKey   String?
+  details      Json?
+  ipAddress    String?
+  createdAt    DateTime  @default(now())
+
+  @@index([superAdminId])
+  @@index([hospitalId])
+  @@index([action])
+  @@index([createdAt])
+}
+
+// ── IWIS Competitor Feature Additions ───────────────────────────────────────
+
+// Feature 1: Therapy Room Management
+model TherapyRoom {
+  id         String              @id @default(cuid())
+  branchId   String
+  branch     Branch              @relation(fields: [branchId], references: [id])
+  name       String
+  type       TherapyRoomType
+  capacity   Int                 @default(1)
+  isActive   Boolean             @default(true)
+  notes      String?
+  createdAt  DateTime            @default(now())
+  updatedAt  DateTime            @updatedAt
+
+  bookings       TherapyRoomBooking[]
+  groupSessions  GroupSession[]
+
+  @@index([branchId])
+  @@index([type])
+}
+
+enum TherapyRoomType {
+  SHIRODHARA
+  ABHYANGA
+  PANCHAKARMA_GENERAL
+  STEAM
+  CONSULTATION
+  GROUP
+}
+
+model TherapyRoomBooking {
+  id            String      @id @default(cuid())
+  roomId        String
+  room          TherapyRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  appointmentId String      @unique
+  appointment   Appointment @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  date          DateTime
+  startTime     String
+  endTime       String
+  notes         String?
+  createdAt     DateTime    @default(now())
+
+  @@index([roomId, date])
+  @@index([date])
+}
+
+// Feature 2: Diet Prescription
+model DietPrescription {
+  id          String   @id @default(cuid())
+  patientId   String
+  patient     Patient  @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  doctorId    String
+  doctor      Doctor   @relation(fields: [doctorId], references: [id])
+  journeyId   String?
+  title       String
+  doshaTarget DoshaType
+  category    DietCategory
+  startDate   DateTime
+  endDate     DateTime?
+  notes       String?
+  isActive    Boolean  @default(true)
+  // Traceability — which approved package this prescription was instantiated
+  // from (null for ad-hoc prescriptions). Meals/metadata are always snapshot
+  // into DietMeal rows so edits on the source package don't mutate existing
+  // patient plans.
+  packageId   String?
+  package     DietPackage? @relation(fields: [packageId], references: [id])
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  meals DietMeal[]
+  logs  DietAdherenceLog[]
+
+  @@index([patientId])
+  @@index([doctorId])
+  @@index([isActive])
+  @@index([packageId])
+}
+
+// Reusable diet template with approval workflow.
+// ADMIN / ADMIN_DOCTOR → auto APPROVED. DOCTOR → PENDING until admin approves.
+// Only APPROVED packages can be assigned to patients (snapshots into
+// DietPrescription + DietMeal rows at assignment time).
+model DietPackage {
+  id              String            @id @default(cuid())
+  hospitalId      String?
+  hospital        Hospital?         @relation(fields: [hospitalId], references: [id])
+  title           String
+  description     String?
+  doshaTarget     DoshaType
+  category        DietCategory
+  durationDays    Int
+  status          DietPackageStatus @default(PENDING)
+  notes           String?
+  isActive        Boolean           @default(true)
+  createdById     String
+  createdBy       User              @relation("DietPackageCreator", fields: [createdById], references: [id])
+  approvedById    String?
+  approvedBy      User?             @relation("DietPackageApprover", fields: [approvedById], references: [id])
+  approvedAt      DateTime?
+  rejectionReason String?
+  xpAwarded       Int?
+  approvalNotes   String?
+  createdAt       DateTime          @default(now())
+  updatedAt       DateTime          @updatedAt
+
+  meals         DietPackageMeal[]
+  prescriptions DietPrescription[]
+
+  @@index([hospitalId])
+  @@index([status])
+  @@index([createdById])
+  @@index([isActive])
+}
+
+model DietPackageMeal {
+  id           String      @id @default(cuid())
+  packageId    String
+  package      DietPackage @relation(fields: [packageId], references: [id], onDelete: Cascade)
+  mealTime     MealTime
+  foods        Json
+  avoidFoods   Json
+  instructions String?
+
+  @@index([packageId])
+}
+
+enum DietPackageStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  ARCHIVED
+}
+
+enum DoshaType {
+  VATA
+  PITTA
+  KAPHA
+  TRIDOSHA
+}
+
+enum DietCategory {
+  SATTVIC
+  RAJASIC
+  TAMASIC
+}
+
+enum MealTime {
+  MORNING_EMPTY
+  BREAKFAST
+  MID_MORNING
+  LUNCH
+  EVENING
+  DINNER
+  BEDTIME
+}
+
+model DietMeal {
+  id                 String           @id @default(cuid())
+  dietPrescriptionId String
+  prescription       DietPrescription @relation(fields: [dietPrescriptionId], references: [id], onDelete: Cascade)
+  mealTime           MealTime
+  foods              Json
+  avoidFoods         Json
+  instructions       String?
+
+  @@index([dietPrescriptionId])
+}
+
+model DietAdherenceLog {
+  id                 String           @id @default(cuid())
+  dietPrescriptionId String
+  prescription       DietPrescription @relation(fields: [dietPrescriptionId], references: [id], onDelete: Cascade)
+  patientId          String
+  patient            Patient          @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  date               DateTime
+  mealTime           MealTime
+  followed           Boolean
+  notes              String?
+  loggedAt           DateTime         @default(now())
+
+  @@unique([dietPrescriptionId, patientId, mealTime, date])
+  @@index([dietPrescriptionId, date])
+  @@index([patientId, date])
+}
+
+// Feature 3: Clinical Photo
+model ClinicalPhoto {
+  id           String            @id @default(cuid())
+  patientId    String
+  patient      Patient           @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  uploadedById String
+  journeyId    String?
+  journey      TreatmentJourney? @relation(fields: [journeyId], references: [id])
+  phaseId      String?
+  phase        JourneyPhase?     @relation(fields: [phaseId], references: [id])
+  category     PhotoCategory
+  stage        PhotoStage
+  bodyRegion   String?
+  notes        String?
+  filePath     String
+  takenAt      DateTime          @default(now())
+  createdAt    DateTime          @default(now())
+
+  @@index([patientId])
+  @@index([journeyId])
+  @@index([category])
+}
+
+enum PhotoCategory {
+  SKIN_CONDITION
+  SWELLING_OEDEMA
+  WOUND_HEALING
+  WEIGHT_CHANGE
+  GENERAL_PROGRESS
+}
+
+enum PhotoStage {
+  BEFORE
+  DURING
+  AFTER
+}
+
+// Feature 4: Therapist Skill Matrix
+model TherapistSkill {
+  id          String         @id @default(cuid())
+  therapistId String
+  therapist   Therapist      @relation(fields: [therapistId], references: [id], onDelete: Cascade)
+  skill       AyurvedicSkill
+  proficiency Proficiency
+  certifiedAt DateTime?
+  notes       String?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  @@unique([therapistId, skill])
+  @@index([skill])
+}
+
+enum AyurvedicSkill {
+  ABHYANGA
+  SHIRODHARA
+  PANCHAKARMA_GENERAL
+  BASTI
+  VIRECHANA
+  NASYA
+  KIZHI
+  NJAVARA
+  PIZHICHIL
+  MARMA_THERAPY
+  YOGA_THERAPY
+  NATUROPATHY
+}
+
+enum Proficiency {
+  CERTIFIED
+  EXPERIENCED
+  LEARNING
+}
+
+// Feature 5: Treatment Package
+model TreatmentPackage {
+  id           String   @id @default(cuid())
+  branchId     String
+  branch       Branch   @relation(fields: [branchId], references: [id])
+  name         String
+  description  String?
+  durationDays Int
+  price        Float
+  taxPercent   Float    @default(0)
+  isActive     Boolean  @default(true)
+  components   Json
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  enrolments PackageEnrolment[]
+
+  @@index([branchId])
+  @@index([isActive])
+}
+
+model PackageEnrolment {
+  id            String           @id @default(cuid())
+  packageId     String
+  package       TreatmentPackage @relation(fields: [packageId], references: [id])
+  patientId     String
+  patient       Patient          @relation(fields: [patientId], references: [id])
+  invoiceId     String?          @unique
+  invoice       Invoice?         @relation(fields: [invoiceId], references: [id])
+  startDate     DateTime
+  endDate       DateTime
+  status        EnrolmentStatus  @default(ACTIVE)
+  sessionsTotal Int
+  sessionsUsed  Int              @default(0)
+  notes         String?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  sessionLogs PackageSessionLog[]
+
+  @@index([patientId])
+  @@index([packageId])
+  @@index([status])
+}
+
+enum EnrolmentStatus {
+  ACTIVE
+  COMPLETED
+  CANCELLED
+  PAUSED
+}
+
+model PackageSessionLog {
+  id            String           @id @default(cuid())
+  enrolmentId   String
+  enrolment     PackageEnrolment @relation(fields: [enrolmentId], references: [id], onDelete: Cascade)
+  appointmentId String?
+  appointment   Appointment?     @relation(fields: [appointmentId], references: [id])
+  sessionType   String
+  conductedAt   DateTime
+  conductedById String
+  conductedBy   Therapist        @relation("PackageSessionConductor", fields: [conductedById], references: [id])
+  notes         String?
+  createdAt     DateTime         @default(now())
+
+  @@index([enrolmentId])
+  @@index([conductedById])
+}
+
+// Feature 6: Group Therapy Session
+model GroupSession {
+  id          String             @id @default(cuid())
+  branchId    String
+  branch      Branch             @relation(fields: [branchId], references: [id])
+  therapistId String
+  therapist   Therapist          @relation(fields: [therapistId], references: [id])
+  roomId      String?
+  room        TherapyRoom?       @relation(fields: [roomId], references: [id])
+  title       String
+  sessionType String
+  date        DateTime
+  startTime   String
+  endTime     String
+  maxCapacity Int
+  status      GroupSessionStatus @default(OPEN)
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  appointments Appointment[]
+
+  @@index([branchId, date])
+  @@index([therapistId, date])
+  @@index([status])
+}
+
+enum GroupSessionStatus {
+  OPEN
+  FULL
+  COMPLETED
+  CANCELLED
+}
+
+// ── Dashboard Refactor: Todo system (IWIS_Dashboard_Refactor_Spec §2, §8) ──
+
+model Todo {
+  id                   String       @id @default(cuid())
+  title                String       @db.VarChar(120)
+  description          String?
+  priority             TodoPriority @default(MEDIUM)
+  status               TodoStatus   @default(PENDING)
+  dueDate              DateTime?
+  xpReward             Int          @default(25)
+  completedAt          DateTime?
+  dismissedAt          DateTime?
+  createdAt            DateTime     @default(now())
+  updatedAt            DateTime     @updatedAt
+
+  createdById          String
+  createdBy            User         @relation("TodoCreatedBy", fields: [createdById], references: [id])
+
+  assignedToId         String
+  assignedTo           User         @relation("TodoAssignedTo", fields: [assignedToId], references: [id])
+
+  relatedPatientId     String?
+  relatedPatient       Patient?     @relation("TodoRelatedPatient", fields: [relatedPatientId], references: [id])
+
+  relatedAppointmentId String?
+  relatedAppointment   Appointment? @relation("TodoRelatedAppointment", fields: [relatedAppointmentId], references: [id])
+
+  branchId             String
+  branch               Branch       @relation("TodoBranch", fields: [branchId], references: [id])
+
+  reminderSentAt       DateTime?
+
+  @@index([assignedToId, status])
+  @@index([createdById, status])
+  @@index([branchId, status])
+  @@index([dueDate])
+  @@index([status, dueDate])
+}
+
+enum TodoPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum TodoStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  DISMISSED
+}
+
+// ─── Self-Examination Protocol (IWIS pre-consultation Ayurvedic workflow) ──
+// Stool is captured as structured texture + habit fields only (no photos).
+
+enum SelfExamStatus {
+  DRAFT
+  SUBMITTED
+  REVIEWED
+}
+
+enum PainZone {
+  HEAD_MIGRAINE
+  NECK
+  SHOULDER
+  CHEST
+  LOWER_BACK
+  ABDOMEN
+  KNEE
+  WRIST_HAND
+  GENERALISED_MUSCLE
+}
+
+enum PainCharacter {
+  THROBBING
+  PRESSING
+  STABBING
+  DULL
+  BURNING
+  SHARP
+  ACHING
+  CRAMPING
+  GRINDING
+  HEAVY
+  TIGHT
+  COLICKY
+  BLOATING
+}
+
+enum TongueCoatingColor {
+  NONE
+  WHITE
+  YELLOW
+  RED
+}
+
+enum TongueCoatingThickness {
+  NONE
+  THIN
+  THICK
+}
+
+enum StoolConsistency {
+  HARD_PELLETS
+  FORMED
+  SOFT
+  LOOSE
+  WATERY
+  MUCOUSY
+}
+
+enum StoolColour {
+  BROWN
+  PALE
+  YELLOW_GREEN
+  DARK
+}
+
+enum StoolMealRelation {
+  BEFORE_MEALS
+  AFTER_MEALS
+  BOTH
+  NONE
+}
+
+enum UrineColour {
+  PALE
+  NORMAL_YELLOW
+  DARK_YELLOW
+  BROWN
+}
+
+enum RoMJoint {
+  NECK
+  SHOULDER_LEFT
+  SHOULDER_RIGHT
+  KNEE_LEFT
+  KNEE_RIGHT
+}
+
+enum RoMDirection {
+  NECK_ROTATE_LEFT
+  NECK_ROTATE_RIGHT
+  NECK_FLEX
+  NECK_EXTEND
+  NECK_LATERAL_LEFT
+  NECK_LATERAL_RIGHT
+  SHOULDER_FLEX_OVERHEAD
+  SHOULDER_ABDUCT
+  SHOULDER_CROSS_BODY
+  SHOULDER_BEHIND_BACK
+  SHOULDER_EXTERNAL_ROT
+  SHOULDER_INTERNAL_ROT
+  KNEE_FLEX
+  KNEE_EXTEND
+}
+
+enum PhysicalObservationType {
+  POSTURE_FULL_BODY
+  FACE_EYE
+  HAND_FLAT
+  KNEE_COMPARE
+  SHOULDER_SYMMETRY
+  GENERAL_APPEARANCE
+}
+
+enum PrakritiType {
+  VATA
+  PITTA
+  KAPHA
+  VATA_PITTA
+  PITTA_KAPHA
+  VATA_KAPHA
+  TRIDOSHA
+}
+
+enum AgniType {
+  MANDAGNI
+  TIKSHNA
+  VISHAMA
+  SAMA
+}
+
+enum AppetiteLevel {
+  STRONG
+  MODERATE
+  WEAK
+  IRREGULAR
+}
+
+enum SleepPosition {
+  BACK
+  LEFT_SIDE
+  RIGHT_SIDE
+  STOMACH
+  MIXED
+}
+
+model SelfExamSubmission {
+  id                String           @id @default(uuid())
+  triageSessionId   String?          @unique
+  triageSession     TriageSession?   @relation(fields: [triageSessionId], references: [id], onDelete: SetNull)
+  patientId         String
+  patient           Patient          @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  appointmentId     String?
+  appointment       Appointment?     @relation(fields: [appointmentId], references: [id], onDelete: SetNull)
+  branchId          String?
+  branch            Branch?          @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  hospitalId        String?
+  hospital          Hospital?        @relation(fields: [hospitalId], references: [id], onDelete: SetNull)
+  painZones         PainZone[]
+  status            SelfExamStatus   @default(DRAFT)
+  submittedAt       DateTime?
+  reviewedAt        DateTime?
+  reviewedByUserId  String?
+  reviewedByUser    User?            @relation("SelfExamReviewer", fields: [reviewedByUserId], references: [id], onDelete: SetNull)
+  reviewNotes       String?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
+  symptomHistory       SymptomHistoryEntry[]
+  tongueObservations   TongueObservation[]
+  stoolLogs            StoolLog[]
+  urineLogs            UrineLog[]
+  romMeasurements      RoMMeasurement[]
+  physicalObservations PhysicalObservation[]
+  voiceObservations    VoiceObservation[]
+  digestiveProfile     DigestiveProfile?
+  lifestyleContext     LifestyleContext?
+
+  @@index([patientId, createdAt])
+  @@index([branchId, status])
+  @@index([hospitalId, status])
+  @@index([appointmentId])
+  @@index([status])
+}
+
+model SymptomHistoryEntry {
+  id                        String             @id @default(uuid())
+  submissionId              String
+  submission                SelfExamSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  painZone                  PainZone
+  subLocation               String?
+  characters                PainCharacter[]
+  triggers                  String[]
+  relievingFactors          String[]
+  timing                    String[]
+  severity                  Int
+  radiatesTo                String?
+  associatedSymptoms        String[]
+  warningSignsBeforeEpisode String[]
+  injuryHistory             String?
+  occupationContext         String?
+  freeText                  String?
+  createdAt                 DateTime           @default(now())
+
+  @@unique([submissionId, painZone])
+  @@index([painZone])
+}
+
+model TongueObservation {
+  id                  String                 @id @default(uuid())
+  submissionId        String
+  submission          SelfExamSubmission     @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  patientId           String
+  patient             Patient                @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  dayIndex            Int
+  observedOn          DateTime
+  photoUrl            String?
+  coatingColor        TongueCoatingColor
+  coatingThickness    TongueCoatingThickness
+  dryness             Boolean                @default(false)
+  cracks              Boolean                @default(false)
+  tremor              Boolean                @default(false)
+  correlatedPainLevel Int?
+  notes               String?
+  createdAt           DateTime               @default(now())
+
+  @@unique([submissionId, dayIndex])
+  @@index([patientId, observedOn])
+}
+
+// Stool (Mala). Deliberately no image/photo field — texture is captured
+// as a structured enum, which is what the Vaidya actually acts on.
+model StoolLog {
+  id                    String             @id @default(uuid())
+  submissionId          String
+  submission            SelfExamSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  patientId             String
+  patient               Patient            @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  dayIndex              Int
+  observedOn            DateTime
+  consistency           StoolConsistency
+  colour                StoolColour
+  frequencyPerDay       Int
+  daysSinceLastMovement Int?
+  strainingEffort       Int
+  incompleteEvacuation  Boolean            @default(false)
+  bloatingGas           Boolean            @default(false)
+  bloodPresent          Boolean            @default(false)
+  mucusPresent          Boolean            @default(false)
+  undigestedFood        Boolean            @default(false)
+  relationshipToMeal    StoolMealRelation  @default(NONE)
+  notes                 String?
+  createdAt             DateTime           @default(now())
+
+  @@unique([submissionId, dayIndex])
+  @@index([patientId, observedOn])
+}
+
+model UrineLog {
+  id              String             @id @default(uuid())
+  submissionId    String
+  submission      SelfExamSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  patientId       String
+  patient         Patient            @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  dayIndex        Int
+  observedOn      DateTime
+  colour          UrineColour
+  frequencyPerDay Int
+  burning         Boolean            @default(false)
+  urgency         Boolean            @default(false)
+  painCorrelation Boolean            @default(false)
+  notes           String?
+  createdAt       DateTime           @default(now())
+
+  @@unique([submissionId, dayIndex])
+  @@index([patientId, observedOn])
+}
+
+model RoMMeasurement {
+  id           String             @id @default(uuid())
+  submissionId String
+  submission   SelfExamSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  joint        RoMJoint
+  direction    RoMDirection
+  angleDegrees Float?
+  restriction  String?
+  painScore    Int
+  crepitus     Boolean            @default(false)
+  catchOrSharp Boolean            @default(false)
+  notes        String?
+  createdAt    DateTime           @default(now())
+
+  @@unique([submissionId, joint, direction])
+}
+
+model PhysicalObservation {
+  id              String                  @id @default(uuid())
+  submissionId    String
+  submission      SelfExamSubmission      @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  observationType PhysicalObservationType
+  painZone        PainZone?
+  photoFrontUrl   String?
+  photoSideUrl    String?
+  photoBackUrl    String?
+  photoExtraUrl   String?
+  details         Json                    @default("{}")
+  notes           String?
+  createdAt       DateTime                @default(now())
+
+  @@unique([submissionId, observationType])
+}
+
+model VoiceObservation {
+  id            String             @id @default(uuid())
+  submissionId  String
+  submission    SelfExamSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  dayIndex      Int                @default(1)
+  morningRecUrl String?
+  eveningRecUrl String?
+  fatigueNotes  String?
+  createdAt     DateTime           @default(now())
+
+  @@unique([submissionId, dayIndex])
+}
+
+model DigestiveProfile {
+  id                       String             @id @default(uuid())
+  submissionId             String             @unique
+  submission               SelfExamSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  agniType                 AgniType?
+  appetiteLevel            AppetiteLevel?
+  bloatingAfterMeals       Boolean            @default(false)
+  bloatingDurationMins     Int?
+  heartburnPerWeek         Int?
+  waterIntakeGlasses       Int?
+  coldFoodAggravates       Boolean            @default(false)
+  foodTriggers             String[]
+  incompatibleCombinations String[]
+  notes                    String?
+  createdAt                DateTime           @default(now())
+}
+
+model LifestyleContext {
+  id                  String             @id @default(uuid())
+  submissionId        String             @unique
+  submission          SelfExamSubmission @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  pillowType          String?
+  pillowFirmness      String?
+  sleepPosition       SleepPosition?
+  sleepHours          Float?
+  screenHoursPerDay   Int?
+  occupation          String?
+  pastInjuries        String?
+  regularExercise     String?
+  stressEventsPast6mo String?
+  notes               String?
+  createdAt           DateTime           @default(now())
+}
+
+model ConstitutionProfile {
+  id            String        @id @default(uuid())
+  patientId     String        @unique
+  patient       Patient       @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  prakriti      PrakritiType?
+  satvaRating   Int?
+  agniType      AgniType?
+  quizAnswers   Json?
+  lastUpdatedBy String?
+  completedAt   DateTime?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+}
+
+// Per-hospital admin override of the zone → test protocol.
+// Default shape (in code): `services/selfExam.protocol.js::DEFAULT_ZONE_PROTOCOLS`.
+// Absence of a row for (hospitalId, painZone) = use the code-level default.
+model SelfExamProtocolOverride {
+  id          String    @id @default(uuid())
+  hospitalId  String
+  hospital    Hospital  @relation(fields: [hospitalId], references: [id], onDelete: Cascade)
+  painZone    PainZone
+  config      Json
+  updatedById String?
+  updatedBy   User?     @relation("SelfExamProtocolEditor", fields: [updatedById], references: [id], onDelete: SetNull)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@unique([hospitalId, painZone])
+  @@index([hospitalId])
+}
+
+// ── Messaging Templates & Configurable Reminders ────────────────────────────
+
+enum MessageTemplateCategory {
+  DAILY_CHECKIN
+  APPOINTMENT_CONFIRMATION
+  APPOINTMENT_REMINDER
+  CUSTOM
+  MEDICATION_MISSED_FOLLOWUP
+  MEDICATION_REFILL_3D
+  MEDICATION_REFILL_LAST_DAY
+}
+
+enum DeliveryChannel {
+  WHATSAPP
+  SMS
+  EMAIL
+  IN_APP
+}
+
+enum ReminderKind {
+  DAILY_CHECKIN
+  APPOINTMENT_CONFIRMATION
+  APPOINTMENT_REMINDER
+}
+
+enum DeliveryStatus {
+  SENT
+  FAILED
+  SKIPPED
+  FALLBACK
+}
+
+model MessageTemplate {
+  id               String                  @id @default(cuid())
+  hospitalId       String
+  hospital         Hospital                @relation(fields: [hospitalId], references: [id], onDelete: Cascade)
+  name             String
+  category         MessageTemplateCategory
+  body             String
+  subject          String?
+  channels         DeliveryChannel[]       @default([WHATSAPP])
+  placeholders     Json                    @default("[]")
+  isDefault        Boolean                 @default(false)
+  isActive         Boolean                 @default(true)
+  createdByUserId  String?
+  createdBy        User?                   @relation("TemplateCreator", fields: [createdByUserId], references: [id], onDelete: SetNull)
+  updatedByUserId  String?
+  updatedBy        User?                   @relation("TemplateEditor", fields: [updatedByUserId], references: [id], onDelete: SetNull)
+  createdAt        DateTime                @default(now())
+  updatedAt        DateTime                @updatedAt
+
+  appointmentsUsing          Appointment[]         @relation("AppointmentCustomTemplate")
+  reminderSettingsUsing      ReminderSetting[]
+  deliveryLogs               ReminderDeliveryLog[]
+
+  @@unique([hospitalId, name])
+  @@index([hospitalId])
+  @@index([hospitalId, category])
+  @@index([isActive])
+}
+
+model ReminderSetting {
+  id                      String            @id @default(cuid())
+  hospitalId              String            @unique
+  hospital                Hospital          @relation(fields: [hospitalId], references: [id], onDelete: Cascade)
+  dailyReminderEnabled    Boolean           @default(true)
+  dailyReminderTime       String            @default("07:30")
+  dailyReminderChannels   DeliveryChannel[] @default([WHATSAPP, IN_APP])
+  dailyReminderTemplateId String?
+  dailyReminderTemplate   MessageTemplate?  @relation(fields: [dailyReminderTemplateId], references: [id], onDelete: SetNull)
+  dailyReminderInlineBody String?
+  skipIfAlreadyCheckedIn  Boolean           @default(true)
+  lastRunAt               DateTime?
+  lastRunTargetCount      Int?
+  lastRunSuccessCount     Int?
+  createdAt               DateTime          @default(now())
+  updatedAt               DateTime          @updatedAt
+}
+
+model ReminderDeliveryLog {
+  id             String           @id @default(cuid())
+  hospitalId     String?
+  hospital       Hospital?        @relation(fields: [hospitalId], references: [id], onDelete: SetNull)
+  patientUserId  String?
+  patientUser    User?            @relation("ReminderTarget", fields: [patientUserId], references: [id], onDelete: SetNull)
+  appointmentId  String?
+  appointment    Appointment?     @relation(fields: [appointmentId], references: [id], onDelete: SetNull)
+  kind           ReminderKind
+  channel        DeliveryChannel
+  status         DeliveryStatus
+  target         String?
+  externalId     String?
+  errorMessage   String?
+  body           String?
+  templateId     String?
+  template       MessageTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  createdAt      DateTime         @default(now())
+
+  @@index([hospitalId, kind])
+  @@index([appointmentId])
+  @@index([patientUserId])
+  @@index([createdAt])
+}
+
+// ── Follow-up schedule + Critical Journey flagging ─────────────────────
+// Enforces the clinical workflow where every completed consultation must
+// have a follow-up decision (schedule N days out OR single-visit). The
+// CriticalJourney detector watches for non-adherence (missed meds, missed
+// vital uploads, missed follow-ups) and surfaces at-risk patients to the
+// admin dashboard with specific reasons.
+
+enum FollowUpInterval {
+  SEVEN_DAYS
+  FOURTEEN_DAYS
+  THIRTY_DAYS
+  SIXTY_DAYS
+  NINETY_DAYS
+  CUSTOM
+  SINGLE_VISIT
+}
+
+enum FollowUpStatus {
+  PENDING
+  COMPLETED
+  MISSED
+  CANCELLED
+}
+
+enum CriticalStatus {
+  ACTIVE
+  RESOLVED
+}
+
+model AppointmentFollowUp {
+  id                       String            @id @default(cuid())
+  appointmentId            String            @unique
+  appointment              Appointment       @relation(fields: [appointmentId], references: [id], onDelete: Cascade)
+  patientId                String
+  patient                  Patient           @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  // Preset interval OR CUSTOM (with daysOffset) OR SINGLE_VISIT (no due date)
+  interval                 FollowUpInterval
+  daysOffset               Int?
+  dueDate                  DateTime?
+  isSingleVisit            Boolean           @default(false)
+  status                   FollowUpStatus    @default(PENDING)
+  notes                    String?
+  // Clinician who set the follow-up (ADMIN / ADMIN_DOCTOR / DOCTOR / THERAPIST)
+  createdById              String
+  createdBy                User              @relation("FollowUpCreator", fields: [createdById], references: [id])
+  // If the patient booked a subsequent visit that fulfilled this follow-up
+  completedByAppointmentId String?
+  // Dedup guard for the "missed follow-up" cron
+  missedNotifiedAt         DateTime?
+  createdAt                DateTime          @default(now())
+  updatedAt                DateTime          @updatedAt
+
+  @@index([patientId, status])
+  @@index([dueDate, status])
+  @@index([status])
+  @@index([createdById])
+}
+
+// One row per patient (unique) — upsert-based. The reasons JSON holds an
+// array of {type, detail, firstDetectedAt, lastDetectedAt, value?}.
+// Detector overwrites the list every run; status transitions are audited
+// via resolvedAt / resolvedById.
+model PatientCriticalFlag {
+  id               String          @id @default(cuid())
+  patientId        String          @unique
+  patient          Patient         @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  branchId         String?
+  branch           Branch?         @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  status           CriticalStatus  @default(ACTIVE)
+  severity         String          @default("MEDIUM") // LOW | MEDIUM | HIGH
+  reasons          Json            @default("[]")
+  firstDetectedAt  DateTime        @default(now())
+  lastDetectedAt   DateTime        @default(now())
+  resolvedAt       DateTime?
+  resolvedById     String?
+  resolvedBy       User?           @relation("CriticalFlagResolver", fields: [resolvedById], references: [id], onDelete: SetNull)
+  notes            String?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  @@index([status, lastDetectedAt])
+  @@index([branchId, status])
+  @@index([severity, status])
 }

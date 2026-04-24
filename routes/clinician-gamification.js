@@ -1,5 +1,6 @@
 import express from 'express';
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
+import { requireFeature } from '../utils/featureGate.js';
 import { ClinicianGamificationController } from '../controllers/clinicianGamification.controller.js';
 import { z } from 'zod';
 import { validate } from '../middleware/validate.js';
@@ -8,6 +9,16 @@ const router = express.Router();
 
 const CLINICIAN_ROLES = ['DOCTOR', 'THERAPIST', 'ADMIN_DOCTOR'];
 const ADMIN_ROLES = ['ADMIN', 'ADMIN_DOCTOR'];
+
+// Path-prefix feature gates (one per sub-area). Auth must run first because the gate
+// reads req.user.hospitalId.
+router.use('/xp',                  authMiddleware, requireFeature('CLINICIAN_XP'));
+router.use('/seasonal-challenges', authMiddleware, requireFeature('SEASONAL_CHALLENGES'));
+router.use('/rewards',             authMiddleware, requireFeature('REWARD_STORE'));
+router.use('/mentor-sessions',     authMiddleware, requireFeature('MENTOR_SESSIONS'));
+// Note: ACHIEVEMENT_SHOWCASE has no dedicated endpoints — the showcase page is rendered
+// from the gated /xp/* endpoints, so disabling it via Super Admin is purely visual
+// (hide the nav entry). No API surface to block here.
 
 // ── XP & Level ──────────────────────────────────────────────────────────────
 
@@ -44,29 +55,6 @@ router.get('/seasonal-challenges', authMiddleware, roleMiddleware(CLINICIAN_ROLE
 
 /** GET /api/clinician-gamification/seasonal-challenges/history — past challenges */
 router.get('/seasonal-challenges/history', authMiddleware, roleMiddleware(ADMIN_ROLES), ClinicianGamificationController.getChallengeHistory);
-
-// ── Team Quests ─────────────────────────────────────────────────────────────
-
-const createQuestSchema = z.object({
-    branchId: z.string().cuid().optional(),
-    title: z.string().min(3).max(100),
-    description: z.string().min(3).max(500),
-    icon: z.string().max(50).optional(),
-    metric: z.string().min(1).max(100),
-    target: z.number().positive(),
-    startDate: z.string().datetime(),
-    endDate: z.string().datetime(),
-    rewardXP: z.number().int().min(0).optional(),
-});
-
-/** POST /api/clinician-gamification/team-quests — create quest */
-router.post('/team-quests', authMiddleware, roleMiddleware(ADMIN_ROLES), validate({ body: createQuestSchema }), ClinicianGamificationController.createTeamQuest);
-
-/** GET /api/clinician-gamification/team-quests — active quests for user's branch */
-router.get('/team-quests', authMiddleware, roleMiddleware(CLINICIAN_ROLES), ClinicianGamificationController.getActiveQuests);
-
-/** GET /api/clinician-gamification/team-quests/history — past quests */
-router.get('/team-quests/history', authMiddleware, roleMiddleware(ADMIN_ROLES), ClinicianGamificationController.getQuestHistory);
 
 // ── Reward Store ────────────────────────────────────────────────────────────
 

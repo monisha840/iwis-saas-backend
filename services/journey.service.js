@@ -100,35 +100,36 @@ export class JourneyService {
      * Activate the next phase when the current one completes.
      */
     static async activateNextPhase(journeyId) {
-        const phases = await prisma.journeyPhase.findMany({
-            where: { journeyId },
-            orderBy: { order: 'asc' }
-        });
-
-        const currentActive = phases.find(p => p.status === 'ACTIVE');
-        if (currentActive) {
-            await prisma.journeyPhase.update({
-                where: { id: currentActive.id },
-                data: { status: 'COMPLETED', completedAt: new Date() }
+        return prisma.$transaction(async (tx) => {
+            const phases = await tx.journeyPhase.findMany({
+                where: { journeyId },
+                orderBy: { order: 'asc' }
             });
-        }
 
-        const nextPhase = phases.find(p => p.status === 'UPCOMING');
-        if (nextPhase) {
-            await prisma.journeyPhase.update({
-                where: { id: nextPhase.id },
-                data: { status: 'ACTIVE', startedAt: new Date() }
+            const currentActive = phases.find(p => p.status === 'ACTIVE');
+            if (currentActive) {
+                await tx.journeyPhase.update({
+                    where: { id: currentActive.id },
+                    data: { status: 'COMPLETED', completedAt: new Date() }
+                });
+            }
+
+            const nextPhase = phases.find(p => p.status === 'UPCOMING');
+            if (nextPhase) {
+                await tx.journeyPhase.update({
+                    where: { id: nextPhase.id },
+                    data: { status: 'ACTIVE', startedAt: new Date() }
+                });
+                return nextPhase;
+            }
+
+            await tx.treatmentJourney.update({
+                where: { id: journeyId },
+                data: { status: 'COMPLETED' }
             });
-            return nextPhase;
-        }
 
-        // All phases complete — mark journey as completed
-        await prisma.treatmentJourney.update({
-            where: { id: journeyId },
-            data: { status: 'COMPLETED' }
+            return null;
         });
-
-        return null;
     }
 
     /**
@@ -220,7 +221,7 @@ export class JourneyService {
         const completedTasks = allTasks.filter(t => t.completions.length > 0);
         const taskAdherenceRate = allTasks.length > 0
             ? (completedTasks.length / allTasks.length) * 100
-            : 0;
+            : 50;
 
         // 2. Vital trend (pain score reduction, normalized 0-100)
         let vitalTrend = 50; // neutral default
@@ -237,7 +238,7 @@ export class JourneyService {
         const achievedMilestones = journey.milestones.filter(m => m.isAchieved).length;
         const milestoneProgress = totalMilestones > 0
             ? (achievedMilestones / totalMilestones) * 100
-            : 0;
+            : 50;
 
         // 4. Appointment attendance
         const appointments = await prisma.appointment.findMany({
@@ -358,8 +359,8 @@ export class JourneyService {
             // Auto-detect milestone criteria from title
             if (titleLower.includes('pain-free') && latestPain !== undefined && latestPain <= 1) achieved = true;
             if (titleLower.includes('first week') && completedCount >= 7) achieved = true;
-            if (titleLower.includes('50%') && completedCount >= allTasks.length * 0.5) achieved = true;
-            if (titleLower.includes('all tasks') && completedCount >= allTasks.length) achieved = true;
+            if (titleLower.includes('50%') && allTasks.length > 0 && completedCount >= allTasks.length * 0.5) achieved = true;
+            if (titleLower.includes('all tasks') && allTasks.length > 0 && completedCount >= allTasks.length) achieved = true;
             if (titleLower.includes('phase complete') && completedPhases > 0) achieved = true;
             // Target date milestone: if past the date and journey is progressing
             if (milestone.targetDate && new Date() >= new Date(milestone.targetDate) && completedCount > 0) achieved = true;

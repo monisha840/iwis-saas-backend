@@ -89,21 +89,37 @@ export class StaffAttendanceService {
 
     /**
      * Get all staff attendance for a branch on a specific date.
+     * Flattens the display name onto each row — User has no fullName; the
+     * canonical name lives on the role-specific profile (Doctor / Therapist
+     * / Pharmacist / Patient). Frontend reads `row.fullName` directly.
      */
     static async getBranchAttendance(branchId, date) {
         const day = new Date(date);
         day.setHours(0, 0, 0, 0);
 
-        return prisma.staffAttendance.findMany({
+        const records = await prisma.staffAttendance.findMany({
             where: {
                 branchId,
                 date: day,
             },
             include: {
-                user: { select: { id: true, email: true, role: true } },
+                user: {
+                    select: {
+                        id: true, email: true, role: true,
+                        doctor:     { select: { fullName: true } },
+                        therapist:  { select: { fullName: true } },
+                        pharmacist: { select: { fullName: true } },
+                        patient:    { select: { fullName: true } },
+                    },
+                },
             },
             orderBy: { clockIn: 'asc' },
         });
+
+        return records.map((r) => ({
+            ...r,
+            fullName: _extractFullName(r.user),
+        }));
     }
 
     /**
@@ -156,7 +172,15 @@ export class StaffAttendanceService {
         const records = await prisma.staffAttendance.findMany({
             where,
             include: {
-                user: { select: { id: true, email: true, role: true } },
+                user: {
+                    select: {
+                        id: true, email: true, role: true,
+                        doctor:     { select: { fullName: true } },
+                        therapist:  { select: { fullName: true } },
+                        pharmacist: { select: { fullName: true } },
+                        patient:    { select: { fullName: true } },
+                    },
+                },
             },
         });
 
@@ -167,6 +191,7 @@ export class StaffAttendanceService {
             if (!grouped[uid]) {
                 grouped[uid] = {
                     user: record.user,
+                    fullName: _extractFullName(record.user),
                     totalDays: 0,
                     presentDays: 0,
                     lateDays: 0,
@@ -193,4 +218,17 @@ export class StaffAttendanceService {
                     : 0,
         }));
     }
+}
+
+/** Pick the clinical display name from whichever role profile is populated.
+ *  Falls back to email (so something legible shows up for rare admin-only
+ *  accounts) and finally null if nothing is available. */
+function _extractFullName(user) {
+    if (!user) return null;
+    return user.doctor?.fullName
+        ?? user.therapist?.fullName
+        ?? user.pharmacist?.fullName
+        ?? user.patient?.fullName
+        ?? user.email
+        ?? null;
 }

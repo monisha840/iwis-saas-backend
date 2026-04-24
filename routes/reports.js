@@ -12,6 +12,7 @@ const router = express.Router();
 const dateRangeSchema = z.object({
     startDate: z.string().optional(),
     endDate: z.string().optional(),
+    branchId: z.string().optional(),
 });
 
 const progressReportSchema = dateRangeSchema.extend({
@@ -150,7 +151,8 @@ router.get('/patient/:patientId/progress', authMiddleware, roleMiddleware(['ADMI
 
 router.get('/branch-summary', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']), async (req, res, next) => {
     try {
-        const data = await analyticsService.getBranchSummary();
+        const branchId = typeof req.query.branchId === 'string' ? req.query.branchId : undefined;
+        const data = await analyticsService.getBranchSummary({ branchId });
         res.json({ success: true, data });
     } catch (err) {
         next(err);
@@ -159,10 +161,17 @@ router.get('/branch-summary', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DO
 
 router.get('/monthly-completed-appointments', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST', 'PHARMACIST']), async (req, res, next) => {
     try {
+        // Admins may override the branch scope via ?branchId=…; everyone else
+        // is locked to their own user.branchId for row-level safety.
+        const isAdminCaller = req.user.role === 'ADMIN' || req.user.role === 'ADMIN_DOCTOR';
+        const queryBranch = typeof req.query.branchId === 'string' ? req.query.branchId : null;
+        const effectiveBranchId = isAdminCaller
+            ? (queryBranch || null)
+            : req.user.branchId;
         const filters = {
             role: req.user.role,
             userId: req.user.id,
-            branchId: req.user.branchId,
+            branchId: effectiveBranchId,
             page: req.query.page,
             limit: req.query.limit
         };

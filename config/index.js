@@ -65,13 +65,19 @@ const config = {
     authMax: parseInt(process.env.RATE_LIMIT_AUTH_MAX || (isProduction ? '10' : '200'), 10),
   },
 
-  notifications: {
-    n8nWebhookUrl: process.env.N8N_WEBHOOK_URL || (isProduction
-      ? (() => { throw new Error('N8N_WEBHOOK_URL is required in production'); })()
+  whatsapp: {
+    // Evolution API — self-hosted WhatsApp gateway.
+    // In production all three must be set; dev falls back to null (service becomes a no-op).
+    baseUrl: process.env.EVOLUTION_API_URL || (isProduction
+      ? (() => { throw new Error('EVOLUTION_API_URL is required in production'); })()
       : null),
-    webhookSecret: process.env.WEBHOOK_SECRET || (isProduction
-      ? (() => { throw new Error('WEBHOOK_SECRET is required in production'); })()
-      : 'dev-webhook-secret-do-not-use-in-production'),
+    apiKey: process.env.EVOLUTION_API_KEY || (isProduction
+      ? (() => { throw new Error('EVOLUTION_API_KEY is required in production'); })()
+      : null),
+    instance: process.env.EVOLUTION_INSTANCE || (isProduction
+      ? (() => { throw new Error('EVOLUTION_INSTANCE is required in production'); })()
+      : null),
+    defaultConsultationMinutes: parseInt(process.env.WHATSAPP_DEFAULT_CONSULTATION_MINUTES || '30', 10),
   },
 
   email: {

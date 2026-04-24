@@ -23,6 +23,7 @@ export class CommunicationController {
         req.user.id,
         req.user.role,
         req.user.branchId,
+        req.user.hospitalId,
         req.query,
       );
       res.json(result);
@@ -111,6 +112,24 @@ export class CommunicationController {
         req.params.appointmentId,
         req.user.id,
       );
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  static async updateHandoff(req, res, next) {
+    try {
+      const result = await HandoffNoteService.updateDraft(req.params.id, req.user.id, req.body);
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  static async sendHandoff(req, res, next) {
+    try {
+      const result = await HandoffNoteService.sendDraft(req.params.id, req.user.id);
       res.json(result);
     } catch (err) {
       next(err);

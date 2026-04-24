@@ -7,15 +7,7 @@ import { VisitSummaryService } from '../services/visitSummary.service.js';
 
 export class PortalController {
   // ── Patient Portal ─────────────────────────────────────────────────────────
-
-  static async getDashboard(req, res, next) {
-    try {
-      const result = await PatientPortalService.getDashboard(req.user.patientId, req.user.id);
-      res.json(result);
-    } catch (err) {
-      next(err);
-    }
-  }
+  // getDashboard removed — superseded by EnhancedDashboardController.getSummary.
 
   static async getPrescriptions(req, res, next) {
     try {
@@ -28,7 +20,16 @@ export class PortalController {
 
   static async getReports(req, res, next) {
     try {
-      const result = await PatientPortalService.getMyReports(req.user.patientId);
+      const result = await PatientPortalService.getMyReports(req.user.patientId, req.query);
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  }
+
+  static async getAppointments(req, res, next) {
+    try {
+      const result = await PatientPortalService.getMyAppointmentHistory(req.user.patientId, req.query);
       res.json(result);
     } catch (err) {
       next(err);

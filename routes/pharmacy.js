@@ -1,9 +1,23 @@
 import express from 'express';
+import multer from 'multer';
+import { unlink } from 'fs/promises';
 import { z } from 'zod';
 import { PharmacyService } from '../services/pharmacy.service.js';
+import { MedicineImportService } from '../services/medicineImport.service.js';
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
 import { auditAction } from '../middleware/auditLog.js';
+
+const csvUpload = multer({
+    dest: 'uploads/',
+    limits: { fileSize: 10 * 1024 * 1024 },
+    fileFilter: (_req, file, cb) => {
+        const ok = file.mimetype === 'text/csv'
+            || file.mimetype === 'application/vnd.ms-excel'
+            || file.originalname.toLowerCase().endsWith('.csv');
+        cb(ok ? null : new Error('Only CSV files are allowed'), ok);
+    },
+});
 
 const router = express.Router();
 
@@ -63,11 +77,16 @@ const listOrdersSchema = z.object({
     page: z.string().optional().transform(v => v ? parseInt(v) : 1),
     limit: z.string().optional().transform(v => v ? parseInt(v) : 20),
     status: z.string().optional(),
+    branchId: z.string().optional(),
 });
 
 router.get('/medicines', authMiddleware, roleMiddleware(['ADMIN', 'PHARMACIST', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST']), async (req, res, next) => {
     try {
-        const data = await PharmacyService.getAllMedicines(req.user.branchId);
+        // Admins (no personal branch) may pass branchId to scope to a specific branch.
+        // Branch-scoped users (pharmacists etc.) always see their own branch.
+        const isAdmin = req.user.role === 'ADMIN' || req.user.role === 'ADMIN_DOCTOR';
+        const branchId = isAdmin ? (req.query.branchId || null) : req.user.branchId;
+        const data = await PharmacyService.getAllMedicines(branchId);
         res.json(data);
     } catch (err) {
         next(err);
@@ -92,6 +111,43 @@ router.put('/medicines/:id', authMiddleware, roleMiddleware(['ADMIN', 'PHARMACIS
         next(err);
     }
 });
+
+router.post(
+    '/medicines/bulk-upload',
+    authMiddleware,
+    roleMiddleware(['ADMIN', 'PHARMACIST', 'ADMIN_DOCTOR']),
+    csvUpload.single('file'),
+    async (req, res, next) => {
+        try {
+            if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+            const preview = await MedicineImportService.previewImport(req.file.path, req.user);
+            await unlink(req.file.path).catch(() => { });
+            res.json({ success: true, ...preview });
+        } catch (err) {
+            if (req.file) await unlink(req.file.path).catch(() => { });
+            next(err);
+        }
+    }
+);
+
+router.post(
+    '/medicines/bulk-import',
+    authMiddleware,
+    roleMiddleware(['ADMIN', 'PHARMACIST', 'ADMIN_DOCTOR']),
+    auditAction('BULK_IMPORT_MEDICINES', 'Medicine', () => null),
+    async (req, res, next) => {
+        try {
+            const { rows } = req.body;
+            if (!Array.isArray(rows) || rows.length === 0) {
+                return res.status(400).json({ error: 'rows must be a non-empty array' });
+            }
+            const summary = await MedicineImportService.executeImport(req.user.id, rows);
+            res.json({ success: true, summary });
+        } catch (err) {
+            next(err);
+        }
+    }
+);
 
 router.post('/stock', authMiddleware, roleMiddleware(['ADMIN', 'PHARMACIST', 'ADMIN_DOCTOR']), validate({ body: stockSchema }), async (req, res, next) => {
     try {
@@ -124,7 +180,9 @@ router.get('/dispenses', authMiddleware, roleMiddleware(['ADMIN', 'PHARMACIST', 
     try {
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 20;
-        const data = await PharmacyService.getDispenseHistory(req.user.branchId, { page, limit });
+        const isAdmin = req.user.role === 'ADMIN' || req.user.role === 'ADMIN_DOCTOR';
+        const branchId = isAdmin ? (req.query.branchId || null) : req.user.branchId;
+        const data = await PharmacyService.getDispenseHistory(branchId, { page, limit });
         res.json(data);
     } catch (err) {
         next(err);
@@ -142,7 +200,9 @@ router.post('/orders', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 
 
 router.get('/orders', authMiddleware, validate({ query: listOrdersSchema }), async (req, res, next) => {
     try {
-        const data = await PharmacyService.getOrders(req.query, req.user.branchId);
+        const isAdmin = req.user.role === 'ADMIN' || req.user.role === 'ADMIN_DOCTOR';
+        const branchId = isAdmin ? (req.query.branchId || null) : req.user.branchId;
+        const data = await PharmacyService.getOrders(req.query, branchId);
         res.json(data);
     } catch (err) {
         next(err);

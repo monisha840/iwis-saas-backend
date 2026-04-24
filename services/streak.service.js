@@ -39,8 +39,10 @@ export class StreakService {
      * Should be called once per clinician per day (by the scheduler).
      */
     static async updateClinicianStreak(participantId, role) {
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
+        // TODO: Use hospital.timezone when per-participant hospital context is available.
+        // Invariant: streaks are computed against UTC midnight for consistency.
+        const now = new Date();
+        const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
         const todayStr = today.toISOString().split('T')[0];
 
         const yesterday = new Date(today.getTime() - MS_IN_A_DAY);
@@ -136,10 +138,9 @@ export class StreakService {
      * Check if a clinician had activity on a given date.
      */
     static async _wasActiveOnDate(participantId, date) {
-        const dayStart = new Date(date);
-        dayStart.setHours(0, 0, 0, 0);
-        const dayEnd = new Date(date);
-        dayEnd.setHours(23, 59, 59, 999);
+        const d = new Date(date);
+        const dayStart = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+        const dayEnd = new Date(dayStart.getTime() + MS_IN_A_DAY - 1);
 
         const [appointmentCount, messageCount, prescriptionCount] = await Promise.all([
             prisma.appointment.count({
@@ -170,8 +171,10 @@ export class StreakService {
      * Update patient streak — active = logged a vital, completed a task, or did a check-in.
      */
     static async updatePatientStreak(patientId) {
-        const today = new Date();
-        today.setHours(0, 0, 0, 0);
+        // TODO: Use patient.hospital.timezone when available.
+        // Invariant: streaks are computed against UTC midnight for consistency.
+        const now = new Date();
+        const today = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
         const todayStr = today.toISOString().split('T')[0];
 
         const yesterday = new Date(today.getTime() - MS_IN_A_DAY);

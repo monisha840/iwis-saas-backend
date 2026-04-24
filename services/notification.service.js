@@ -2,17 +2,50 @@ import prisma from '../lib/prisma.js';
 import { emitToUser } from '../websocket/index.js';
 import logger from '../lib/logger.js';
 import config from '../config/index.js';
-import { enqueueAppointmentWebhook } from './queue.service.js';
+import { enqueueAppointmentWhatsApp } from './queue.service.js';
 import { emailService } from './email.service.js';
 import { smsService } from './sms.service.js';
+import { DeliveryService } from './delivery.service.js';
+import { renderTemplate, buildAppointmentContext } from '../lib/templateRenderer.js';
 
 // ─── SCALING NOTE ────────────────────────────────────────────────────────────
 // The previous module-level `processedIds = new Set()` was removed.
 // In-process Sets are destroyed on restart and invisible to sibling instances,
 // making it impossible to scale horizontally.  Idempotency is now enforced
 // exclusively via the DB `notificationSent` flag (atomic DB update) PLUS the
-// Bull queue's per-jobId deduplication in enqueueAppointmentWebhook().
+// Bull queue's per-jobId deduplication in enqueueAppointmentWhatsApp().
 // ─────────────────────────────────────────────────────────────────────────────
+
+// ─── WhatsApp message templates ─────────────────────────────────────────────
+// Patient-facing appointment confirmations, sent over Evolution API.
+// Kept verbatim — wording is signed off by hospital admin.
+function buildOfflineTemplate({ patientName, clinicianName, dateAndTime, estimatedTime }) {
+    return `Dear ${patientName},
+
+This is to formally confirm that your appointment has been successfully scheduled.
+
+You are booked for a consultation with ${clinicianName} on ${dateAndTime}.
+Your estimated consultation time is ${estimatedTime}.
+
+Kindly arrive at least 10–15 minutes prior to your scheduled time to complete any required formalities. Please bring any relevant medical records or documents for reference.
+
+Should you require any assistance, rescheduling, or further clarification, please do not hesitate to contact the hospital administration.
+
+Sincerely,
+Al-Shifa Group of Hospitals`;
+}
+
+function buildOnlineTemplate({ patientName, clinicianName, dateAndTime, estimatedTime, meetingLink }) {
+    return `Dear ${patientName},
+
+This is to formally confirm that your online consultation has been successfully scheduled.
+You are booked for a virtual consultation with ${clinicianName} on ${dateAndTime}. Your estimated consultation time is ${estimatedTime}.
+Kindly join the meeting 5–10 minutes prior to your scheduled time to ensure your device, camera, and microphone are functioning properly. Please keep any relevant medical records or documents ready for reference during the session. For the best experience, we recommend using a stable internet connection and a quiet, private space.
+Your meeting link: ${meetingLink}
+Should you require any assistance, rescheduling, or further clarification, please do not hesitate to contact the hospital administration.
+Sincerely,
+Al-Shifa Group of Hospitals`;
+}
 
 export class NotificationService {
     /**
@@ -38,22 +71,33 @@ export class NotificationService {
     }
 
     /**
-     * Send appointment confirmation to n8n webhook
+     * Send appointment confirmation.
+     *
+     * Order of template selection:
+     *   1. Inline `appointment.customReminderBody` (most specific override)
+     *   2. `appointment.customReminderTemplate` (linked MessageTemplate)
+     *   3. Hospital's default APPOINTMENT_CONFIRMATION MessageTemplate
+     *   4. Hardcoded OFFLINE / ONLINE template
+     *
+     * Delivery uses DeliveryService when custom channels are configured on the
+     * appointment (supports WA → SMS → Email fallback + per-attempt logging).
+     * Otherwise it enqueues the legacy WhatsApp-only job.
      */
     async sendAppointmentConfirmation(appointmentOrId, source = 'SYSTEM') {
         try {
             let appointment = appointmentOrId;
             const appointmentId = typeof appointmentOrId === 'string' ? appointmentOrId : appointmentOrId.id;
 
-            // 1. Fetch full details with all needed relations for payload integrity
-            if (typeof appointmentOrId === 'string' || !appointment.doctor || !appointment.patient || !appointment.branch) {
+            // 1. Fetch full details with all needed relations for message integrity
+            if (typeof appointmentOrId === 'string' || !appointment.doctor || !appointment.patient || !appointment.branch || !appointment.customReminderTemplate) {
                 appointment = await prisma.appointment.findUnique({
                     where: { id: appointmentId },
                     include: {
                         doctor: { include: { user: true } },
                         therapist: { include: { user: true } },
                         patient: { include: { user: true } },
-                        branch: true
+                        branch: { include: { hospital: true } },
+                        customReminderTemplate: true,
                     }
                 });
             }
@@ -61,45 +105,118 @@ export class NotificationService {
             if (!appointment) return false;
 
             // 2. Persistent Idempotency check + Approval State Validation
-            // Only trigger if final approval state is reached for the given type
             const isApproved = this.checkFinalApprovalState(appointment);
             if (!isApproved) {
-                logger.info(`[NotificationService] Skipping Webhook for ${appointmentId} - Not fully approved yet.`);
+                logger.info(`[NotificationService] Skipping confirmation for ${appointmentId} - Not fully approved yet.`);
                 return false;
             }
-
-            // DB-only idempotency — no in-process Set (supports horizontal scale)
             if (appointment.notificationSent) {
-                logger.info(`[NotificationService] IDEMPOTENCY - Webhook Bypassed for ${appointmentId}`);
+                logger.info(`[NotificationService] IDEMPOTENCY - confirmation bypassed for ${appointmentId}`);
                 return false;
             }
 
-            // 3. Dynamic Payload Construction
-            const payload = this.constructWebhookPayload(appointment);
+            // 3. Pick the template. Custom (inline body > linked template) wins.
+            //    Otherwise look for the hospital's default APPOINTMENT_CONFIRMATION.
+            //    Otherwise fall back to hardcoded OFFLINE/ONLINE template.
+            const hospital = appointment.branch?.hospital || null;
+            const hospitalId = hospital?.id || null;
 
-            // 4. Strict Payload Validation - Block if required data is missing
-            const validation = this.validatePayload(payload);
-            if (!validation.success) {
-                logger.warn(`[NotificationService] BLOCKING WEBHOOK for ${appointmentId} - Missing Real Data`, { missing: validation.missing });
-                // Not marking as sent so it can be retried once data is corrected
-                return false;
+            let body = null;
+            let subject = null;
+            let templateId = null;
+            let channels = appointment.customReminderChannels && appointment.customReminderChannels.length
+                ? appointment.customReminderChannels
+                : null;
+
+            if (appointment.customReminderBody) {
+                body = appointment.customReminderBody;
+                subject = appointment.customReminderSubject;
+            } else if (appointment.customReminderTemplate) {
+                body = appointment.customReminderTemplate.body;
+                subject = appointment.customReminderTemplate.subject;
+                templateId = appointment.customReminderTemplate.id;
+                if (!channels) channels = appointment.customReminderTemplate.channels;
+            } else if (hospitalId) {
+                const defaultTpl = await prisma.messageTemplate.findFirst({
+                    where: {
+                        hospitalId,
+                        category: 'APPOINTMENT_CONFIRMATION',
+                        isDefault: true,
+                        isActive: true,
+                    },
+                });
+                if (defaultTpl) {
+                    body = defaultTpl.body;
+                    subject = defaultTpl.subject;
+                    templateId = defaultTpl.id;
+                    if (!channels) channels = defaultTpl.channels;
+                }
             }
 
-            // 5. Enqueue webhook FIRST — if enqueueing fails the flag is never set,
-            //    so the next retry attempt will re-enter and try again.
-            logger.info(`[NotificationService] Enqueueing webhook for ${appointmentId}`, { payload: JSON.stringify(payload) });
-            await enqueueAppointmentWebhook(appointmentId, payload);
-
-            // 6. Mark as processed ONLY after successful enqueue.
-            //    DB write is atomic across replicas; Bull's jobId deduplication prevents double-fire.
-            await prisma.appointment.update({
-                where: { id: appointmentId },
-                data: { notificationSent: true }
+            // 4. Build the context for placeholder substitution + raw WA fallback.
+            const estimatedTime = `${config.whatsapp?.defaultConsultationMinutes || 30} minutes`;
+            const ctx = buildAppointmentContext({
+                appointment, hospital,
+                patient: appointment.patient,
+                doctor: appointment.doctor,
+                therapist: appointment.therapist,
+                branch: appointment.branch,
+                extras: { estimatedTime },
             });
+            if (!ctx.patientName || !ctx.clinicianName) {
+                logger.warn(`[NotificationService] BLOCKING confirmation for ${appointmentId} - Missing patient or clinician name`);
+                return false;
+            }
+            if (appointment.consultationMode === 'ONLINE' && !ctx.meetingLink) {
+                logger.warn(`[NotificationService] BLOCKING confirmation for ${appointmentId} - Online appointment without meeting link`);
+                return false;
+            }
 
+            // 5. If a custom template/channels are configured, use DeliveryService
+            //    (multi-channel fallback + per-attempt audit log).
+            //    Otherwise fall back to the legacy single-channel WhatsApp queue path.
+            if (body || (channels && channels.length)) {
+                const renderedBody = renderTemplate(body || this.buildWhatsAppMessage(appointment).text, ctx);
+                const renderedSubject = subject ? renderTemplate(subject, ctx) : null;
+                const patientUserId = appointment.patient?.user?.id || appointment.patient?.userId;
+                if (!patientUserId) {
+                    logger.warn(`[NotificationService] BLOCKING confirmation for ${appointmentId} - no patient user id`);
+                    return false;
+                }
+
+                const result = await DeliveryService.send({
+                    userId: patientUserId,
+                    hospitalId,
+                    appointmentId,
+                    templateId,
+                    kind: 'APPOINTMENT_CONFIRMATION',
+                    channels: channels && channels.length ? channels : ['WHATSAPP', 'SMS', 'EMAIL', 'IN_APP'],
+                    body: renderedBody,
+                    subject: renderedSubject || undefined,
+                    inAppTitle: renderedSubject || 'Appointment confirmed',
+                    inAppType: 'APPOINTMENT_CONFIRMATION',
+                });
+
+                if (result.success) {
+                    await prisma.appointment.update({ where: { id: appointmentId }, data: { notificationSent: true } });
+                } else {
+                    logger.warn(`[NotificationService] All channels failed for ${appointmentId}`, { attempts: result.attempts });
+                }
+                return result.success;
+            }
+
+            // Legacy path — hardcoded OFFLINE/ONLINE WhatsApp templates through the queue
+            const message = this.buildWhatsAppMessage(appointment);
+            if (!message.number) {
+                logger.warn(`[NotificationService] BLOCKING WhatsApp for ${appointmentId} - No phone number on patient`);
+                return false;
+            }
+            logger.info(`[NotificationService] Enqueueing WhatsApp for ${appointmentId}`, { number: message.number });
+            await enqueueAppointmentWhatsApp(appointmentId, { number: message.number, text: message.text });
+            await prisma.appointment.update({ where: { id: appointmentId }, data: { notificationSent: true } });
             return true;
         } catch (error) {
-            logger.error(`[NotificationService] Fatal failure in webhook preparation`, error, { appointmentOrId });
+            logger.error(`[NotificationService] Fatal failure in confirmation`, error, { appointmentOrId });
             return false;
         }
     }
@@ -116,121 +233,60 @@ export class NotificationService {
     }
 
     /**
-     * Construct a payload exclusively from validated database records.
-     * No fallbacks, no placeholders, no hardcoded strings.
+     * Build the WhatsApp message payload for Evolution API.
+     * Picks the OFFLINE (direct) or ONLINE (virtual) template based on `consultationMode`.
+     * Returns `{ number, text, patientName, clinicianName }`.
      */
-    constructWebhookPayload(appointment) {
-        // Source Identification for Traceability
-        const sourceMeta = {
-            patientId: appointment.patientId,
-            doctorId: appointment.doctorId,
-            therapistId: appointment.therapistId,
-            branchId: appointment.branchId
-        };
+    buildWhatsAppMessage(appointment) {
+        const patientName = appointment.patient?.fullName || appointment.contactDetails?.fullName || null;
 
-        const patientName = appointment.patient?.fullName || appointment.contactDetails?.fullName;
+        // Clinician — prefer whichever is relevant for this appointment type.
+        // For COMBINED we go with the doctor as the lead name (they're the principal consultant).
+        const clinicianName =
+            appointment.consultationType === 'THERAPIST'
+                ? (appointment.therapist?.fullName || null)
+                : (appointment.doctor?.fullName || appointment.therapist?.fullName || null);
 
-        // Mobile Formatting - Strict DB Source
-        let rawPhone = appointment.contactDetails?.phoneNumber || appointment.patient?.phoneNumber || "";
-        let sanitizedPhone = rawPhone.replace(/\D/g, '');
-        if (sanitizedPhone.startsWith('0')) sanitizedPhone = sanitizedPhone.substring(1);
-
-        const mobileWith91 = sanitizedPhone.length >= 10
-            ? (sanitizedPhone.startsWith('91') ? sanitizedPhone : `91${sanitizedPhone}`)
+        // Phone: strip non-digits, drop leading 0, prefix 91 (India) if absent.
+        const rawPhone = appointment.contactDetails?.phoneNumber || appointment.patient?.phoneNumber || '';
+        let digits = rawPhone.replace(/\D/g, '');
+        if (digits.startsWith('0')) digits = digits.substring(1);
+        const number = digits.length >= 10
+            ? (digits.startsWith('91') ? digits : `91${digits}`)
             : null;
 
-        // Date & Time Helpers
-        const formatDT = (date) => {
-            if (!date) return { date: null, time: null };
-            return {
-                date: date.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }),
-                time: date.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })
-            };
-        };
+        // Date & time — use the primary consultation datetime.
+        const primaryDate = appointment.date || appointment.therapistDate;
+        const dateAndTime = primaryDate
+            ? new Date(primaryDate).toLocaleString('en-IN', {
+                weekday: 'long',
+                day: 'numeric',
+                month: 'long',
+                year: 'numeric',
+                hour: '2-digit',
+                minute: '2-digit',
+                hour12: true,
+            })
+            : '';
 
-        const docDT = formatDT(appointment.date ? new Date(appointment.date) : null);
-        const therDT = formatDT(appointment.therapistDate ? new Date(appointment.therapistDate) : null);
+        const estimatedTime = `${config.whatsapp.defaultConsultationMinutes} minutes`;
 
-        // Arrival Calculation (15 mins before)
-        let estimatedArrival = null;
-        if (appointment.consultationMode === 'OFFLINE') {
-            const primaryDate = appointment.date || appointment.therapistDate;
-            if (primaryDate) {
-                const arrival = new Date(new Date(primaryDate).getTime() - 15 * 60000);
-                estimatedArrival = arrival.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
-            }
-        }
+        const text = appointment.consultationMode === 'ONLINE'
+            ? buildOnlineTemplate({
+                patientName,
+                clinicianName,
+                dateAndTime,
+                estimatedTime,
+                meetingLink: appointment.meetingLink || '',
+            })
+            : buildOfflineTemplate({
+                patientName,
+                clinicianName,
+                dateAndTime,
+                estimatedTime,
+            });
 
-        // Base Schema - Strictly Data-Bound
-        const basePayload = {
-            appointmentId: appointment.id,
-            sourceMetadata: sourceMeta,
-            patientName: patientName || null,
-            mobileWith91: mobileWith91,
-            appointmentDate: docDT.date || therDT.date,
-            bookingType: appointment.consultationType,
-            consultationMedium: appointment.consultationMode,
-            bookingStatus: appointment.status,
-            createdAt: appointment.createdAt.toISOString(),
-            branchName: appointment.branch?.name || null,
-            meetingLink: appointment.consultationMode === 'ONLINE' ? appointment.meetingLink : null,
-            estimatedArrivalTime: appointment.consultationMode === 'OFFLINE' ? estimatedArrival : null
-        };
-
-        const approvalTS = appointment.updatedAt.toISOString();
-
-        // Scenario Specific Logic - Pure Participant Data
-        if (appointment.consultationType === 'THERAPIST') {
-            return {
-                ...basePayload,
-                doctorName: null,
-                doctorAppointmentTime: null,
-                doctorApprovedTime: null,
-                therapistName: appointment.therapist?.fullName || null,
-                therapistAppointmentTime: therDT.time,
-                therapistApprovedTime: approvalTS
-            };
-        } else if (appointment.consultationType === 'DOCTOR') {
-            return {
-                ...basePayload,
-                doctorName: appointment.doctor?.fullName || null,
-                doctorAppointmentTime: docDT.time,
-                doctorApprovedTime: approvalTS,
-                therapistName: null,
-                therapistAppointmentTime: null,
-                therapistApprovedTime: null
-            };
-        } else {
-            // COMBINED
-            return {
-                ...basePayload,
-                doctorName: appointment.doctor?.fullName || null,
-                doctorAppointmentTime: docDT.time,
-                doctorApprovedTime: approvalTS,
-                therapistName: appointment.therapist?.fullName || null,
-                therapistAppointmentTime: therDT.time,
-                therapistApprovedTime: approvalTS
-            };
-        }
-    }
-
-    /**
-     * Strict Validation: Block webhook if critical real data is missing.
-     */
-    validatePayload(payload) {
-        const required = ['patientName', 'mobileWith91', 'appointmentDate', 'branchName'];
-
-        // Conditional requirements
-        if (payload.consultationMedium === 'ONLINE' && !payload.meetingLink) required.push('meetingLink');
-        if (payload.bookingType === 'DOCTOR' || payload.bookingType === 'COMBINED') required.push('doctorName');
-        if (payload.bookingType === 'THERAPIST' || payload.bookingType === 'COMBINED') required.push('therapistName');
-
-        const missing = required.filter(field => !payload[field]);
-
-        return {
-            success: missing.length === 0,
-            missing: missing
-        };
+        return { number, text, patientName, clinicianName };
     }
 
     /**

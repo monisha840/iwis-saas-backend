@@ -215,6 +215,7 @@ export class FamilyLeaderboardService {
                 totalPoints: f.members.reduce((sum, m) => sum + m.patient.zenPoints, 0),
                 createdAt: f.createdAt
             }))
+            .filter(f => f.memberCount >= 2)
             .sort((a, b) => b.totalPoints - a.totalPoints)
             .map((f, idx) => ({ ...f, rank: idx + 1 }));
 

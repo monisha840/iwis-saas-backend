@@ -1,13 +1,15 @@
 import express from 'express';
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
+import { requireFeature } from '../utils/featureGate.js';
 import { CommunicationController } from '../controllers/communication.controller.js';
 
 const router = express.Router();
 
 const clinicianRoles = ['DOCTOR', 'THERAPIST', 'ADMIN_DOCTOR'];
 
-// All routes require authentication
+// All routes require authentication + feature flag
 router.use(authMiddleware);
+router.use(requireFeature('HANDOFF_NOTES'));
 
 // POST / — create handoff note
 router.post(
@@ -49,6 +51,20 @@ router.get(
   '/auto-populate/:appointmentId',
   roleMiddleware(clinicianRoles),
   CommunicationController.autoPopulateHandoff,
+);
+
+// PATCH /:id — edit a draft before sending (sender-only, draft-only)
+router.patch(
+  '/:id',
+  roleMiddleware(clinicianRoles),
+  CommunicationController.updateHandoff,
+);
+
+// POST /:id/send — promote a DRAFT handoff to SENT + deliver notification
+router.post(
+  '/:id/send',
+  roleMiddleware(clinicianRoles),
+  CommunicationController.sendHandoff,
 );
 
 export default router;

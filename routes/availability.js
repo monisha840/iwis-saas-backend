@@ -110,4 +110,22 @@ router.get('/:doctorId', authMiddleware, async (req, res, next) => {
     }
 });
 
+// Availability check by User.id — used by resource-sharing to verify a
+// clinician is free before submitting a cross-branch share. Query params:
+// ?date=YYYY-MM-DD&startTime=HH:mm&endTime=HH:mm. Returns `{ available, reason? }`.
+const availabilityCheckSchema = z.object({
+    date: z.string().min(1, 'date is required'),
+    startTime: z.string().regex(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/, 'Invalid HH:mm'),
+    endTime:   z.string().regex(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/, 'Invalid HH:mm'),
+});
+router.get('/user/:userId/check', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']), validate({ query: availabilityCheckSchema }), async (req, res, next) => {
+    try {
+        const { date, startTime, endTime } = req.query;
+        const result = await AvailabilityService.checkAvailabilityForUser(req.params.userId, date, startTime, endTime);
+        res.json(result);
+    } catch (err) {
+        next(err);
+    }
+});
+
 export default router;

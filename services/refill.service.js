@@ -169,7 +169,19 @@ export class RefillService {
             return num || 30;
         };
 
+        const now = new Date();
+        // Cycle start: only re-notify for a given prescription once per
+        // daysAhead window. Prevents the cron from spamming every day until
+        // the prescription expires.
+        const cycleStart = new Date(now.getTime() - daysAhead * 24 * 60 * 60 * 1000);
+
         const prescriptions = await prisma.prescription.findMany({
+            where: {
+                OR: [
+                    { refillNotifiedAt: null },
+                    { refillNotifiedAt: { lt: cycleStart } },
+                ],
+            },
             include: {
                 patient:  { include: { user: true } },
                 doctor:   { include: { user: true } },
@@ -177,7 +189,6 @@ export class RefillService {
             },
         });
 
-        const now = new Date();
         let alertCount = 0;
 
         for (const rx of prescriptions) {
@@ -213,6 +224,10 @@ export class RefillService {
                     });
                 }
 
+                await prisma.prescription.update({
+                    where: { id: rx.id },
+                    data: { refillNotifiedAt: now },
+                });
                 alertCount++;
             }
         }

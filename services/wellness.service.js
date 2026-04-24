@@ -135,6 +135,17 @@ export class WellnessService {
         const patient = await prisma.patient.findUnique({ where: { userId } });
         if (!patient) throw new Error('Patient not found');
 
+        // Validate quantity: must be a positive integer 1..50 (per-dose).
+        // Blocks negatives (which would INCREASE stock via decrement) and
+        // absurdly-large values that would zero out the remaining supply.
+        const qty = Number.isFinite(quantityTaken) ? Math.floor(quantityTaken) : 1;
+        if (qty < 1 || qty > 50) {
+            throw Object.assign(
+                new Error('quantityTaken must be an integer between 1 and 50'),
+                { status: 400 },
+            );
+        }
+
         return prisma.$transaction(async (tx) => {
             const prescription = await tx.prescription.findUnique({
                 where: { id: prescriptionId }
@@ -144,6 +155,14 @@ export class WellnessService {
                 throw new Error('Prescription not found or access denied');
             }
 
+            // Never decrement below zero.
+            if (prescription.totalQuantity < qty) {
+                throw Object.assign(
+                    new Error('Not enough remaining medication to log this dose'),
+                    { status: 400 },
+                );
+            }
+
             // Create log
             const log = await tx.medicationLog.create({
                 data: {
@@ -151,7 +170,7 @@ export class WellnessService {
                     date: new Date(date || Date.now()),
                     medicationName: prescription.medicationName,
                     dosage: prescription.dosage,
-                    quantityTaken: quantityTaken || 1,
+                    quantityTaken: qty,
                     taken: true,
                     takenAt: new Date(),
                     notes
@@ -161,7 +180,7 @@ export class WellnessService {
             // Update remaining quantity
             const updatedPrescription = await tx.prescription.update({
                 where: { id: prescriptionId },
-                data: { totalQuantity: { decrement: quantityTaken || 1 } }
+                data: { totalQuantity: { decrement: qty } }
             });
 
             // Check threshold and notify
@@ -258,6 +277,18 @@ export class WellnessService {
                 }
             }
 
+            return log;
+        }).then(async (log) => {
+            // Update the PatientStreak aggregate in real time so the
+            // dashboard reflects the new state immediately. Best-effort —
+            // the log is already persisted; a failed streak refresh is
+            // recoverable via the nightly job.
+            try {
+                const { StreakService } = await import('./streak.service.js');
+                await StreakService.updatePatientStreak(patient.id);
+            } catch (err) {
+                logger.warn('[WellnessService] Streak update failed:', err.message);
+            }
             return log;
         });
     }

@@ -4,6 +4,7 @@ import { UserService } from '../services/user.service.js';
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
 import { auditAction, auditDelete } from '../middleware/auditLog.js';
+import { getUploadMiddleware, uploadToSupabase, BUCKETS } from '../middleware/upload.js';
 
 const router = express.Router();
 
@@ -19,7 +20,16 @@ const onboardingSchema = z.object({
 
 const assignPatientSchema = z.object({
   patientId: z.string(),
-  doctorId: z.string(),
+  doctorId:  z.string(),
+  type:      z.enum(['PRIMARY', 'CONSULTING', 'TEMPORARY']).default('PRIMARY').optional(),
+  reason:    z.string().optional(),
+});
+
+const unassignPatientSchema = z.object({
+  patientId: z.string(),
+  doctorId:  z.string(),
+  type:      z.enum(['PRIMARY', 'CONSULTING', 'TEMPORARY']).optional(),
+  reason:    z.string().optional(),
 });
 
 const listDoctorsSchema = z.object({
@@ -45,51 +55,112 @@ const staffPassword = z.string()
   .regex(/[0-9]/, 'Password must contain at least one number')
   .regex(/[^A-Za-z0-9]/, 'Password must contain at least one special character');
 
+const GENDERS = ['FEMALE', 'MALE', 'OTHER', 'PREFER_NOT_TO_SAY'];
+const phoneShape = z.string()
+  .regex(/^\+?[0-9]{7,15}$/, 'Phone must be 7-15 digits, optional leading +');
+
+// Date-only ISO (YYYY-MM-DD) that parses to a plausible past date (0-130 years).
+const dobShape = z.string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/, 'Date of birth must be YYYY-MM-DD')
+  .refine((s) => {
+    const d = new Date(s + 'T00:00:00Z');
+    if (Number.isNaN(d.getTime())) return false;
+    const ageYears = (Date.now() - d.getTime()) / (365.25 * 24 * 60 * 60 * 1000);
+    return ageYears >= 0 && ageYears <= 130;
+  }, 'Date of birth must be a valid past date');
+
+// One schema, role-conditional required fields enforced via superRefine so each
+// missing field returns a path-targeted error (better UX than a single blob).
 const createUserSchema = z.object({
   email: z.string().email(),
   password: staffPassword,
-  fullName: z.string(),
+  fullName: z.string().min(2, 'Full name is required'),
   role: z.enum(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST', 'PATIENT', 'PHARMACIST']),
-  branchId: z.string().optional(),
+  branchId: z.string().min(1, 'Branch is required'),
+
+  phoneNumber: phoneShape.optional(),
+
+  // Patient-only
+  dob: dobShape.optional(),
+  gender: z.enum(GENDERS).optional(),
+  therapyType: z.string().optional(),
+
+  // Clinician-only (DOCTOR / ADMIN_DOCTOR / THERAPIST / PHARMACIST)
+  specialization:  z.string().min(1).optional(),
+  qualification:   z.string().min(1).optional(),
+  yearsExperience: z.number().int().min(0).max(80).optional(),
+  clinic:          z.string().optional(),
+  // Certificate / medical registration number. Required for DOCTOR,
+  // ADMIN_DOCTOR, and THERAPIST via superRefine below.
+  registrationNumber: z.string().trim().min(1).optional(),
+
+  // Therapist-only — optional additional AyurvedicSkill tags written to
+  // TherapistSkill rows at creation time. Saves an extra admin step.
+  initialSkills: z.array(z.enum([
+    'ABHYANGA', 'SHIRODHARA', 'PANCHAKARMA_GENERAL', 'BASTI', 'VIRECHANA',
+    'NASYA', 'KIZHI', 'NJAVARA', 'PIZHICHIL', 'MARMA_THERAPY', 'YOGA_THERAPY', 'NATUROPATHY',
+  ])).optional(),
+}).superRefine((val, ctx) => {
+  const req = (field) => {
+    if (val[field] === undefined || val[field] === null || val[field] === '') {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: [field], message: `${field} is required for ${val.role}` });
+    }
+  };
+
+  if (val.role === 'PATIENT') {
+    req('dob');
+    req('gender');
+    req('phoneNumber');
+  }
+  if (val.role === 'DOCTOR' || val.role === 'ADMIN_DOCTOR' || val.role === 'THERAPIST') {
+    req('specialization');
+    req('qualification');
+    req('yearsExperience');
+    req('registrationNumber');
+  }
+  if (val.role === 'PHARMACIST') {
+    req('qualification');
+    req('yearsExperience');
+  }
 });
 
 const updateDoctorSchema = z.object({
-  email: z.string().email().optional(),
-  fullName: z.string().optional(),
-  specialization: z.string().optional(),
-  qualification: z.string().optional(),
-  yearsExperience: z.number().optional(),
-  clinic: z.string().optional(),
-  branchId: z.string().optional(),
+  email: z.string().email().min(1, 'Email is required').optional(),
+  fullName: z.string().min(2, 'Full name is required').optional(),
+  specialization: z.string().nullable().optional(),
+  qualification: z.string().nullable().optional(),
+  yearsExperience: z.number().int().nonnegative().nullable().optional(),
+  clinic: z.string().nullable().optional(),
+  branchId: z.string().min(1, 'Branch is required').optional(),
 });
 
 const updateTherapistSchema = z.object({
-  email: z.string().email().optional(),
-  fullName: z.string().optional(),
-  specialization: z.string().optional(),
-  qualification: z.string().optional(),
-  yearsExperience: z.number().optional(),
-  clinic: z.string().optional(),
-  branchId: z.string().optional(),
+  email: z.string().email().min(1, 'Email is required').optional(),
+  fullName: z.string().min(2, 'Full name is required').optional(),
+  specialization: z.string().nullable().optional(),
+  qualification: z.string().nullable().optional(),
+  yearsExperience: z.number().int().nonnegative().nullable().optional(),
+  clinic: z.string().nullable().optional(),
+  branchId: z.string().min(1, 'Branch is required').optional(),
 });
 
 const updatePatientSchema = z.object({
-  email: z.string().email().optional(),
-  fullName: z.string().optional(),
-  phoneNumber: z.string().optional(),
-  age: z.number().optional(),
-  gender: z.string().optional(),
-  therapyType: z.string().optional(),
-  patientId: z.string().optional(),
-  branchId: z.string().optional(),
+  email: z.string().email().min(1, 'Email is required').optional(),
+  fullName: z.string().min(2, 'Full name is required').optional(),
+  phoneNumber: z.string().regex(/^\+?[0-9]{7,15}$/, 'Invalid phone format').nullable().optional(),
+  age: z.number().int().min(0).max(150).nullable().optional(),
+  gender: z.string().nullable().optional(),
+  therapyType: z.string().nullable().optional(),
+  patientId: z.string().nullable().optional(),
+  branchId: z.string().min(1, 'Branch is required').optional(),
 });
 
 const updatePharmacistSchema = z.object({
-  email: z.string().email().optional(),
-  fullName: z.string().optional(),
-  qualification: z.string().optional(),
-  yearsExperience: z.number().optional(),
-  branchId: z.string().optional(),
+  email: z.string().email().min(1, 'Email is required').optional(),
+  fullName: z.string().min(2, 'Full name is required').optional(),
+  qualification: z.string().nullable().optional(),
+  yearsExperience: z.number().int().nonnegative().nullable().optional(),
+  branchId: z.string().min(1, 'Branch is required').optional(),
 });
 
 router.get('/list-therapists', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']), validate({ query: listTherapistsSchema }), async (req, res, next) => {
@@ -153,6 +224,95 @@ router.get('/me', authMiddleware, async (req, res, next) => {
   }
 });
 
+/**
+ * Feature set for the current user's hospital. The UI reads this once after
+ * login to hide nav items / CTAs for features the tenant has disabled.
+ *
+ * Returns BOTH:
+ *   - registered: every feature key present in FeatureRegistry (the universe)
+ *   - enabled: the subset enabled for this hospital (isCore bypass applied)
+ *
+ * The frontend treats unregistered keys as fail-open so newly-built features
+ * surface in nav even before their FeatureRegistry row has been seeded. Only
+ * keys that are registered BUT not in the enabled list get hidden.
+ */
+router.get('/features', authMiddleware, async (req, res, next) => {
+  try {
+    const { default: prisma } = await import('../lib/prisma.js');
+    const registryRows = await prisma.featureRegistry.findMany({ select: { key: true } });
+    const registered = registryRows.map(r => r.key);
+
+    // SUPER_ADMIN: every registered feature counts as enabled.
+    if (req.user.role === 'SUPER_ADMIN' || !req.user.hospitalId) {
+      return res.json({
+        registered,
+        enabled: registered,
+        isSuperAdmin: req.user.role === 'SUPER_ADMIN',
+      });
+    }
+
+    const rows = await prisma.hospitalFeatureFlag.findMany({
+      where: { hospitalId: req.user.hospitalId },
+      include: { feature: { select: { key: true, isCore: true } } },
+    });
+    const enabled = rows
+      .filter(r => r.feature.isCore || r.enabled)
+      .map(r => r.feature.key);
+
+    res.json({ registered, enabled, isSuperAdmin: false });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Self-service profile update. Email / role / branch are intentionally excluded —
+// those are identity/tenancy changes that must go through an admin.
+const updateMeSchema = z.object({
+  fullName: z.string().min(2).max(100).optional(),
+  phoneNumber: z.string().regex(/^\+?[0-9]{7,15}$/).optional(),
+  profilePhoto: z.string().url().nullable().optional(),
+  clinic: z.string().max(200).nullable().optional(),
+  dob: dobShape.optional(),
+  gender: z.enum(GENDERS).optional(),
+  therapyType: z.string().max(100).nullable().optional(),
+});
+
+router.patch(
+  '/me',
+  authMiddleware,
+  validate({ body: updateMeSchema }),
+  auditAction('UPDATE_SELF_PROFILE', 'User', (req) => req.user.id),
+  async (req, res, next) => {
+    try {
+      const data = await UserService.updateMe(req.user.id, req.body);
+      res.json(data);
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+const photoUpload = getUploadMiddleware({ maxSizeMb: 5, fieldName: 'file' });
+router.post(
+  '/me/photo',
+  authMiddleware,
+  photoUpload,
+  auditAction('UPDATE_SELF_PROFILE_PHOTO', 'User', (req) => req.user.id),
+  async (req, res, next) => {
+    try {
+      if (!req.file) return res.status(400).json({ error: 'file is required' });
+      if (!req.file.mimetype?.startsWith('image/')) {
+        return res.status(400).json({ error: 'Only image files are accepted' });
+      }
+      const url = await uploadToSupabase(req.file, BUCKETS.PROFILE_PICTURES);
+      const data = await UserService.updateMe(req.user.id, { profilePhoto: url });
+      res.json({ url, user: data });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
 router.put('/patient/onboarding', authMiddleware, roleMiddleware(['PATIENT']), validate({ body: onboardingSchema }), async (req, res, next) => {
   try {
     await UserService.updateOnboarding(req.user.id, req.body);
@@ -162,19 +322,92 @@ router.put('/patient/onboarding', authMiddleware, roleMiddleware(['PATIENT']), v
   }
 });
 
-router.post('/create', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']), validate({ body: createUserSchema }), auditAction('CREATE_USER', 'User', (req) => null), async (req, res, next) => {
+// Role-creation matrix — enforces privilege boundaries at the API layer.
+// Without this, any ADMIN could create another ADMIN or elevate to ADMIN_DOCTOR.
+// Keep in sync with roleMiddleware() gate below.
+const ROLE_CREATE_MATRIX = {
+  SUPER_ADMIN:  ['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST', 'PATIENT', 'PHARMACIST'],
+  ADMIN_DOCTOR: ['ADMIN', 'DOCTOR', 'THERAPIST', 'PATIENT', 'PHARMACIST'],
+  ADMIN:        ['DOCTOR', 'THERAPIST', 'PATIENT', 'PHARMACIST'],
+};
+
+router.post(
+  '/create',
+  authMiddleware,
+  roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'SUPER_ADMIN']),
+  validate({ body: createUserSchema }),
+  (req, res, next) => {
+    const allowed = ROLE_CREATE_MATRIX[req.user.role] || [];
+    if (!allowed.includes(req.body.role)) {
+      return res.status(403).json({
+        error: 'Forbidden',
+        message: `${req.user.role} cannot create a user with role ${req.body.role}`,
+      });
+    }
+    next();
+  },
+  auditAction('CREATE_USER', 'User', (req) => null),
+  async (req, res, next) => {
+    try {
+      const user = await UserService.createUser(req.body);
+      res.status(201).json({ id: user.id, email: user.email, role: user.role });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+router.post('/assign-patient', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']), validate({ body: assignPatientSchema }), async (req, res, next) => {
   try {
-    const user = await UserService.createUser(req.body);
-    res.status(201).json({ id: user.id, email: user.email, role: user.role });
+    const record = await UserService.assignPatient({
+      ...req.body,
+      assignedById:     req.user.id,
+      // ADMIN has cross-branch authority; ADMIN_DOCTOR is branch-scoped.
+      allowCrossBranch: req.user.role === 'ADMIN',
+    });
+    res.json({ message: 'Patient assigned to doctor successfully', assignment: record });
   } catch (err) {
     next(err);
   }
 });
 
-router.post('/assign-patient', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']), validate({ body: assignPatientSchema }), async (req, res, next) => {
+router.post('/unassign-patient', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']), validate({ body: unassignPatientSchema }), async (req, res, next) => {
   try {
-    await UserService.assignPatient(req.body);
-    res.json({ message: 'Patient assigned to doctor successfully' });
+    const result = await UserService.unassignPatient({
+      patientId: req.body.patientId,
+      doctorId:  req.body.doctorId,
+      type:      req.body.type,
+      endReason: req.body.reason,
+      endedById: req.user.id,
+    });
+    res.json({ message: 'Assignment ended', ...result });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/patient/:id/assignments', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR']), async (req, res, next) => {
+  try {
+    const status = req.query.status ? String(req.query.status) : 'ACTIVE';
+    const data = await UserService.getPatientAssignments(req.params.id, { status });
+    res.json(data);
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.get('/list-unassigned-patients', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']), async (req, res, next) => {
+  try {
+    // ADMIN_DOCTOR defaults to their own branch; ADMIN sees hospital-wide
+    // unless a branchId is explicitly passed.
+    const branchId = req.query.branchId
+      ? String(req.query.branchId)
+      : (req.user.role === 'ADMIN_DOCTOR' ? req.user.branchId : null);
+    const data = await UserService.listUnassignedPatients({
+      branchId,
+      hospitalId: req.user.hospitalId ?? null,
+    });
+    res.json(data);
   } catch (err) {
     next(err);
   }

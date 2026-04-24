@@ -1,6 +1,7 @@
 import prisma from '../lib/prisma.js';
 import logger from '../lib/logger.js';
 import { inventoryService } from './inventory.service.js';
+import { onDispense as onMedicationDispense } from './medicationLifecycle.service.js';
 
 export class PharmacyService {
     static async getAllMedicines(branchId) {
@@ -124,7 +125,9 @@ export class PharmacyService {
 
             await inventoryService.deductStock(tx, itemsWithPrices);
 
-            // If a prescription is linked, increment its total quantity
+            // If a prescription is linked, increment lifecycle counters
+            // (dispensedQty is the new source of truth; totalQuantity is
+            // kept in sync inside onMedicationDispense for back-compat).
             if (prescriptionId) {
                 for (const item of itemsWithPrices) {
                     const prescription = await tx.prescription.findFirst({
@@ -132,10 +135,7 @@ export class PharmacyService {
                     });
 
                     if (prescription) {
-                        await tx.prescription.update({
-                            where: { id: prescription.id },
-                            data: { totalQuantity: { increment: item.quantity } }
-                        });
+                        await onMedicationDispense(tx, prescription.id, item.quantity);
                     }
                 }
             }

@@ -1,5 +1,6 @@
 import express from 'express';
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
+import { requireFeature } from '../utils/featureGate.js';
 import { OperationsController } from '../controllers/operations.controller.js';
 
 const router = express.Router();
@@ -8,6 +9,16 @@ const ADMIN_ROLES = ['ADMIN', 'ADMIN_DOCTOR'];
 const ALL_STAFF = ['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST', 'PHARMACIST'];
 const INVENTORY_ROLES = ['ADMIN', 'ADMIN_DOCTOR', 'PHARMACIST'];
 const CLINICIAN_ROLES = ['DOCTOR', 'THERAPIST', 'ADMIN_DOCTOR'];
+
+// Path-prefix feature gates. Each operations sub-area maps to its own FeatureRegistry
+// key so Super Admin can toggle them independently. Auth is asserted here first since
+// feature gates read req.user.hospitalId.
+router.use('/resource-sharing', authMiddleware, requireFeature('RESOURCE_SHARING'));
+router.use('/inventory',        authMiddleware, requireFeature('CENTRALIZED_INVENTORY'));
+router.use('/staff-activity',   authMiddleware, requireFeature('STAFF_ACTIVITY_FEED'));
+router.use('/scorecards',       authMiddleware, requireFeature('PERFORMANCE_SCORECARDS'));
+router.use('/attendance',       authMiddleware, requireFeature('STAFF_ATTENDANCE'));
+router.use('/skills',           authMiddleware, requireFeature('STAFF_SKILL_MATRIX'));
 
 // ── Resource Sharing ────────────────────────────────────────────────────────────
 

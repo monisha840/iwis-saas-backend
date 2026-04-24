@@ -1,11 +1,10 @@
 /**
  * ClinicianGamificationController — HTTP layer for clinician XP, seasonal
- * challenges, team quests, reward store, mentor sessions, and achievement showcase.
+ * challenges, reward store, mentor sessions, and achievement showcase.
  */
 
 import { ClinicianXPService } from '../services/clinicianXP.service.js';
 import { SeasonalChallengeService } from '../services/seasonalChallenge.service.js';
-import { TeamQuestService } from '../services/teamQuest.service.js';
 import { RewardStoreService } from '../services/rewardStore.service.js';
 import { MentorSessionService } from '../services/mentorSession.service.js';
 import { BadgeService } from '../services/badge.service.js';
@@ -66,44 +65,6 @@ export class ClinicianGamificationController {
         try {
             const { page = 1, limit = 20 } = req.query;
             const history = await SeasonalChallengeService.getChallengeHistory({
-                page: parseInt(page),
-                limit: parseInt(limit),
-            });
-            res.json(history);
-        } catch (err) { next(err); }
-    }
-
-    // ── Team Quests ──────────────────────────────────────────────────────────
-
-    static async createTeamQuest(req, res, next) {
-        try {
-            const { branchId, ...questData } = req.body;
-            const quest = await TeamQuestService.createQuest(
-                branchId || req.user.branchId,
-                questData,
-                req.user.id
-            );
-            res.status(201).json(quest);
-        } catch (err) { next(err); }
-    }
-
-    static async getActiveQuests(req, res, next) {
-        try {
-            const branchId = req.query.branchId || req.user.branchId;
-            if (!branchId) return res.status(400).json({ error: 'No branch context found' });
-
-            const quests = await TeamQuestService.getActiveQuests(branchId);
-            res.json(quests);
-        } catch (err) { next(err); }
-    }
-
-    static async getQuestHistory(req, res, next) {
-        try {
-            const { page = 1, limit = 20 } = req.query;
-            const branchId = req.query.branchId || req.user.branchId;
-            if (!branchId) return res.status(400).json({ error: 'No branch context found' });
-
-            const history = await TeamQuestService.getQuestHistory(branchId, {
                 page: parseInt(page),
                 limit: parseInt(limit),
             });

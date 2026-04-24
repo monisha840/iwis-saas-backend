@@ -104,7 +104,6 @@ export class AuthService {
 
         const tokenHash = this._hashToken(refreshToken);
 
-        // Find the token record
         const tokenRecord = await prisma.refreshToken.findUnique({
             where: { tokenHash }
         });
@@ -115,8 +114,20 @@ export class AuthService {
             throw error;
         }
 
-        // Token reuse detection: if already revoked, revoke ALL user tokens (force re-login)
-        if (tokenRecord.revokedAt) {
+        if (tokenRecord.expiresAt < new Date()) {
+            const error = new Error('Refresh token expired');
+            error.status = 401;
+            throw error;
+        }
+
+        const rotation = await prisma.refreshToken.updateMany({
+            where: { id: tokenRecord.id, revokedAt: null },
+            data: { revokedAt: new Date() }
+        });
+
+        // updateMany.count === 0 means someone else already revoked this token
+        // (concurrent refresh or replay). Treat as reuse: burn all sessions.
+        if (rotation.count === 0) {
             logger.warn('Refresh token reuse detected — revoking all sessions', {
                 userId: tokenRecord.userId, ip
             });
@@ -129,22 +140,9 @@ export class AuthService {
             throw error;
         }
 
-        // Check expiry
-        if (tokenRecord.expiresAt < new Date()) {
-            const error = new Error('Refresh token expired');
-            error.status = 401;
-            throw error;
-        }
-
-        // Revoke this token immediately (rotation)
-        await prisma.refreshToken.update({
-            where: { id: tokenRecord.id },
-            data: { revokedAt: new Date() }
-        });
-
         const user = await prisma.user.findUnique({
             where: { id: decoded.id },
-            select: { id: true, email: true, role: true, branchId: true, deletedAt: true }
+            select: { id: true, email: true, role: true, branchId: true, hospitalId: true, deletedAt: true }
         });
 
         if (!user || user.deletedAt) {
@@ -187,10 +185,17 @@ export class AuthService {
     // ── 1.1 Logout All Sessions ──────────────────────────────────────────────────
 
     static async logoutAll(userId) {
-        await prisma.refreshToken.updateMany({
-            where: { userId, revokedAt: null },
-            data: { revokedAt: new Date() }
-        });
+        const now = new Date();
+        await prisma.$transaction([
+            prisma.refreshToken.updateMany({
+                where: { userId, revokedAt: null },
+                data: { revokedAt: now }
+            }),
+            prisma.user.update({
+                where: { id: userId },
+                data: { tokensRevokedAt: now }
+            })
+        ]);
     }
 
     // ── 1.2 Email Verification ───────────────────────────────────────────────────
@@ -292,19 +297,19 @@ export class AuthService {
         // Hash new password with bcrypt rounds=12
         const hashed = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
 
-        // Update password and mark token as used, revoke all refresh tokens
+        const now = new Date();
         await prisma.$transaction([
             prisma.user.update({
                 where: { id: tokenRecord.userId },
-                data: { password: hashed }
+                data: { password: hashed, tokensRevokedAt: now }
             }),
             prisma.passwordResetToken.update({
                 where: { id: tokenRecord.id },
-                data: { usedAt: new Date() }
+                data: { usedAt: now }
             }),
             prisma.refreshToken.updateMany({
                 where: { userId: tokenRecord.userId, revokedAt: null },
-                data: { revokedAt: new Date() }
+                data: { revokedAt: now }
             })
         ]);
 
@@ -360,7 +365,7 @@ export class AuthService {
             crypto.randomBytes(4).toString('hex').toUpperCase()
         );
         const hashedBackupCodes = await Promise.all(
-            backupCodes.map(code => bcrypt.hash(code, 10))
+            backupCodes.map(code => bcrypt.hash(code, BCRYPT_ROUNDS))
         );
 
         await prisma.user.update({
@@ -397,19 +402,27 @@ export class AuthService {
         const { authenticator } = await import('otplib');
         let isValid = authenticator.check(totpCode, user.mfaSecret);
 
-        // Check backup codes if TOTP fails
         if (!isValid) {
             for (let i = 0; i < user.mfaBackupCodes.length; i++) {
                 const match = await bcrypt.compare(totpCode, user.mfaBackupCodes[i]);
                 if (match) {
-                    isValid = true;
-                    // Remove used backup code
-                    const updatedCodes = [...user.mfaBackupCodes];
-                    updatedCodes.splice(i, 1);
-                    await prisma.user.update({
-                        where: { id: user.id },
-                        data: { mfaBackupCodes: updatedCodes }
+                    const usedHash = user.mfaBackupCodes[i];
+                    const consumed = await prisma.$transaction(async (tx) => {
+                        const current = await tx.user.findUnique({
+                            where: { id: user.id },
+                            select: { mfaBackupCodes: true }
+                        });
+                        const idx = current?.mfaBackupCodes?.indexOf(usedHash) ?? -1;
+                        if (idx === -1) return false;
+                        const updatedCodes = [...current.mfaBackupCodes];
+                        updatedCodes.splice(idx, 1);
+                        await tx.user.update({
+                            where: { id: user.id },
+                            data: { mfaBackupCodes: updatedCodes }
+                        });
+                        return true;
                     });
+                    if (consumed) isValid = true;
                     break;
                 }
             }
@@ -461,7 +474,7 @@ export class AuthService {
         const jti = crypto.randomUUID();
 
         const accessToken = jwt.sign(
-            { id: user.id, role: user.role, branchId: user.branchId, jti },
+            { id: user.id, role: user.role, branchId: user.branchId, hospitalId: user.hospitalId ?? null, jti },
             config.jwt.secret,
             { expiresIn: config.jwt.expiresIn }
         );

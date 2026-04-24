@@ -43,8 +43,22 @@ export function errorHandler(err, req, res, next) {
   }
 
   if (err instanceof Prisma.PrismaClientValidationError) {
-    logger.warn('[errorHandler] Prisma validation error', { url: req.url });
-    return res.status(400).json({ error: 'Invalid data supplied to the database', code: 'DB_VALIDATION_ERROR' });
+    const isDev = process.env.NODE_ENV !== 'production';
+    // Prisma's validation message names the offending field/type — invaluable
+    // for diagnosis. We log the full message server-side always, and in dev
+    // surface it in `details` using the same array shape Zod uses so existing
+    // UI code that calls `details.map()` keeps working.
+    logger.warn('[errorHandler] Prisma validation error', {
+      url: req.url,
+      method: req.method,
+      userId: req.user?.id,
+      message: err.message,
+    });
+    return res.status(400).json({
+      error: 'Invalid data supplied to the database',
+      code: 'DB_VALIDATION_ERROR',
+      ...(isDev && { details: [{ path: '', message: err.message }] }),
+    });
   }
 
   // ── Application-level HTTP errors (e.g. thrown as: const e = new Error('...'); e.status = 403) ──

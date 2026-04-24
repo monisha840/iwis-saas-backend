@@ -62,6 +62,46 @@ export class BranchService {
         return branches;
     }
 
+    static async getBranchById(id) {
+        return prisma.branch.findUnique({
+            where: { id },
+            include: {
+                _count: { select: { patients: true, appointments: true, users: true, therapyRooms: true } }
+            }
+        });
+    }
+
+    static async getCapacity(id) {
+        const branch = await prisma.branch.findUnique({
+            where: { id },
+            select: {
+                id: true, name: true,
+                totalBeds: true, availableBeds: true,
+                totalRooms: true, totalTherapyRooms: true,
+                ipdEnabled: true, opdEnabled: true,
+                operatingHoursFrom: true, operatingHoursTo: true,
+            }
+        });
+        if (!branch) return null;
+
+        const [registeredTherapyRooms, activeEnrolments] = await Promise.all([
+            prisma.therapyRoom.count({ where: { branchId: id, isActive: true } }),
+            prisma.packageEnrolment.count({ where: { status: 'ACTIVE', package: { branchId: id } } }).catch(() => 0),
+        ]);
+
+        const totalBeds = branch.totalBeds ?? 0;
+        const availableBeds = branch.availableBeds ?? 0;
+        const occupiedBeds = Math.max(0, totalBeds - availableBeds);
+
+        return {
+            ...branch,
+            registeredTherapyRooms,
+            occupiedBeds,
+            activeInpatientEnrolments: activeEnrolments,
+            therapyRoomRegistrationGap: Math.max(0, (branch.totalTherapyRooms ?? 0) - registeredTherapyRooms),
+        };
+    }
+
     static async updateBranch(adminId, id, data) {
         return prisma.$transaction(async (tx) => {
             const oldData = await tx.branch.findUnique({ where: { id } });

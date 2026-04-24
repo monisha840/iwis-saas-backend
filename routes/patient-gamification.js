@@ -1,11 +1,22 @@
 import express from 'express';
-import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
+import { authMiddleware, roleMiddleware, resolvePatientId } from '../middleware/auth.js';
+import { requireFeature } from '../utils/featureGate.js';
 import { PatientGamificationController } from '../controllers/patientGamification.controller.js';
 
 const router = express.Router();
 
 // All routes require PATIENT role
-const patientAuth = [authMiddleware, roleMiddleware(['PATIENT'])];
+const patientAuth = [authMiddleware, roleMiddleware(['PATIENT']), resolvePatientId];
+
+// Path-prefix feature gates (one per sub-area). Auth must run first because the gate
+// reads req.user.hospitalId.
+router.use('/quests',         authMiddleware, requireFeature('HEALTH_QUESTS'));
+router.use('/avatar',         authMiddleware, requireFeature('HEALTH_AVATAR'));
+router.use('/family',         authMiddleware, requireFeature('FAMILY_LEADERBOARD'));
+router.use('/referral-stats', authMiddleware, requireFeature('REFERRAL_TIERS'));
+router.use('/social-proof',   authMiddleware, requireFeature('SOCIAL_PROOF'));
+router.use('/streaks',        authMiddleware, requireFeature('SOCIAL_PROOF'));
+router.use('/content',        authMiddleware, requireFeature('UNLOCKABLE_CONTENT'));
 
 // ── Health Quests ───────────────────────────────────────────────────────────
 

@@ -263,13 +263,52 @@ export class CareGapService {
 
     /**
      * Deduplication helper: check if a care gap alert was already sent within last 7 days.
+     * Also short-circuits if ANY care-gap notification was sent to this user in the last 24h
+     * so a single patient never receives > 1 gap alert per day across the 5 dimensions.
      */
     static async _hasRecentAlert(userId, type) {
         const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
         const existing = await prisma.notification.findFirst({
-            where: { userId, type, createdAt: { gte: sevenDaysAgo } },
+            where: {
+                userId,
+                OR: [
+                    { type, createdAt: { gte: sevenDaysAgo } },
+                    { type: { startsWith: 'CARE_GAP_' }, createdAt: { gte: oneDayAgo } },
+                ],
+            },
             select: { id: true },
         });
         return !!existing;
+    }
+
+    /**
+     * Atomic dedup + create: prevents concurrent runs from producing duplicate alerts.
+     * Returns the created notification or null if an alert was already sent recently.
+     */
+    static async _createAlertIfAbsent(payload) {
+        const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        try {
+            return await prisma.$transaction(async (tx) => {
+                const existing = await tx.notification.findFirst({
+                    where: { userId: payload.userId, type: payload.type, createdAt: { gte: sevenDaysAgo } },
+                    select: { id: true },
+                });
+                if (existing) return null;
+                return tx.notification.create({
+                    data: {
+                        userId: payload.userId,
+                        type: payload.type,
+                        title: payload.title,
+                        message: payload.message,
+                        priority: payload.priority || 'INFO',
+                        data: payload.data || {},
+                    },
+                });
+            }, { isolationLevel: 'Serializable' });
+        } catch (err) {
+            if (err?.code === 'P2002') return null;
+            throw err;
+        }
     }
 }

@@ -19,7 +19,6 @@ export const loginLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: 'Too many login attempts. Please try again in 15 minutes.' },
-    keyGenerator: (req) => req.ip,
 });
 
 // Token refresh - generous (called automatically every 15min per tab)
@@ -38,7 +37,6 @@ export const passwordResetLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: 'Too many password reset attempts. Please try again later.' },
-    keyGenerator: (req) => req.ip,
 });
 
 // Email verification resend - per-IP

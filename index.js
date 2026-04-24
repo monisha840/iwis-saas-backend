@@ -52,7 +52,32 @@ import patientGamificationRoutes from './routes/patient-gamification.js';
 import announcementRoutes from './routes/announcements.js';
 import handoffRoutes from './routes/handoff.js';
 import portalRoutes from './routes/portal.js';
+import enhancedDashboardRoutes from './routes/enhanced-dashboard.js';
+import prescribedVitalsRoutes from './routes/prescribed-vitals.js';
 import visitSummaryRoutes from './routes/visit-summary.js';
+import superAdminRoutes from './routes/super-admin.js';
+// IWIS competitor features
+import therapyRoomRoutes from './routes/therapyRoom.js';
+import dietPrescriptionRoutes from './routes/dietPrescription.js';
+import dietPackageRoutes from './routes/dietPackage.js';
+import clinicalPhotoRoutes from './routes/clinicalPhoto.js';
+import therapistSkillRoutes from './routes/therapistSkill.js';
+import treatmentPackageRoutes from './routes/treatmentPackage.js';
+import groupSessionRoutes from './routes/groupSession.js';
+// Billing disabled application-wide — invoice routes intentionally unmounted.
+// import invoiceRoutes from './routes/invoices.js';
+// Dashboard refactor
+import todoRoutes from './routes/todos.js';
+import dashboardSummaryRoutes from './routes/dashboard-summary.js';
+// Self-Examination Protocol (IWIS pre-consultation)
+import selfExamRoutes from './routes/self-exam.js';
+// Messaging templates + configurable daily reminder
+import messageTemplateRoutes from './routes/message-templates.js';
+import reminderSettingRoutes from './routes/reminder-settings.js';
+// Critical-journey: admin view of at-risk patients
+import criticalJourneyRoutes from './routes/critical-journey.js';
+// Inbound webhooks (Daily.co room-ended, etc.)
+import webhooksRoutes from './routes/webhooks.js';
 
 import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from './config/swagger.js';
@@ -78,7 +103,7 @@ app.use((req, res, next) => {
 app.use(cors({
   origin: config.cors.origins,
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
@@ -88,13 +113,17 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      scriptSrc: ["'self'", "'unsafe-inline'", "https://meet.jit.si"],
-      styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
-      imgSrc: ["'self'", "data:", "https:", "http:"],
-      connectSrc: ["'self'", "https://meet.jit.si", "wss://*.jit.si"],
-      fontSrc: ["'self'", "https://fonts.gstatic.com"],
-      objectSrc: ["'none'"],
-      mediaSrc: ["'self'", "https://*.youtube.com", "https://*.vimeo.com"],
+      // Video-call providers are allowed for script / iframe / connect so both
+      // Jitsi (fallback) and Daily.co (primary when DAILY_API_KEY is set) can
+      // embed inside ConsultationRoom.
+      scriptSrc:  ["'self'", "'unsafe-inline'", "https://meet.jit.si", "https://*.daily.co"],
+      styleSrc:   ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+      imgSrc:     ["'self'", "data:", "https:", "http:"],
+      connectSrc: ["'self'", "https://meet.jit.si", "wss://*.jit.si", "https://*.daily.co", "wss://*.daily.co"],
+      frameSrc:   ["'self'", "https://meet.jit.si", "https://*.daily.co"],
+      fontSrc:    ["'self'", "https://fonts.gstatic.com"],
+      objectSrc:  ["'none'"],
+      mediaSrc:   ["'self'", "https://*.youtube.com", "https://*.vimeo.com", "https://*.daily.co"],
       upgradeInsecureRequests: [],
     },
   },
@@ -177,7 +206,39 @@ app.use('/api/patient-gamification', patientGamificationRoutes);
 app.use('/api/announcements', announcementRoutes);
 app.use('/api/handoff', handoffRoutes);
 app.use('/api/portal', portalRoutes);
+app.use('/api/patient/dashboard', enhancedDashboardRoutes);
+app.use('/api/patients/:patientId/prescribed-vitals', prescribedVitalsRoutes);
 app.use('/api/visit-summary', visitSummaryRoutes);
+
+// IWIS competitor feature additions
+app.use('/api/therapy-rooms', therapyRoomRoutes);
+app.use('/api/diet-prescriptions', dietPrescriptionRoutes);
+app.use('/api/diet-packages', dietPackageRoutes);
+app.use('/api/clinical-photos', clinicalPhotoRoutes);
+app.use('/api/therapists', therapistSkillRoutes);
+app.use('/api/packages', treatmentPackageRoutes);
+app.use('/api/group-sessions', groupSessionRoutes);
+// app.use('/api/invoices', invoiceRoutes); // billing disabled
+
+// Dashboard refactor
+app.use('/api/todos', todoRoutes);
+app.use('/api/dashboards', dashboardSummaryRoutes);
+
+// Self-Examination Protocol (IWIS pre-consultation)
+app.use('/api/self-exam', selfExamRoutes);
+app.use('/api/message-templates', messageTemplateRoutes);
+app.use('/api/reminder-settings', reminderSettingRoutes);
+
+// Critical-journey — admin view of at-risk patients (feature-gated)
+app.use('/api/critical-journey', criticalJourneyRoutes);
+
+// Inbound webhooks (Daily.co room-ended → auto-complete appointment, etc.)
+// Route uses express.raw() internally for HMAC verification — scoped local
+// to the /daily handler so the global JSON parser doesn't reach it.
+app.use('/api/webhooks', webhooksRoutes);
+
+// Super Admin (platform-level) — mounted separately; its own auth chain.
+app.use('/api/super-admin', superAdminRoutes);
 
 // Bull Board admin dashboard — admin-only (lazy: only mounts if queues are available)
 import { authMiddleware as authMw, roleMiddleware as roleMw } from './middleware/auth.js';
@@ -230,8 +291,29 @@ initScheduledJobs().catch(err => logger.error('Scheduled jobs init failed', err)
 // Seed default feature flags (idempotent — safe to run every startup)
 FeatureFlagService.seedDefaults().catch(err => logger.error('Feature flag seed failed', err));
 
-httpServer.listen(PORT, () => {
+httpServer.listen(PORT, async () => {
   logger.info(`Backend server running on port ${PORT}`, { env: process.env.NODE_ENV });
   logger.info('WebSocket server initialized');
   logger.info('Scheduler service running');
+
+  // Prominently surface Redis state at startup. When Redis is unavailable,
+  // several features degrade silently (BullMQ → node-cron, Bull Board hidden,
+  // JTI blacklist best-effort, no horizontal scaling). Make the operator aware.
+  try {
+    const { cacheService } = await import('./services/cache.service.js');
+    // Give the client a beat to attempt its initial connection.
+    await new Promise(r => setTimeout(r, 500));
+    const { connected, circuitOpen } = cacheService.getStatus();
+    if (connected && !circuitOpen) {
+      logger.info('[Redis] ✅ Connected — BullMQ + circuit breaker + JTI blacklist active');
+    } else {
+      logger.warn(
+        '[Redis] ⚠️ NOT CONNECTED — scheduled jobs fall back to in-process node-cron, ' +
+        'Bull Board unavailable, JTI blacklist disabled, horizontal scaling won\'t work. ' +
+        'Set REDIS_URL in .env (default redis://localhost:6379) and start a Redis service.',
+      );
+    }
+  } catch (err) {
+    logger.warn('[Redis] state check failed:', err.message);
+  }
 });

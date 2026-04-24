@@ -36,8 +36,19 @@ export class FeedbackService {
             err.status = 403;
             throw err;
         }
-        if (appointment.status !== 'COMPLETED') {
-            const err = new Error('Feedback can only be submitted for completed appointments');
+        // Feedback is accepted once the appointment start time has passed,
+        // as long as it wasn't cancelled / marked no-show. This avoids the
+        // dead-end where a clinician forgets to mark the visit COMPLETED.
+        const startedAt = appointment.date ? new Date(appointment.date).getTime() : null;
+        const startHasPassed = startedAt && startedAt <= Date.now();
+        const blockedStatuses = ['CANCELLED', 'NO_SHOW'];
+        if (!startHasPassed) {
+            const err = new Error('Feedback can only be submitted after the appointment start time');
+            err.status = 400;
+            throw err;
+        }
+        if (blockedStatuses.includes(appointment.status)) {
+            const err = new Error('Feedback is not available for cancelled or no-show appointments');
             err.status = 400;
             throw err;
         }

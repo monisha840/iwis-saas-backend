@@ -3,34 +3,40 @@ import logger from '../lib/logger.js';
 import { emitToUser } from '../websocket/index.js';
 import { userNameSelect, flattenUserName } from '../lib/userName.js';
 
+const BRANCH_SELECT = { select: { id: true, name: true } };
+
 export class AnnouncementService {
   /**
    * Create a new announcement and notify relevant users via socket.
+   * `branchIds` empty/undefined = broadcast to all branches.
    */
-  static async createAnnouncement(authorId, { branchId, title, message, priority, targetRoles, isPinned, expiresAt }) {
-    logger.info(`Creating announcement`, { authorId, branchId, title, priority });
+  static async createAnnouncement(authorId, { branchIds, title, message, priority, targetRoles, isPinned, expiresAt }) {
+    const ids = Array.isArray(branchIds) ? branchIds.filter(Boolean) : [];
+    logger.info(`Creating announcement`, { authorId, branchIds: ids, title, priority });
 
     const announcement = await prisma.announcement.create({
       data: {
         authorId,
-        branchId: branchId || null,
         title,
         message,
         priority: priority || 'NORMAL',
         targetRoles: targetRoles || [],
         isPinned: isPinned || false,
         expiresAt: expiresAt ? new Date(expiresAt) : null,
+        ...(ids.length > 0
+          ? { branches: { connect: ids.map((id) => ({ id })) } }
+          : {}),
       },
       include: {
         author: { select: userNameSelect },
-        branch: { select: { id: true, name: true } },
+        branches: BRANCH_SELECT,
       },
     });
 
-    // Find all relevant users to notify
+    // Pick who to notify
     const userWhere = {};
-    if (branchId) {
-      userWhere.branchId = branchId;
+    if (ids.length > 0) {
+      userWhere.branchId = { in: ids };
     }
     if (targetRoles && targetRoles.length > 0) {
       userWhere.role = { in: targetRoles };
@@ -53,21 +59,32 @@ export class AnnouncementService {
   /**
    * Get announcements visible to a user (matching branch + role), with read status.
    * Pinned first, then by createdAt desc. Excludes expired.
+   *
+   * Visibility rules:
+   *   - Author always sees their own.
+   *   - Announcement with no branches = broadcast → everyone in the hospital sees it.
+   *   - Announcement with branches set = only users whose branch is in the set (admins see all in their hospital).
    */
-  static async getAnnouncements(userId, userRole, userBranchId, { page = 1, limit = 20 } = {}) {
+  static async getAnnouncements(userId, userRole, userBranchId, userHospitalId, { page = 1, limit = 20 } = {}) {
     const currentPage = Math.max(1, parseInt(page) || 1);
     const take = Math.min(parseInt(limit) || 20, 100);
     const skip = (currentPage - 1) * take;
 
     const now = new Date();
 
+    const isAdmin = userRole === 'ADMIN' || userRole === 'ADMIN_DOCTOR';
+    const branchMatchers = [
+      { branches: { none: {} } },       // broadcast
+      { authorId: userId },              // self
+    ];
+    if (isAdmin && userHospitalId) {
+      branchMatchers.push({ branches: { some: { hospitalId: userHospitalId } } });
+    } else if (userBranchId) {
+      branchMatchers.push({ branches: { some: { id: userBranchId } } });
+    }
+
     const where = {
-      // Branch: global (null) or user's branch
-      OR: [
-        { branchId: null },
-        { branchId: userBranchId },
-      ],
-      // Not expired
+      OR: branchMatchers,
       AND: [
         {
           OR: [
@@ -83,7 +100,7 @@ export class AnnouncementService {
         where,
         include: {
           author: { select: userNameSelect },
-          branch: { select: { id: true, name: true } },
+          branches: BRANCH_SELECT,
           reads: {
             where: { userId },
             select: { readAt: true },
@@ -167,7 +184,8 @@ export class AnnouncementService {
   }
 
   /**
-   * Update an announcement's title, message, priority, or pinned status.
+   * Update an announcement's title, message, priority, pinned status, roles,
+   * expiry, or branch targeting.
    */
   static async updateAnnouncement(announcementId, data) {
     const updateData = {};
@@ -177,13 +195,17 @@ export class AnnouncementService {
     if (data.isPinned !== undefined) updateData.isPinned = data.isPinned;
     if (data.targetRoles !== undefined) updateData.targetRoles = data.targetRoles;
     if (data.expiresAt !== undefined) updateData.expiresAt = data.expiresAt ? new Date(data.expiresAt) : null;
+    if (Array.isArray(data.branchIds)) {
+      const ids = data.branchIds.filter(Boolean);
+      updateData.branches = { set: ids.map((id) => ({ id })) };
+    }
 
     const updated = await prisma.announcement.update({
       where: { id: announcementId },
       data: updateData,
       include: {
         author: { select: userNameSelect },
-        branch: { select: { id: true, name: true } },
+        branches: BRANCH_SELECT,
       },
     });
     return { ...updated, author: flattenUserName(updated.author) };

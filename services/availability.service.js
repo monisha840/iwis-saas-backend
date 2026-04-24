@@ -126,7 +126,7 @@ export class AvailabilityService {
         });
 
         const newDateObj = date ? new Date(date) : null;
-        const newDay = dayOfWeek !== undefined ? parseInt(dayOfWeek) : (newDateObj ? newDateObj.getDay() : null);
+        const newDay = dayOfWeek !== undefined ? parseInt(dayOfWeek) : (newDateObj ? newDateObj.getUTCDay() : null);
 
         for (const block of candidates) {
             let matchesDay = false;
@@ -139,10 +139,10 @@ export class AvailabilityService {
                 matchesDay = parseInt(dayOfWeek) === block.dayOfWeek;
             } else if (date && block.dayOfWeek !== null) {
                 // New is specific, existing is recurring
-                matchesDay = new Date(date).getDay() === block.dayOfWeek;
+                matchesDay = new Date(date).getUTCDay() === block.dayOfWeek;
             } else if (dayOfWeek !== undefined && block.date) {
                 // New is recurring, existing is specific
-                matchesDay = new Date(block.date).getDay() === parseInt(dayOfWeek);
+                matchesDay = new Date(block.date).getUTCDay() === parseInt(dayOfWeek);
             }
 
             if (matchesDay) {
@@ -173,6 +173,35 @@ export class AvailabilityService {
                 { startTime: 'asc' }
             ]
         });
+    }
+
+    /**
+     * Resolve a User.id to the clinician-level id used by BlockedSlot
+     * (Doctor.id or Therapist.id) so callers that only have the User.id can
+     * still hit `checkAvailability`. Returns `{ clinicianId, role }` or null
+     * when the user has no clinician profile (ADMIN, PHARMACIST, PATIENT).
+     */
+    static async resolveClinicianForUser(userId) {
+        const [doctor, therapist] = await Promise.all([
+            prisma.doctor.findUnique({    where: { userId }, select: { id: true } }),
+            prisma.therapist.findUnique({ where: { userId }, select: { id: true } }),
+        ]);
+        if (doctor)    return { clinicianId: doctor.id,    role: 'DOCTOR' };
+        if (therapist) return { clinicianId: therapist.id, role: 'THERAPIST' };
+        return null;
+    }
+
+    /**
+     * Same contract as `checkAvailability` but accepts a User.id — resolves
+     * to Doctor.id / Therapist.id internally. Useful for resource-sharing,
+     * where the share row references User.id.
+     */
+    static async checkAvailabilityForUser(userId, dateString, startTime, endTime) {
+        const resolved = await this.resolveClinicianForUser(userId);
+        if (!resolved) {
+            return { available: false, reason: 'User has no clinician profile' };
+        }
+        return this.checkAvailability(resolved.clinicianId, dateString, startTime, endTime);
     }
 
     static async checkAvailability(clinicianId, dateString, startTime, endTime) {

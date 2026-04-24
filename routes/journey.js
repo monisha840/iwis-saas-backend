@@ -1,10 +1,39 @@
 import express from 'express';
 import { z } from 'zod';
+import prisma from '../lib/prisma.js';
 import { JourneyService } from '../services/journey.service.js';
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
 
 const router = express.Router();
+
+const CLINICAL_ROLES = ['DOCTOR', 'ADMIN_DOCTOR', 'THERAPIST', 'ADMIN'];
+const VIEW_ROLES = [...CLINICAL_ROLES, 'PATIENT'];
+
+// A patient is allowed to view only their own journey.
+async function enforcePatientJourneyOwnership(req, res, next) {
+  if (req.user.role !== 'PATIENT') return next();
+  try {
+    // Journey.patientId points at User.id (see schema — TreatmentJourney.patientId → User)
+    const journey = await prisma.treatmentJourney.findUnique({
+      where: { id: req.params.id },
+      select: { patientId: true },
+    });
+    if (!journey || journey.patientId !== req.user.id) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    next();
+  } catch (err) { next(err); }
+}
+
+async function enforcePatientIdMatch(req, res, next) {
+  if (req.user.role !== 'PATIENT') return next();
+  // For GET /patient/:patientId we expect patientId = User.id (TreatmentJourney uses User.id)
+  if (req.params.patientId !== req.user.id) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  next();
+}
 
 // POST /api/journeys — Doctor creates a journey
 const createJourneySchema = z.object({
@@ -47,20 +76,30 @@ router.post('/',
 );
 
 // GET /api/journeys/patient/:patientId
-router.get('/patient/:patientId', authMiddleware, async (req, res, next) => {
-    try {
-        const journeys = await JourneyService.getPatientJourneys(req.params.patientId);
-        res.json(journeys);
-    } catch (err) { next(err); }
-});
+router.get('/patient/:patientId',
+    authMiddleware,
+    roleMiddleware(VIEW_ROLES),
+    enforcePatientIdMatch,
+    async (req, res, next) => {
+        try {
+            const journeys = await JourneyService.getPatientJourneys(req.params.patientId);
+            res.json(journeys);
+        } catch (err) { next(err); }
+    }
+);
 
 // GET /api/journeys/:id — journey detail
-router.get('/:id', authMiddleware, async (req, res, next) => {
-    try {
-        const journey = await JourneyService.getJourneyById(req.params.id);
-        res.json(journey);
-    } catch (err) { next(err); }
-});
+router.get('/:id',
+    authMiddleware,
+    roleMiddleware(VIEW_ROLES),
+    enforcePatientJourneyOwnership,
+    async (req, res, next) => {
+        try {
+            const journey = await JourneyService.getJourneyById(req.params.id);
+            res.json(journey);
+        } catch (err) { next(err); }
+    }
+);
 
 // POST /api/journeys/:id/phases — add phase
 const addPhaseSchema = z.object({

@@ -1,6 +1,7 @@
 import express from 'express';
 import { z } from 'zod';
 import { AppointmentService } from '../services/appointment.service.js';
+import { FollowUpService, FOLLOWUP_INTERVALS } from '../services/followUp.service.js';
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
 import { auditAction, auditDelete } from '../middleware/auditLog.js';
@@ -19,6 +20,8 @@ const VALID_STATUS_TRANSITIONS = {
 
 const router = express.Router();
 
+const channelEnum = z.enum(['WHATSAPP', 'SMS', 'EMAIL', 'IN_APP']);
+
 const appointmentSchema = z.object({
   patientId: z.string().optional(),
   doctorId: z.string().nullable().optional(),
@@ -34,7 +37,25 @@ const appointmentSchema = z.object({
     fullName: z.string().min(2),
     phoneNumber: z.string(),
     email: z.string().email()
-  }).optional()
+  }).optional(),
+  // Optional per-appointment reminder template attached at booking time.
+  customReminderTemplateId: z.string().nullable().optional(),
+  customReminderBody: z.string().nullable().optional(),
+  customReminderSubject: z.string().nullable().optional(),
+  customReminderChannels: z.array(channelEnum).optional()
+});
+
+const reminderTemplatePatchSchema = z.object({
+  templateId: z.string().nullable().optional(),
+  body: z.string().nullable().optional(),
+  subject: z.string().nullable().optional(),
+  channels: z.array(channelEnum).optional()
+});
+
+const followUpSchema = z.object({
+  interval: z.enum(FOLLOWUP_INTERVALS),
+  daysOffset: z.number().int().min(1).max(365).optional().nullable(),
+  notes: z.string().max(500).optional().nullable(),
 });
 
 const updateAppointmentSchema = z.object({
@@ -43,7 +64,10 @@ const updateAppointmentSchema = z.object({
   notes: z.string().optional(),
   doctorId: z.string().nullable().optional(),
   therapistId: z.string().nullable().optional(),
-  therapistDate: z.string().nullable().optional()
+  therapistDate: z.string().nullable().optional(),
+  // Required alongside status=COMPLETED unless a follow-up row already
+  // exists for the appointment (validated server-side by the service).
+  followUp: followUpSchema.optional(),
 });
 
 /**
@@ -233,6 +257,54 @@ router.get('/slots', authMiddleware, async (req, res, next) => {
       req.query.branchId
     );
     res.json(slots);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH /api/appointments/:id/reminder-template — attach or edit the per-appointment
+// custom reminder message. Editable any time until the appointment is COMPLETED.
+router.patch(
+  '/:id/reminder-template',
+  authMiddleware,
+  roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST']),
+  validate({ body: reminderTemplatePatchSchema }),
+  auditAction('UPDATE_APPOINTMENT_REMINDER', 'Appointment', (req) => req.params.id),
+  async (req, res, next) => {
+    try {
+      const updated = await AppointmentService.updateReminderTemplate(req.params.id, req.user, req.body);
+      res.json({ data: updated });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// ── Follow-up schedule endpoints ────────────────────────────────────────
+// Fetch the follow-up decision attached to a specific appointment. Any
+// authenticated clinician/admin (or the owning patient — checked
+// downstream) can read this for the consultation-room UI, patient
+// portal history, or dashboard cards.
+router.get('/:id/follow-up', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST', 'PATIENT']), async (req, res, next) => {
+  try {
+    const followUp = await FollowUpService.getForAppointment(req.params.id);
+    if (!followUp) return res.status(404).json({ error: 'No follow-up assigned to this appointment' });
+    res.json({ data: followUp });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Ad-hoc create/update of a follow-up WITHOUT flipping status (e.g. a
+// doctor decides on the follow-up plan before marking the appointment
+// COMPLETED, or edits the plan after the fact). Accepts the same
+// payload shape as the PUT /:id completion flow.
+const attachFollowUpSchema = z.object({ followUp: followUpSchema });
+
+router.put('/:id/follow-up', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST']), validate({ body: attachFollowUpSchema }), auditAction('ATTACH_APPOINTMENT_FOLLOWUP', 'Appointment', (req) => req.params.id), async (req, res, next) => {
+  try {
+    const saved = await AppointmentService.attachFollowUp(req.params.id, req.user, req.body.followUp);
+    res.json({ data: saved });
   } catch (err) {
     next(err);
   }

@@ -32,7 +32,7 @@ export class TimelineService {
                 include: {
                     doctor:   { select: { fullName: true, specialization: true } },
                     therapist:{ select: { fullName: true, specialization: true } },
-                    triageSession: { select: { severity: true, suggestedSpecialty: true, triageScore: true } },
+                    triageSession: { select: { severity: true, suggestedSpecialty: true, compositeScore: true } },
                 },
                 orderBy: { date: 'desc' },
             }),

@@ -48,19 +48,27 @@ export class OperationsController {
     static async approveSharingRequest(req, res, next) {
         try {
             const record = await ResourceSharingService.approveSharingRequest(
-                req.params.id, req.user.id
+                req.params.id,
+                { id: req.user.id, role: req.user.role, branchId: req.user.branchId || null },
             );
             res.json(record);
-        } catch (err) { next(err); }
+        } catch (err) {
+            if (err.status) return res.status(err.status).json({ error: err.message });
+            next(err);
+        }
     }
 
     static async rejectSharingRequest(req, res, next) {
         try {
             const record = await ResourceSharingService.rejectSharingRequest(
-                req.params.id, req.user.id
+                req.params.id,
+                { id: req.user.id, role: req.user.role, branchId: req.user.branchId || null },
             );
             res.json(record);
-        } catch (err) { next(err); }
+        } catch (err) {
+            if (err.status) return res.status(err.status).json({ error: err.message });
+            next(err);
+        }
     }
 
     // ── Centralized Inventory ───────────────────────────────────────────────────

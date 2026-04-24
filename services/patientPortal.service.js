@@ -7,151 +7,9 @@ const withLegacyUserName = (p) =>
   p ? { ...p, user: { name: p.fullName ?? null } } : null;
 
 export class PatientPortalService {
-  /**
-   * Get the patient dashboard with aggregated data from multiple sources.
-   */
-  static async getDashboard(patientId, userId) {
-    logger.info(`Fetching patient dashboard`, { patientId, userId });
-
-    const now = new Date();
-
-    const [
-      upcomingAppointments,
-      recentPrescriptions,
-      activeJourneys,
-      completedJourneys,
-      unreadNotifications,
-      patient,
-      healthAvatar,
-      recentDocuments,
-    ] = await Promise.all([
-      // Next 5 upcoming appointments
-      prisma.appointment.findMany({
-        where: {
-          patientId,
-          status: { in: ['PENDING', 'SCHEDULED', 'CONFIRMED'] },
-          date: { gte: now },
-        },
-        include: {
-          doctor: { select: { id: true, fullName: true } },
-          therapist: { select: { id: true, fullName: true } },
-          branch: { select: { id: true, name: true } },
-        },
-        orderBy: { date: 'asc' },
-        take: 5,
-      }),
-
-      // Last 10 prescriptions
-      prisma.prescription.findMany({
-        where: { patientId },
-        include: {
-          doctor: { select: { id: true, fullName: true } },
-          therapist: { select: { id: true, fullName: true } },
-        },
-        orderBy: { createdAt: 'desc' },
-        take: 10,
-      }),
-
-      // Active treatment journeys
-      prisma.treatmentJourney.findMany({
-        where: { patientId: userId, status: 'ACTIVE' },
-        include: {
-          phases: {
-            orderBy: { order: 'asc' },
-            select: { id: true, name: true, status: true, order: true },
-          },
-        },
-      }),
-
-      // Completed treatment journeys count
-      prisma.treatmentJourney.count({
-        where: { patientId: userId, status: 'COMPLETED' },
-      }),
-
-      // Unread notifications count
-      prisma.notification.count({
-        where: { userId, isRead: false },
-      }),
-
-      // Patient record with zen points and streak
-      prisma.patient.findUnique({
-        where: { id: patientId },
-        select: {
-          zenPoints: true,
-          patientStreak: {
-            select: { currentStreak: true, longestStreak: true },
-          },
-        },
-      }),
-
-      // Health avatar
-      prisma.healthAvatar.findUnique({
-        where: { patientId },
-        select: {
-          id: true,
-          avatarType: true,
-          name: true,
-          level: true,
-          health: true,
-          happiness: true,
-          xp: true,
-          appearance: true,
-        },
-      }),
-
-      // Recent documents
-      prisma.document.findMany({
-        where: { patientId },
-        orderBy: { createdAt: 'desc' },
-        take: 5,
-        select: {
-          id: true,
-          fileName: true,
-          fileType: true,
-          category: true,
-          createdAt: true,
-        },
-      }),
-    ]);
-
-    // Calculate wellness score from active journeys
-    const avgWellness = activeJourneys.length > 0
-      ? activeJourneys.reduce((sum, j) => sum + j.wellnessScore, 0) / activeJourneys.length
-      : 0;
-
-    // Determine zen level from points
-    const zenPoints = patient?.zenPoints || 0;
-    const zenLevel = Math.floor(zenPoints / 100) + 1;
-
-    const appointmentsWithLegacy = upcomingAppointments.map((a) => ({
-      ...a,
-      doctor: withLegacyUserName(a.doctor),
-      therapist: withLegacyUserName(a.therapist),
-    }));
-    const prescriptionsWithLegacy = recentPrescriptions.map((p) => ({
-      ...p,
-      doctor: withLegacyUserName(p.doctor),
-      therapist: withLegacyUserName(p.therapist),
-    }));
-
-    return {
-      upcomingAppointments: appointmentsWithLegacy,
-      recentPrescriptions: prescriptionsWithLegacy,
-      treatmentProgress: {
-        activeJourneys: activeJourneys.length,
-        completedJourneys,
-        wellnessScore: Math.round(avgWellness * 10) / 10,
-      },
-      unreadNotifications,
-      zenProfile: {
-        zenPoints,
-        level: zenLevel,
-        streak: patient?.patientStreak?.currentStreak || 0,
-      },
-      avatar: healthAvatar,
-      recentDocuments,
-    };
-  }
+  // getDashboard() removed — superseded by EnhancedDashboardService.getSummary
+  // (`/api/patient/dashboard/summary`). Patient Portal now serves the records
+  // archive only: appointments / prescriptions / documents / visit summaries.
 
   /**
    * Get paginated prescription history with doctor info.
@@ -213,18 +71,26 @@ export class PatientPortalService {
 
   /**
    * Get visit summaries and documents for a patient.
+   * Both lists are paginated independently (same page/limit applied to each).
    */
-  static async getMyReports(patientId) {
-    const [visitSummaries, documents] = await Promise.all([
+  static async getMyReports(patientId, { page = 1, limit = 20 } = {}) {
+    const currentPage = Math.max(1, parseInt(page) || 1);
+    const take = Math.min(parseInt(limit) || 20, 100);
+    const skip = (currentPage - 1) * take;
+
+    const [vsRows, vsTotal, docRows, docTotal] = await Promise.all([
       prisma.visitSummary.findMany({
         where: { patientId, sentToPatient: true },
         include: {
           appointment: {
-            select: { date: true, consultationType: true },
+            select: { id: true, date: true, consultationType: true },
           },
         },
         orderBy: { createdAt: 'desc' },
+        skip,
+        take,
       }),
+      prisma.visitSummary.count({ where: { patientId, sentToPatient: true } }),
       prisma.document.findMany({
         where: { patientId },
         orderBy: { createdAt: 'desc' },
@@ -237,10 +103,79 @@ export class PatientPortalService {
           description: true,
           createdAt: true,
         },
+        skip,
+        take,
       }),
+      prisma.document.count({ where: { patientId } }),
     ]);
 
-    return { visitSummaries, documents };
+    const buildPagination = (total) => ({
+      page: currentPage,
+      limit: take,
+      total,
+      totalPages: Math.ceil(total / take),
+    });
+
+    return {
+      visitSummaries: { data: vsRows, pagination: buildPagination(vsTotal) },
+      documents: { data: docRows, pagination: buildPagination(docTotal) },
+    };
+  }
+
+  /**
+   * Paginated full appointment history for the patient. Optional `status`
+   * filter accepts a single status string (e.g. COMPLETED) or one of the
+   * synthetic groups: "UPCOMING" (PENDING/SCHEDULED/CONFIRMED) or "PAST"
+   * (COMPLETED/NO_SHOW/CANCELLED).
+   */
+  static async getMyAppointmentHistory(patientId, { page = 1, limit = 20, status } = {}) {
+    const currentPage = Math.max(1, parseInt(page) || 1);
+    const take = Math.min(parseInt(limit) || 20, 100);
+    const skip = (currentPage - 1) * take;
+
+    const where = { patientId };
+    if (status) {
+      const upper = String(status).toUpperCase();
+      if (upper === 'UPCOMING') {
+        where.status = { in: ['PENDING', 'SCHEDULED', 'CONFIRMED'] };
+      } else if (upper === 'PAST') {
+        where.status = { in: ['COMPLETED', 'NO_SHOW', 'CANCELLED'] };
+      } else if (upper !== 'ALL') {
+        where.status = upper;
+      }
+    }
+
+    const [rows, total] = await Promise.all([
+      prisma.appointment.findMany({
+        where,
+        include: {
+          doctor: { select: { id: true, fullName: true } },
+          therapist: { select: { id: true, fullName: true } },
+          branch: { select: { id: true, name: true } },
+          visitSummary: { select: { id: true, sentToPatient: true } },
+        },
+        orderBy: { date: 'desc' },
+        skip,
+        take,
+      }),
+      prisma.appointment.count({ where }),
+    ]);
+
+    const data = rows.map((a) => ({
+      ...a,
+      doctor: withLegacyUserName(a.doctor),
+      therapist: withLegacyUserName(a.therapist),
+    }));
+
+    return {
+      data,
+      pagination: {
+        page: currentPage,
+        limit: take,
+        total,
+        totalPages: Math.ceil(total / take),
+      },
+    };
   }
 
   /**

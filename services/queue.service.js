@@ -65,30 +65,42 @@ async function ensureQueues() {
 
     // ── Workers ──────────────────────────────────────────────────────────────
     const notificationWorker = new Worker('notifications', async (job) => {
-      if (job.name === 'webhook') {
-        const { url, payload, secret, appointmentId } = job.data;
-        logger.info('[Queue:notifications] Processing webhook job', { jobId: job.id, appointmentId });
-        const response = await fetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'X-Webhook-Secret': secret },
-          body: JSON.stringify(payload),
-        });
-        if (!response.ok) {
-          const body = await response.text();
-          throw new Error(`Webhook failed (${response.status}): ${body}`);
+      if (job.name === 'whatsapp') {
+        const { number, text, appointmentId } = job.data;
+        logger.info('[Queue:notifications] Processing WhatsApp job', { jobId: job.id, appointmentId });
+        const { WhatsAppService } = await import('./whatsapp.service.js');
+        const result = await WhatsAppService.sendText(number, text);
+        if (result.status === 'FAILED') {
+          throw new Error(`WhatsApp send failed: ${result.error || 'unknown'}`);
         }
-        return { status: response.status };
+        return result;
       }
 
       if (job.name === 'in-app') {
-        const { userId, title, body, type, relatedId } = job.data;
+        const { userId, title, body, type, relatedId, idempotencyKey } = job.data;
         logger.info('[Queue:notifications] Processing in-app notification', { jobId: job.id, userId });
         const { default: prisma } = await import('../lib/prisma.js');
         const { emitToUser } = await import('../websocket/index.js');
+
+        // Retry-safe: if a previous attempt already created the row, short-circuit.
+        if (idempotencyKey) {
+          const existing = await prisma.notification.findFirst({
+            where: {
+              userId,
+              type: type || 'GENERAL',
+              data: { path: ['idempotencyKey'], equals: idempotencyKey },
+            },
+            select: { id: true },
+          });
+          if (existing) return { notificationId: existing.id, dedup: true };
+        }
+
         const notification = await prisma.notification.create({
           data: {
             userId, title, message: body, type: type || 'GENERAL',
-            priority: 'INFO', data: {}, ...(relatedId && { relatedId }),
+            priority: 'INFO',
+            data: idempotencyKey ? { idempotencyKey } : {},
+            ...(relatedId && { relatedId }),
           },
         });
         emitToUser(userId, 'notification', notification);
@@ -135,17 +147,15 @@ export const reportQueue = { add: (...args) => _reportQueue?.add(...args) };
 
 // ── Helper functions ────────────────────────────────────────────────────────
 
-export async function enqueueAppointmentWebhook(appointmentId, payload) {
+export async function enqueueAppointmentWhatsApp(appointmentId, { number, text }) {
   if (!_notificationQueue) {
-    logger.warn('[QueueService] Queue unavailable — skipping webhook enqueue');
+    logger.warn('[QueueService] Queue unavailable — skipping WhatsApp enqueue');
     return null;
   }
-  const job = await _notificationQueue.add('webhook', {
-    url: config.notifications.n8nWebhookUrl,
-    secret: config.notifications.webhookSecret,
-    payload, appointmentId,
-  }, { ...defaultJobOptions, jobId: `webhook:${appointmentId}` });
-  logger.info('[QueueService] Enqueued appointment webhook', { jobId: job.id, appointmentId });
+  const job = await _notificationQueue.add('whatsapp', {
+    number, text, appointmentId,
+  }, { ...defaultJobOptions, jobId: `whatsapp:${appointmentId}` });
+  logger.info('[QueueService] Enqueued appointment WhatsApp', { jobId: job.id, appointmentId });
   return job.id;
 }
 

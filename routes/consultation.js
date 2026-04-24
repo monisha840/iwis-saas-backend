@@ -48,9 +48,12 @@ router.post('/session/:appointmentId/notes', authMiddleware, roleMiddleware(['TH
     }
 });
 
-router.post('/session/:appointmentId/complete', authMiddleware, roleMiddleware(['THERAPIST']), async (req, res, next) => {
+router.post('/session/:appointmentId/complete', authMiddleware, roleMiddleware(['THERAPIST', 'DOCTOR', 'ADMIN_DOCTOR', 'ADMIN']), async (req, res, next) => {
     try {
-        const data = await ConsultationService.completeSession(req.params.appointmentId);
+        const data = await ConsultationService.completeSession(req.params.appointmentId, {
+            user: req.user,
+            followUp: req.body?.followUp,
+        });
         res.json(data);
     } catch (err) {
         next(err);

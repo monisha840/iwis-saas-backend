@@ -2,6 +2,33 @@ import prisma from '../lib/prisma.js';
 import bcrypt from 'bcrypt';
 import logger from '../lib/logger.js';
 
+// AyurvedicSkill enum values — used to seed TherapistSkill rows when a
+// therapist is created. Kept in sync with the Prisma enum (schema.prisma).
+const THERAPIST_SKILLS = new Set([
+    'ABHYANGA', 'SHIRODHARA', 'PANCHAKARMA_GENERAL', 'BASTI', 'VIRECHANA',
+    'NASYA', 'KIZHI', 'NJAVARA', 'PIZHICHIL', 'MARMA_THERAPY', 'YOGA_THERAPY', 'NATUROPATHY',
+]);
+
+// Canonical gender values stored in DB. Legacy rows may be lowercase/mixed-case;
+// canonicaliseGender() maps them to the canonical uppercase form on read/write.
+const CANONICAL_GENDERS = new Set(['FEMALE', 'MALE', 'OTHER', 'PREFER_NOT_TO_SAY']);
+function normaliseGender(input) {
+    if (!input) return null;
+    const upper = String(input).trim().toUpperCase().replace(/\s+/g, '_');
+    if (CANONICAL_GENDERS.has(upper)) return upper;
+    // Accept a handful of common free-form variants without failing the write.
+    if (upper === 'F' || upper === 'WOMAN') return 'FEMALE';
+    if (upper === 'M' || upper === 'MAN')   return 'MALE';
+    return upper; // unknown — keep but canonicalised to upper
+}
+
+// Compute age (integer years) from a DOB string or Date. Returns null for invalid input.
+function computeAge(dob) {
+    if (!dob) return null;
+    const d = dob instanceof Date ? dob : new Date(dob);
+    if (Number.isNaN(d.getTime())) return null;
+    return Math.floor((Date.now() - d.getTime()) / (365.25 * 24 * 60 * 60 * 1000));
+}
 
 export class UserService {
     static async listTherapists({ search = '', branchId = null } = {}) {
@@ -191,69 +218,212 @@ export class UserService {
     static async getCurrentUser(userId) {
         const user = await prisma.user.findUnique({
             where: { id: userId },
+            include: {
+                doctor: true, therapist: true, patient: true, pharmacist: true,
+                branch: { select: { id: true, name: true, address: true } },
+                hospital: { select: { id: true, name: true, slug: true, plan: true } },
+            },
+        });
+        if (!user) throw new Error('User not found');
+
+        // Derive age from dob so the API never returns a stale value. The stored
+        // patient.age column is kept for query convenience but should never be
+        // trusted as the source of truth.
+        const patientPayload = user.patient
+            ? {
+                ...user.patient,
+                onboardingCompleted: user.patient.onboardingCompleted,
+                age: computeAge(user.patient.dob) ?? user.patient.age ?? null,
+            }
+            : null;
+
+        return {
+            id: user.id,
+            email: user.email,
+            role: user.role,
+            createdAt: user.createdAt,
+            emailVerifiedAt: user.emailVerifiedAt,
+            mfaEnabled: user.mfaEnabled,
+            branch: user.branch,
+            hospital: user.hospital,
+            doctor: user.doctor,
+            therapist: user.therapist,
+            pharmacist: user.pharmacist,
+            patient: patientPayload,
+        };
+    }
+
+    /**
+     * Self-service profile update. Whitelisted fields only — role/branch/email
+     * are identity/tenancy-level and require an admin.
+     */
+    static async updateMe(userId, data) {
+        const user = await prisma.user.findUnique({
+            where: { id: userId },
             include: { doctor: true, therapist: true, patient: true, pharmacist: true },
         });
         if (!user) throw new Error('User not found');
-        return {
-            id: user.id, email: user.email, role: user.role,
-            doctor: user.doctor, therapist: user.therapist, pharmacist: user.pharmacist,
-            patient: user.patient ? { ...user.patient, onboardingCompleted: user.patient.onboardingCompleted } : null,
-        };
+
+        const {
+            fullName, phoneNumber, profilePhoto, clinic,
+            dob, gender: rawGender, therapyType,
+        } = data || {};
+        const gender = rawGender !== undefined ? normaliseGender(rawGender) : undefined;
+
+        // Phone shape check — mirrors the appointment contact-details rule.
+        if (phoneNumber && !/^\+?[0-9]{7,15}$/.test(phoneNumber.replace(/[\s-]/g, ''))) {
+            const err = new Error('Invalid phone number format'); err.status = 400; throw err;
+        }
+
+        await prisma.$transaction(async (tx) => {
+            if ((user.role === 'DOCTOR' || user.role === 'ADMIN_DOCTOR') && user.doctor) {
+                await tx.doctor.update({
+                    where: { id: user.doctor.id },
+                    data: {
+                        ...(fullName !== undefined && { fullName }),
+                        ...(clinic !== undefined && { clinic: clinic || null }),
+                        ...(profilePhoto !== undefined && { profilePhoto: profilePhoto || null }),
+                    },
+                });
+            } else if (user.role === 'THERAPIST' && user.therapist) {
+                await tx.therapist.update({
+                    where: { id: user.therapist.id },
+                    data: {
+                        ...(fullName !== undefined && { fullName }),
+                        ...(clinic !== undefined && { clinic: clinic || null }),
+                        ...(profilePhoto !== undefined && { profilePhoto: profilePhoto || null }),
+                    },
+                });
+            } else if (user.role === 'PHARMACIST' && user.pharmacist) {
+                await tx.pharmacist.update({
+                    where: { id: user.pharmacist.id },
+                    data: {
+                        ...(fullName !== undefined && { fullName }),
+                        ...(profilePhoto !== undefined && { profilePhoto: profilePhoto || null }),
+                    },
+                });
+            } else if (user.role === 'PATIENT' && user.patient) {
+                const dobDate = dob ? new Date(dob + 'T00:00:00Z') : undefined;
+                const age = dobDate
+                    ? Math.floor((Date.now() - dobDate.getTime()) / (365.25 * 24 * 60 * 60 * 1000))
+                    : undefined;
+                await tx.patient.update({
+                    where: { id: user.patient.id },
+                    data: {
+                        ...(fullName !== undefined && { fullName }),
+                        ...(phoneNumber !== undefined && { phoneNumber: phoneNumber || null }),
+                        ...(profilePhoto !== undefined && { profilePhoto: profilePhoto || null }),
+                        ...(dobDate !== undefined && { dob: dobDate }),
+                        ...(age !== undefined && { age }),
+                        ...(gender !== undefined && { gender: gender || null }),
+                        ...(therapyType !== undefined && { therapyType: therapyType || null }),
+                    },
+                });
+            }
+            // ADMIN / SUPER_ADMIN have no role-specific profile row; nothing to update.
+        });
+
+        return this.getCurrentUser(userId);
     }
 
     static async updateOnboarding(userId, data) {
         const patient = await prisma.patient.findUnique({ where: { userId } });
         if (!patient) throw new Error('Patient profile not found');
+
+        // Only award zen points on the *first* completion — prevents farming by
+        // repeatedly re-submitting the onboarding endpoint.
+        const isFirstCompletion = !patient.onboardingCompleted;
+
         return prisma.patient.update({
             where: { id: patient.id },
             data: {
                 gender: data.gender || patient.gender,
                 onboardingCompleted: true,
                 onboardingData: data,
-                zenPoints: { increment: 50 }
+                ...(isFirstCompletion && { zenPoints: { increment: 50 } }),
             }
         });
     }
 
+    /**
+     * "My Patients" — reads from the PatientAssignment join table so
+     * admin-made assignments propagate immediately.
+     *
+     * For THERAPIST we fall back to Journey (legacy) since therapists aren't
+     * tracked in PatientAssignment yet — a future iteration can promote
+     * Therapist onto PatientAssignment if needed.
+     */
     static async getAssignedPatients(userId, role) {
-        let where = {};
         if (role === 'THERAPIST') {
             const therapist = await prisma.therapist.findUnique({ where: { userId } });
             if (!therapist) throw new Error('Therapist profile not found');
-            where = { therapistId: therapist.id };
-        } else if (role === 'DOCTOR' || role === 'ADMIN_DOCTOR') {
-            const doctor = await prisma.doctor.findUnique({ where: { userId } });
-            if (!doctor) throw new Error('Doctor profile not found');
-            where = { doctorId: doctor.id };
-        } else {
+            const journeys = await prisma.journey.findMany({
+                where:   { therapistId: therapist.id },
+                include: { patient: { include: { user: { select: { email: true } } } } },
+            });
+            return journeys.map((j) => ({
+                id:           j.patient.id,
+                userId:       j.patient.userId,
+                fullName:     j.patient.fullName,
+                email:        j.patient.user?.email,
+                phoneNumber:  j.patient.phoneNumber,
+                status:       j.status,
+                journeyType:  j.status,
+            }));
+        }
+
+        if (role !== 'DOCTOR' && role !== 'ADMIN_DOCTOR') {
             throw new Error('Unauthorized role');
         }
+        const doctor = await prisma.doctor.findUnique({ where: { userId } });
+        if (!doctor) throw new Error('Doctor profile not found');
 
+        // Branch scope — DOCTOR sees only their own branch; ADMIN_DOCTOR
+        // sees all their assignments hospital-wide.
         const userBranchId = (await prisma.user.findUnique({ where: { id: userId } }))?.branchId;
-        if (userBranchId && role !== 'ADMIN_DOCTOR') {
-            where.patient = { branchId: userBranchId };
-        }
+        const where = {
+            doctorId: doctor.id,
+            status:   'ACTIVE',
+            ...(userBranchId && role !== 'ADMIN_DOCTOR'
+                ? { patient: { branchId: userBranchId } }
+                : {}),
+        };
 
-        const journeys = await prisma.journey.findMany({
+        const assignments = await prisma.patientAssignment.findMany({
             where,
             include: {
                 patient: {
-                    include: { user: { select: { email: true } } }
-                }
-            }
+                    include: {
+                        user:    { select: { email: true } },
+                        journeys: {
+                            where:   { status: { in: ['IN_PROGRESS', 'ACTIVE'] } },
+                            select:  { status: true, completedSessions: true, totalSessions: true },
+                            orderBy: { createdAt: 'desc' },
+                            take:    1,
+                        },
+                    },
+                },
+            },
+            orderBy: { assignedAt: 'desc' },
         });
 
-        return journeys.map(j => ({
-            id: j.patient.id,
-            userId: j.patient.userId,
-            fullName: j.patient.fullName,
-            email: j.patient.user?.email,
-            phoneNumber: j.patient.phoneNumber,
-            status: j.status,
-            completedSittings: j.completedSessions,
-            totalSittings: j.totalSessions,
-            journeyType: j.status
-        }));
+        return assignments.map((a) => {
+            const journey = a.patient.journeys[0];
+            return {
+                id:                a.patient.id,
+                userId:            a.patient.userId,
+                fullName:          a.patient.fullName,
+                email:             a.patient.user?.email,
+                phoneNumber:       a.patient.phoneNumber,
+                assignmentId:      a.id,
+                assignmentType:    a.type,
+                assignedAt:        a.assignedAt,
+                status:            journey?.status || 'ACTIVE',
+                completedSittings: journey?.completedSessions ?? 0,
+                totalSittings:     journey?.totalSessions ?? 0,
+                journeyType:       journey?.status || null,
+            };
+        });
     }
 
     static async _validateBranchId(branchId) {
@@ -268,7 +438,17 @@ export class UserService {
     }
 
     static async createUser(data) {
-        const { email, password, role, fullName, branchId: inputBranchId } = data;
+        const {
+            email, password, role, fullName, branchId: inputBranchId,
+            phoneNumber, dob, gender: rawGender, therapyType,
+            specialization, qualification, yearsExperience, clinic,
+            registrationNumber,
+            initialSkills,
+        } = data;
+        // Canonicalise gender to uppercase so downstream checks (e.g. pregnancy toggle)
+        // don't have to worry about mixed-case history (Female / female / FEMALE).
+        const gender = normaliseGender(rawGender);
+
         const branchId = await this._validateBranchId(inputBranchId);
         const existing = await prisma.user.findUnique({ where: { email } });
         if (existing) {
@@ -277,71 +457,227 @@ export class UserService {
             throw error;
         }
 
-        const hashed = await bcrypt.hash(password, 10);
+        // rounds=12 to match AuthService.BCRYPT_ROUNDS (password reset flow).
+        // Previously 10 — weaker than reset-initiated hashes. Unified here.
+        const hashed = await bcrypt.hash(password, 12);
         return prisma.$transaction(async (tx) => {
             const newUser = await tx.user.create({ data: { email, password: hashed, role, branchId } });
 
             // Note: Doctor, Therapist, and Pharmacist schemas DO NOT include branchId.
             // Branch isolation for them is handled via the User record.
-            const profileData = { userId: newUser.id, fullName };
-
             if (role === 'DOCTOR' || role === 'ADMIN_DOCTOR') {
-                await tx.doctor.create({ data: { ...profileData, userId: newUser.id } });
+                await tx.doctor.create({
+                    data: {
+                        userId: newUser.id,
+                        fullName,
+                        specialization,
+                        qualification,
+                        yearsExperience,
+                        clinic: clinic || null,
+                        registrationNumber: registrationNumber || null,
+                    },
+                });
             } else if (role === 'THERAPIST') {
-                await tx.therapist.create({ data: profileData });
+                const therapist = await tx.therapist.create({
+                    data: {
+                        userId: newUser.id,
+                        fullName,
+                        specialization,
+                        qualification,
+                        yearsExperience,
+                        clinic: clinic || null,
+                        registrationNumber: registrationNumber || null,
+                    },
+                });
+                // Seed the therapist's skill matrix. Primary specialization is
+                // always added as CERTIFIED (if it maps to an enum value);
+                // additional picks default to EXPERIENCED. De-duped so a skill
+                // listed in both slots only produces one row.
+                const skillSet = new Map();
+                if (specialization && THERAPIST_SKILLS.has(specialization)) {
+                    skillSet.set(specialization, 'CERTIFIED');
+                }
+                if (Array.isArray(initialSkills)) {
+                    for (const s of initialSkills) {
+                        if (!skillSet.has(s)) skillSet.set(s, 'EXPERIENCED');
+                    }
+                }
+                if (skillSet.size > 0) {
+                    await tx.therapistSkill.createMany({
+                        data: Array.from(skillSet.entries()).map(([skill, proficiency]) => ({
+                            therapistId: therapist.id,
+                            skill,
+                            proficiency,
+                        })),
+                        skipDuplicates: true,
+                    });
+                }
             } else if (role === 'PATIENT') {
-                await tx.patient.create({ data: { ...profileData, branchId } });
+                const dobDate = dob ? new Date(dob + 'T00:00:00Z') : null;
+                const age = dobDate
+                    ? Math.floor((Date.now() - dobDate.getTime()) / (365.25 * 24 * 60 * 60 * 1000))
+                    : null;
+                await tx.patient.create({
+                    data: {
+                        userId: newUser.id,
+                        fullName,
+                        branchId,
+                        phoneNumber: phoneNumber || null,
+                        dob: dobDate,
+                        age,
+                        gender: gender || null,
+                        therapyType: therapyType || null,
+                    },
+                });
             } else if (role === 'PHARMACIST') {
-                await tx.pharmacist.create({ data: profileData });
+                await tx.pharmacist.create({
+                    data: {
+                        userId: newUser.id,
+                        fullName,
+                        qualification,
+                        yearsExperience,
+                    },
+                });
             }
             return newUser;
         });
     }
 
-    static async assignPatient(data) {
-        const { patientId, doctorId } = data;
+    /**
+     * Assign a patient to a doctor.
+     *
+     * Writes to the PatientAssignment join table — the canonical source of
+     * truth for "who's looking after this patient". Doctor-side reads
+     * (`getAssignedPatients`) use the same table, so assignments propagate
+     * immediately.
+     *
+     * Behaviour for PRIMARY (default):
+     *   - Any existing ACTIVE PRIMARY for the patient is flipped to REPLACED
+     *     inside the same transaction (preserves history, enforces the
+     *     "one primary at a time" invariant).
+     *
+     * Branch parity is enforced unless the caller is ADMIN (ADMINs can
+     * reassign cross-branch, e.g. when sharing staff between clinics).
+     */
+    static async assignPatient({ patientId, doctorId, assignedById, type = 'PRIMARY', reason = null, allowCrossBranch = false }) {
         const [patient, doctor] = await Promise.all([
             prisma.patient.findUnique({ where: { id: patientId }, include: { user: true } }),
-            prisma.doctor.findUnique({ where: { id: doctorId }, include: { user: true } })
+            prisma.doctor.findUnique({  where: { id: doctorId },  include: { user: true } }),
         ]);
+        if (!patient) { const e = new Error('Patient not found'); e.status = 404; throw e; }
+        if (!doctor)  { const e = new Error('Doctor not found');  e.status = 404; throw e; }
 
-        if (!patient || !doctor) throw new Error('Patient or Doctor not found');
-
-        // Branch Parity Check
-        if (patient.branchId && doctor.user?.branchId && patient.branchId !== doctor.user.branchId) {
-            throw new Error('Cross-branch assignment is restricted to administrators');
+        if (!allowCrossBranch
+            && patient.branchId
+            && doctor.user?.branchId
+            && patient.branchId !== doctor.user.branchId) {
+            const e = new Error('Cross-branch assignment is restricted to full admins');
+            e.status = 403;
+            throw e;
         }
 
-        // Real-time Availability Check
-        const { AvailabilityService } = await import('./availability.service.js');
-        const now = new Date();
-        const startTime = now.toTimeString().slice(0, 5);
-        const endTime = new Date(now.getTime() + 60 * 60 * 1000).toTimeString().slice(0, 5);
+        // Is this doctor *already* the active primary? Treat as a no-op so
+        // clicking Assign twice doesn't create duplicate history rows.
+        const existingForDoctor = await prisma.patientAssignment.findFirst({
+            where: { patientId, doctorId, type, status: 'ACTIVE' },
+        });
+        if (existingForDoctor) return existingForDoctor;
 
-        const availability = await AvailabilityService.checkAvailability(
-            doctorId,
-            now.toISOString(),
-            startTime,
-            endTime
-        );
+        return prisma.$transaction(async (tx) => {
+            if (type === 'PRIMARY') {
+                // Replace (not delete) any existing active primary so the
+                // history trail is preserved for audit.
+                await tx.patientAssignment.updateMany({
+                    where: { patientId, type: 'PRIMARY', status: 'ACTIVE' },
+                    data:  { status: 'REPLACED', endedAt: new Date(), endReason: 'Replaced by new assignment' },
+                });
+            }
+            return tx.patientAssignment.create({
+                data: {
+                    patientId, doctorId, type,
+                    status: 'ACTIVE',
+                    reason,
+                    assignedById,
+                },
+                include: {
+                    doctor:  { select: { id: true, fullName: true, specialization: true } },
+                    patient: { select: { id: true, fullName: true } },
+                },
+            });
+        });
+    }
 
-        if (!availability.available) {
-            const availableSlots = await AvailabilityService.getAvailableSlots(doctorId, now);
-            const error = new Error(`Doctor is currently unavailable: ${availability.reason}`);
-            error.status = 403;
-            error.availableSlots = availableSlots;
-            throw error;
+    /**
+     * End an active assignment. Row status goes to ENDED (not deleted) to
+     * preserve history. Pass `type` to disambiguate when a patient has
+     * multiple active non-primary assignments with the same doctor.
+     */
+    static async unassignPatient({ patientId, doctorId, endedById, endReason = null, type }) {
+        const where = { patientId, doctorId, status: 'ACTIVE' };
+        if (type) where.type = type;
+
+        const existing = await prisma.patientAssignment.findMany({ where });
+        if (existing.length === 0) {
+            const e = new Error('No active assignment found for this patient/doctor');
+            e.status = 404;
+            throw e;
         }
 
-        return prisma.appointment.create({
+        await prisma.patientAssignment.updateMany({
+            where,
             data: {
-                patientId: patient.id,
-                doctorId: doctor.id,
-                date: now,
-                status: 'ASSIGNED',
-                branchId: patient.branchId
+                status:    'ENDED',
+                endedAt:   new Date(),
+                endReason: endReason || null,
             },
         });
+        // eslint-disable-next-line no-unused-vars
+        const _auditedBy = endedById; // reserved for future audit-trail write
+        return { patientId, doctorId, endedCount: existing.length };
+    }
+
+    /**
+     * Current active assignments for a patient — what the AssignPatient UI
+     * shows as "Currently assigned to: Dr. X" before the admin overrides.
+     */
+    static async getPatientAssignments(patientId, { status = 'ACTIVE' } = {}) {
+        return prisma.patientAssignment.findMany({
+            where: { patientId, ...(status ? { status } : {}) },
+            include: {
+                doctor:     { select: { id: true, fullName: true, specialization: true } },
+                assignedBy: { select: { id: true, email: true } },
+            },
+            orderBy: { assignedAt: 'desc' },
+        });
+    }
+
+    /**
+     * Patients in a branch (or whole hospital for ADMIN) that have no
+     * ACTIVE PRIMARY assignment. Drives the "Unassigned only" filter and
+     * the AdminDashboard "Unassigned Patients" card.
+     */
+    static async listUnassignedPatients({ branchId = null, hospitalId = null } = {}) {
+        const patients = await prisma.patient.findMany({
+            where: {
+                ...(branchId   ? { branchId } : {}),
+                ...(hospitalId ? { user: { hospitalId } } : {}),
+                user: { deletedAt: null },
+            },
+            include: {
+                user:                { select: { id: true, email: true, branchId: true } },
+                branch:              { select: { id: true, name: true } },
+                patientAssignments:  {
+                    where:  { type: 'PRIMARY', status: 'ACTIVE' },
+                    select: { id: true },
+                },
+            },
+        });
+        return patients
+            .filter((p) => p.patientAssignments.length === 0)
+            .map((p) => ({
+                id: p.id, fullName: p.fullName, email: p.user?.email,
+                phoneNumber: p.phoneNumber, branchId: p.branchId, branchName: p.branch?.name,
+            }));
     }
 
     static async getPatientById(requestedPatientId, user) {

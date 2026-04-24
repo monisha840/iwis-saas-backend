@@ -120,10 +120,16 @@ export class StockTransferService {
             for (const batch of sourceStocks) {
                 if (remaining <= 0) break;
                 const deduct = Math.min(batch.quantity, remaining);
-                await tx.medicineStock.update({
-                    where: { id: batch.id },
-                    data: { quantity: batch.quantity - deduct },
+                // Guarded update: only decrement if the batch still has enough
+                // stock. A concurrent dispense against the same batch cannot
+                // race us into a negative quantity.
+                const res = await tx.medicineStock.updateMany({
+                    where: { id: batch.id, quantity: { gte: deduct } },
+                    data: { quantity: { decrement: deduct } },
                 });
+                if (res.count === 0) {
+                    throw new Error('Stock batch changed during transfer — retry');
+                }
                 remaining -= deduct;
             }
 
@@ -131,13 +137,24 @@ export class StockTransferService {
                 throw new Error(`Insufficient stock: short by ${remaining} units`);
             }
 
-            // Add to destination branch — create a new stock entry
+            // Add to destination branch. Upsert on (medicineId, branchId, batchNumber)
+            // so idempotent retries of the same transfer receipt don't create
+            // duplicate rows.
             const sourceBatch = sourceStocks[0];
-            await tx.medicineStock.create({
-                data: {
+            const destBatchNumber = `TRANSFER-${id}`;
+            await tx.medicineStock.upsert({
+                where: {
+                    medicineId_branchId_batchNumber: {
+                        medicineId: transfer.medicineId,
+                        branchId: transfer.toBranchId,
+                        batchNumber: destBatchNumber,
+                    },
+                },
+                update: { quantity: { increment: transfer.quantity } },
+                create: {
                     medicineId: transfer.medicineId,
                     branchId: transfer.toBranchId,
-                    batchNumber: `TRANSFER-${id}`,
+                    batchNumber: destBatchNumber,
                     expiryDate: sourceBatch.expiryDate,
                     quantity: transfer.quantity,
                 },

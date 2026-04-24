@@ -4,12 +4,34 @@ import { emitToUser } from '../websocket/index.js';
 import { notificationService } from './notification.service.js';
 import { userNameSelect, flattenUserName } from '../lib/userName.js';
 
+const FULL_INCLUDE = {
+  patient: { select: { id: true, fullName: true } },
+  fromClinician: { select: userNameSelect },
+  toClinician: { select: userNameSelect },
+  toBranch: { select: { id: true, name: true } },
+};
+
+function flattenHandoff(h) {
+  if (!h) return h;
+  return {
+    ...h,
+    fromClinician: flattenUserName(h.fromClinician),
+    toClinician: flattenUserName(h.toClinician),
+  };
+}
+
 export class HandoffNoteService {
   /**
-   * Create a handoff note and notify the receiving clinician.
+   * Create a handoff note. When status='SENT' (default), fire the delivery
+   * notification; when status='DRAFT' the note is silent until promoted via
+   * sendDraft().
    */
-  static async createHandoffNote(fromClinicianId, { patientId, toClinicianId, toBranchId, summary, currentMedications, activeConditions, nextSteps, urgency }) {
-    logger.info(`Creating handoff note`, { fromClinicianId, patientId, toClinicianId });
+  static async createHandoffNote(fromClinicianId, {
+    patientId, toClinicianId, toBranchId, summary,
+    currentMedications, activeConditions, nextSteps, urgency,
+    status = 'SENT',
+  }) {
+    logger.info(`Creating handoff note`, { fromClinicianId, patientId, toClinicianId, status });
 
     const fromClinicianRaw = await prisma.user.findUnique({
       where: { id: fromClinicianId },
@@ -19,8 +41,6 @@ export class HandoffNoteService {
     if (!fromClinicianRaw) {
       throw new Error('Clinician not found');
     }
-
-    const fromClinician = flattenUserName(fromClinicianRaw);
 
     const handoff = await prisma.handoffNote.create({
       data: {
@@ -33,34 +53,142 @@ export class HandoffNoteService {
         activeConditions: activeConditions || [],
         nextSteps: nextSteps || null,
         urgency: urgency || 'NORMAL',
+        status,
+        sentAt: status === 'SENT' ? new Date() : null,
       },
-      include: {
-        patient: { select: { id: true, fullName: true } },
-        fromClinician: { select: userNameSelect },
-        toClinician: { select: userNameSelect },
-        toBranch: { select: { id: true, name: true } },
-      },
+      include: FULL_INCLUDE,
     });
 
-    handoff.fromClinician = flattenUserName(handoff.fromClinician);
-    handoff.toClinician = flattenUserName(handoff.toClinician);
+    const flat = flattenHandoff(handoff);
 
-    // Notify receiving clinician
-    if (toClinicianId) {
-      emitToUser(toClinicianId, 'handoff_received', handoff);
-
-      await notificationService.createNotification({
-        userId: toClinicianId,
-        type: 'HANDOFF_NOTE',
-        title: 'New Handoff Note Received',
-        message: `${fromClinician.name} has sent you a handoff note for patient ${handoff.patient.fullName || 'Unknown'}`,
-        priority: urgency === 'CRITICAL' ? 'HIGH' : 'INFO',
-        data: { handoffId: handoff.id, patientId },
-      });
+    if (status === 'SENT' && toClinicianId) {
+      await HandoffNoteService._emitHandoffNotification(flat);
     }
 
-    logger.info(`Handoff note created`, { handoffId: handoff.id });
-    return handoff;
+    logger.info(`Handoff note created`, { handoffId: handoff.id, status });
+    return flat;
+  }
+
+  /**
+   * Emit WebSocket + notification for a SENT handoff. Shared by createHandoffNote
+   * (manual send) and sendDraft (draft → sent promotion).
+   */
+  static async _emitHandoffNotification(handoff) {
+    if (!handoff.toClinicianId) return;
+    emitToUser(handoff.toClinicianId, 'handoff_received', handoff);
+    await notificationService.createNotification({
+      userId: handoff.toClinicianId,
+      type: 'HANDOFF_NOTE',
+      title: 'New Handoff Note Received',
+      message: `${handoff.fromClinician?.name || 'A clinician'} has sent you a handoff note for patient ${handoff.patient?.fullName || 'Unknown'}`,
+      priority: handoff.urgency === 'CRITICAL' ? 'HIGH' : 'INFO',
+      data: { handoffId: handoff.id, patientId: handoff.patientId },
+    });
+  }
+
+  /**
+   * Auto-draft a handoff seeded from a just-completed appointment.
+   * Targets the patient's PRIMARY active clinician (via PatientAssignment),
+   * or falls back to the appointment's branch. Silent (DRAFT) — no notification.
+   * Swallowed by the caller; never rolls back appointment completion.
+   */
+  static async _autoDraftFromAppointment(appointment, user) {
+    if (!user?.id || !appointment?.id) return null;
+
+    const populated = await HandoffNoteService.autoPopulateFromAppointment(appointment.id, user.id);
+
+    const primary = await prisma.patientAssignment.findFirst({
+      where: { patientId: appointment.patientId, status: 'ACTIVE', type: 'PRIMARY' },
+      include: { doctor: { select: { userId: true } } },
+    });
+    const toClinicianId = primary?.doctor?.userId ?? null;
+
+    // Self-handoff is noise — completer is already the patient's primary clinician.
+    if (toClinicianId && toClinicianId === user.id) return null;
+
+    const toBranchId = toClinicianId ? null : (appointment.branchId ?? null);
+
+    try {
+      return await prisma.handoffNote.create({
+        data: {
+          patientId:           populated.patientId,
+          fromClinicianId:     user.id,
+          toClinicianId,
+          toBranchId,
+          summary:             populated.summary,
+          currentMedications:  populated.currentMedications?.length ? populated.currentMedications : null,
+          activeConditions:    populated.activeConditions || [],
+          nextSteps:           populated.nextSteps || null,
+          urgency:             populated.urgency || 'NORMAL',
+          status:              'DRAFT',
+          isAutoGenerated:     true,
+          sourceAppointmentId: appointment.id,
+        },
+      });
+    } catch (err) {
+      // P2002 = unique violation on sourceAppointmentId — duplicate completion,
+      // draft already exists. Swallow.
+      if (err?.code === 'P2002') return null;
+      throw err;
+    }
+  }
+
+  /**
+   * Promote a DRAFT handoff to SENT and fire the delivery notification.
+   * Only the original sender may send their own draft.
+   */
+  static async sendDraft(handoffId, userId) {
+    const existing = await prisma.handoffNote.findUnique({ where: { id: handoffId } });
+    if (!existing) { const e = new Error('Handoff note not found'); e.status = 404; throw e; }
+    if (existing.fromClinicianId !== userId) {
+      const e = new Error('Only the sender can send this draft'); e.status = 403; throw e;
+    }
+    if (existing.status === 'SENT') {
+      const e = new Error('Handoff already sent'); e.status = 409; throw e;
+    }
+
+    const updated = await prisma.handoffNote.update({
+      where: { id: handoffId },
+      data:  { status: 'SENT', sentAt: new Date() },
+      include: FULL_INCLUDE,
+    });
+
+    const flat = flattenHandoff(updated);
+    await HandoffNoteService._emitHandoffNotification(flat);
+    logger.info(`Handoff draft sent`, { handoffId, userId });
+    return flat;
+  }
+
+  /**
+   * Edit a draft before sending. Rejects when note is already SENT or when the
+   * editor isn't the original sender.
+   */
+  static async updateDraft(handoffId, userId, data = {}) {
+    const existing = await prisma.handoffNote.findUnique({ where: { id: handoffId } });
+    if (!existing) { const e = new Error('Handoff note not found'); e.status = 404; throw e; }
+    if (existing.fromClinicianId !== userId) {
+      const e = new Error('Only the sender can edit this draft'); e.status = 403; throw e;
+    }
+    if (existing.status === 'SENT') {
+      const e = new Error('Cannot edit a sent handoff'); e.status = 409; throw e;
+    }
+
+    // Whitelist editable fields.
+    const patch = {};
+    if (data.summary !== undefined)            patch.summary = data.summary;
+    if (data.currentMedications !== undefined) patch.currentMedications = data.currentMedications?.length ? data.currentMedications : null;
+    if (data.activeConditions !== undefined)   patch.activeConditions = data.activeConditions || [];
+    if (data.nextSteps !== undefined)          patch.nextSteps = data.nextSteps || null;
+    if (data.urgency !== undefined)            patch.urgency = data.urgency || 'NORMAL';
+    if (data.toClinicianId !== undefined)      patch.toClinicianId = data.toClinicianId || null;
+    if (data.toBranchId !== undefined)         patch.toBranchId = data.toBranchId || null;
+
+    const updated = await prisma.handoffNote.update({
+      where: { id: handoffId },
+      data: patch,
+      include: FULL_INCLUDE,
+    });
+    return flattenHandoff(updated);
   }
 
   /**
@@ -71,7 +199,8 @@ export class HandoffNoteService {
     const take = Math.min(parseInt(limit) || 20, 100);
     const skip = (currentPage - 1) * take;
 
-    const where = { toClinicianId: clinicianId };
+    // Drafts must never leak to recipients — only SENT notes surface here.
+    const where = { toClinicianId: clinicianId, status: 'SENT' };
     if (isRead !== undefined) {
       where.isRead = isRead === 'true' || isRead === true;
     }
