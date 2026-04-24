@@ -214,6 +214,66 @@ router.get(
     OperationsController.getPunctualityReport
 );
 
+/** PUT /api/operations/attendance/user/:userId — admin override.
+ *  Body: { date: 'YYYY-MM-DD', clockIn?: 'HH:mm', clockOut?: 'HH:mm',
+ *          status?: AttendanceStatus, notes?: string }
+ *  Upserts the row; re-derives status from schedule + times when `status`
+ *  is omitted, honors explicit `status` otherwise. */
+router.put(
+    '/attendance/user/:userId',
+    authMiddleware,
+    roleMiddleware(ADMIN_ROLES),
+    OperationsController.setAttendance
+);
+
+/** DELETE /api/operations/attendance/user/:userId?date=YYYY-MM-DD — admin override. */
+router.delete(
+    '/attendance/user/:userId',
+    authMiddleware,
+    roleMiddleware(ADMIN_ROLES),
+    OperationsController.deleteAttendance
+);
+
+/** POST /api/operations/attendance/reconcile/:branchId — manual reconciliation.
+ *  Converts planned leave / WFH blocks + no-show shifts into attendance rows
+ *  for the requested date (defaults to yesterday).                           */
+router.post(
+    '/attendance/reconcile/:branchId',
+    authMiddleware,
+    roleMiddleware(ADMIN_ROLES),
+    OperationsController.reconcileAttendance
+);
+
+// ── Unified Clinician Calendar ──────────────────────────────────────────────────
+
+/** GET /api/operations/calendar/clinician/:userId?year=&month=
+ *  Unified per-day view: schedule, blocks (leave/WFH), attendance row,
+ *  appointment counts + morning/afternoon/evening distribution. */
+router.get(
+    '/calendar/clinician/:userId',
+    authMiddleware,
+    roleMiddleware(ALL_STAFF),
+    OperationsController.getClinicianCalendar
+);
+
+/** GET /api/operations/calendar/clinician (no param) — own calendar.
+ *  Convenience route so clinicians don't need to know their own userId. */
+router.get(
+    '/calendar/clinician',
+    authMiddleware,
+    roleMiddleware(ALL_STAFF),
+    OperationsController.getClinicianCalendar
+);
+
+/** GET /api/operations/calendar/branch/:branchId?year=&month=
+ *  Branch-wide workload heatmap — one row per clinician, one cell per day. */
+router.get(
+    '/calendar/branch/:branchId',
+    authMiddleware,
+    roleMiddleware(ADMIN_ROLES),
+    OperationsController.getBranchCalendar
+);
+
 // ── Skill Matrix ────────────────────────────────────────────────────────────────
 
 /** POST /api/operations/skills — add a skill */

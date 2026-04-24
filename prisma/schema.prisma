@@ -291,6 +291,11 @@ model BlockedSlot {
   startTime   String
   endTime     String
   reason      String?
+  // Classifies the block so the nightly attendance reconciliation can map
+  // a full-day block to the correct AttendanceStatus (LEAVE / WFH / OFF).
+  // Anything else falls through as OTHER and is treated as generic
+  // unavailability (does not flip attendance automatically).
+  kind        String?
   createdAt   DateTime   @default(now())
   updatedAt   DateTime   @updatedAt
   doctor      Doctor?    @relation(fields: [doctorId], references: [id])
@@ -299,6 +304,7 @@ model BlockedSlot {
   @@index([doctorId])
   @@index([therapistId])
   @@index([date])
+  @@index([kind])
   // Composite indexes for the availability check queries
   @@index([doctorId, date, dayOfWeek])    // checkAvailability + getAvailableSlots
   @@index([therapistId, date, dayOfWeek]) // checkAvailability + getAvailableSlots
@@ -1827,6 +1833,7 @@ enum AttendanceStatus {
   ABSENT
   HALF_DAY
   LEAVE
+  WFH
 }
 
 // ── Feature 13: Staff Skill Matrix ──────────────────────────────────────────

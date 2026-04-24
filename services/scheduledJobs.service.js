@@ -50,6 +50,10 @@ const JOB_DEFINITIONS = [
     { name: 'missed-followup-sweep', cron: '15 * * * *', handler: 'missedFollowUpSweep' },
     // Detect adherence-based critical patients (every 4 hours)
     { name: 'critical-journey-scan', cron: '0 */4 * * *', handler: 'criticalJourneyScan' },
+    // Nightly attendance reconciliation — converts leave/WFH blocks +
+    // no-show shifts from the prior day into attendance rows. Runs at
+    // 23:30 local time so the shift window has fully closed.
+    { name: 'attendance-reconcile', cron: '30 23 * * *', handler: 'attendanceReconcile' },
 ];
 
 async function processJob(job) {
@@ -99,6 +103,10 @@ async function processJob(job) {
         criticalJourneyScan: async () => {
             const { CriticalJourneyService } = await import('./criticalJourney.service.js');
             return CriticalJourneyService.detect();
+        },
+        attendanceReconcile: async () => {
+            const { StaffAttendanceService } = await import('./staffAttendance.service.js');
+            return StaffAttendanceService.runNightlyReconciliation();
         },
     };
 

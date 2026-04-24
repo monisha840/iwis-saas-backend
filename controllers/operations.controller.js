@@ -10,6 +10,7 @@ import { StaffActivityService } from '../services/staffActivity.service.js';
 import { PerformanceScorecardService } from '../services/performanceScorecard.service.js';
 import { StaffAttendanceService } from '../services/staffAttendance.service.js';
 import { StaffSkillService } from '../services/staffSkill.service.js';
+import { ClinicianCalendarService } from '../services/clinicianCalendar.service.js';
 
 export class OperationsController {
     // ── Resource Sharing ────────────────────────────────────────────────────────
@@ -181,13 +182,76 @@ export class OperationsController {
         try {
             const record = await StaffAttendanceService.clockIn(req.user.id, req.user.branchId);
             res.json(record);
-        } catch (err) { next(err); }
+        } catch (err) {
+            // Most clock-in failures are user-actionable ("already clocked
+            // in", "on approved leave"), not server bugs — surface them as
+            // 409s so the UI can show a sensible toast.
+            if (/already clocked in|leave/i.test(err?.message || '')) {
+                return res.status(409).json({ error: err.message });
+            }
+            next(err);
+        }
     }
 
     static async clockOut(req, res, next) {
         try {
             const record = await StaffAttendanceService.clockOut(req.user.id);
             res.json(record);
+        } catch (err) {
+            if (/no active clock-in|already clocked out/i.test(err?.message || '')) {
+                return res.status(409).json({ error: err.message });
+            }
+            next(err);
+        }
+    }
+
+    static async setAttendance(req, res, next) {
+        try {
+            const { userId: targetUserId } = req.params;
+            const { date, clockIn, clockOut, status, notes } = req.body;
+            const record = await StaffAttendanceService.setAttendance({
+                actorId: req.user.id,
+                actorEmail: req.user.email,
+                targetUserId,
+                date,
+                clockIn,
+                clockOut,
+                status,
+                notes,
+            });
+            res.json(record);
+        } catch (err) {
+            if (/required|must be|not found|before/i.test(err?.message || '')) {
+                return res.status(400).json({ error: err.message });
+            }
+            next(err);
+        }
+    }
+
+    static async deleteAttendance(req, res, next) {
+        try {
+            const { userId: targetUserId } = req.params;
+            const { date } = req.query;
+            if (!date) return res.status(400).json({ error: 'date is required' });
+            const result = await StaffAttendanceService.deleteAttendance({
+                actorId: req.user.id,
+                targetUserId,
+                date,
+            });
+            res.json(result);
+        } catch (err) { next(err); }
+    }
+
+    static async reconcileAttendance(req, res, next) {
+        try {
+            const { branchId } = req.params;
+            const { date } = req.query;
+            const targetDate = date ? new Date(date) : new Date();
+            // Reconcile yesterday by default so the shift window has fully
+            // closed (matches the nightly cron semantics).
+            if (!date) targetDate.setDate(targetDate.getDate() - 1);
+            const data = await StaffAttendanceService.reconcileDay({ date: targetDate, branchId });
+            res.json({ date: targetDate.toISOString().slice(0, 10), ...data });
         } catch (err) { next(err); }
     }
 
@@ -221,6 +285,30 @@ export class OperationsController {
             const { branchId } = req.params;
             const { startDate, endDate } = req.query;
             const data = await StaffAttendanceService.getPunctualityReport(branchId, { startDate, endDate });
+            res.json(data);
+        } catch (err) { next(err); }
+    }
+
+    // ── Unified Clinician Calendar ──────────────────────────────────────────────
+
+    static async getClinicianCalendar(req, res, next) {
+        try {
+            const userId = req.params.userId || req.user.id;
+            const now = new Date();
+            const year  = Number(req.query.year)  || now.getFullYear();
+            const month = Number(req.query.month) || (now.getMonth() + 1);
+            const data = await ClinicianCalendarService.getClinicianCalendar({ userId, year, month });
+            res.json(data);
+        } catch (err) { next(err); }
+    }
+
+    static async getBranchCalendar(req, res, next) {
+        try {
+            const { branchId } = req.params;
+            const now = new Date();
+            const year  = Number(req.query.year)  || now.getFullYear();
+            const month = Number(req.query.month) || (now.getMonth() + 1);
+            const data = await ClinicianCalendarService.getBranchCalendar({ branchId, year, month });
             res.json(data);
         } catch (err) { next(err); }
     }

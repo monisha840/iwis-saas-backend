@@ -9,6 +9,8 @@ import { validate } from '../middleware/validate.js';
 
 const router = express.Router();
 
+const BLOCK_KINDS = ['LEAVE', 'WFH', 'OFF', 'OTHER'];
+
 const createBlockSchema = z.object({
     doctorId: z.string().uuid().optional(),
     therapistId: z.string().uuid().optional(),
@@ -16,7 +18,10 @@ const createBlockSchema = z.object({
     dayOfWeek: z.number().min(0).max(6).optional(),
     startTime: z.string().regex(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/, 'Invalid time format HH:mm'),
     endTime: z.string().regex(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/, 'Invalid time format HH:mm'),
-    reason: z.string().optional()
+    reason: z.string().optional(),
+    // Classification consumed by the nightly attendance reconciliation —
+    // LEAVE / WFH become planned-unavailability statuses automatically.
+    kind: z.enum(BLOCK_KINDS).optional(),
 }).refine(data => data.date || data.dayOfWeek !== undefined, {
     message: "Either date or dayOfWeek must be provided"
 }).refine(data => data.doctorId || data.therapistId, {
@@ -28,7 +33,8 @@ const updateBlockSchema = z.object({
     dayOfWeek: z.number().min(0).max(6).optional(),
     startTime: z.string().regex(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/, 'Invalid time format HH:mm').optional(),
     endTime: z.string().regex(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/, 'Invalid time format HH:mm').optional(),
-    reason: z.string().optional()
+    reason: z.string().optional(),
+    kind: z.enum(BLOCK_KINDS).optional(),
 });
 
 router.post('/block', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST']), validate({ body: createBlockSchema }), async (req, res, next) => {

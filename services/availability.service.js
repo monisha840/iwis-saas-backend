@@ -6,7 +6,7 @@ const CLINICAL_DAY_END = 18;
 
 export class AvailabilityService {
     static async createBlock(data) {
-        const { doctorId, therapistId, date, dayOfWeek, startTime, endTime, reason } = data;
+        const { doctorId, therapistId, date, dayOfWeek, startTime, endTime, reason, kind } = data;
 
         if (!doctorId && !therapistId) {
             throw new Error('Either doctorId or therapistId is required');
@@ -70,7 +70,8 @@ export class AvailabilityService {
                 dayOfWeek: dayOfWeek !== undefined ? parseInt(dayOfWeek) : null,
                 startTime,
                 endTime,
-                reason
+                reason,
+                kind: kind || null,
             }
         });
     }
@@ -104,7 +105,8 @@ export class AvailabilityService {
                 dayOfWeek: dayOfWeek !== undefined ? parseInt(dayOfWeek) : undefined,
                 startTime: data.startTime,
                 endTime: data.endTime,
-                reason: data.reason
+                reason: data.reason,
+                kind: data.kind,
             }
         });
     }
