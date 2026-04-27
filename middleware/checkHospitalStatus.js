@@ -39,14 +39,32 @@ export async function checkHospitalStatus(req, res, next) {
     let hospitalId = req.user.hospitalId;
 
     // Grace path: old access tokens issued before hospitalId was part of the
-    // JWT claims won't have it set. Look up the user once; next refresh will
-    // bake it into the token and this lookup is skipped.
+    // JWT claims won't have it set. Look up the user; if their User row also
+    // lacks hospitalId, derive it from their assigned branch (Branch.hospitalId
+    // is required) and persist back to the User row so subsequent requests
+    // skip the lookup. This self-heals legacy users that were created via
+    // /api/user/create before hospitalId was being inherited from branchId.
     if (hospitalId === undefined || hospitalId === null) {
       const user = await prisma.user.findUnique({
         where: { id: req.user.id },
-        select: { hospitalId: true },
+        select: { hospitalId: true, branchId: true },
       });
       hospitalId = user?.hospitalId ?? null;
+
+      if (!hospitalId && user?.branchId) {
+        const branch = await prisma.branch.findUnique({
+          where: { id: user.branchId },
+          select: { hospitalId: true },
+        });
+        if (branch?.hospitalId) {
+          hospitalId = branch.hospitalId;
+          // Persist so the next request short-circuits at the JWT layer.
+          await prisma.user.update({
+            where: { id: req.user.id },
+            data: { hospitalId },
+          }).catch(() => null);
+        }
+      }
       req.user.hospitalId = hospitalId;
     }
 

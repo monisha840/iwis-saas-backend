@@ -22,7 +22,7 @@
 import prisma from '../lib/prisma.js';
 import logger from '../lib/logger.js';
 
-const STAFF_ROLES = ['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST', 'PHARMACIST'];
+const STAFF_ROLES = ['ADMIN', 'ADMIN_DOCTOR', 'BRANCH_ADMIN', 'DOCTOR', 'THERAPIST', 'PHARMACIST'];
 const MANAGE_ROLES = ['ADMIN', 'ADMIN_DOCTOR'];
 
 /**
@@ -164,7 +164,16 @@ export class StaffChatService {
             loadUserForChat(currentUserId),
             loadUserForChat(partnerUserId),
         ]);
-        if (me.hospitalId !== partner.hospitalId) {
+        // Cross-hospital DMs blocked. Orphan staff (hospitalId === null) are
+        // treated as belonging to the caller's hospital — mirrors the picker
+        // behaviour in listAddressableStaff so anyone listed there can be DMed.
+        const meHosp = me.hospitalId;
+        const partnerHosp = partner.hospitalId;
+        const sameOrOrphan =
+            meHosp === partnerHosp ||
+            (meHosp && partnerHosp === null) ||
+            (partnerHosp && meHosp === null);
+        if (!sameOrOrphan) {
             throw httpError(403, 'Cross-hospital DMs are not allowed');
         }
 
@@ -210,16 +219,24 @@ export class StaffChatService {
             if (!branch) throw httpError(400, 'Invalid branch');
         }
 
-        // Validate every nominated member: same hospital, staff role, not deleted.
-        // Drop self-id from input — we'll add the creator as OWNER explicitly.
+        // Validate every nominated member: same hospital (or orphan), staff
+        // role, not deleted. Drop self-id from input — we'll add the creator
+        // as OWNER explicitly. Mirrors listAddressableStaff so anyone the
+        // picker offered can actually be added.
         const requestedIds = Array.from(new Set(memberUserIds.filter((id) => id && id !== me.id)));
+        const memberWhere = {
+            id: { in: requestedIds },
+            deletedAt: null,
+            role: { in: STAFF_ROLES },
+        };
+        if (me.hospitalId) {
+            memberWhere.OR = [
+                { hospitalId: me.hospitalId },
+                { hospitalId: null },
+            ];
+        }
         const requested = await prisma.user.findMany({
-            where: {
-                id: { in: requestedIds },
-                hospitalId: me.hospitalId,
-                deletedAt: null,
-                role: { in: STAFF_ROLES },
-            },
+            where: memberWhere,
             select: { id: true, role: true },
         });
         if (requested.length !== requestedIds.length) {
@@ -618,20 +635,37 @@ export class StaffChatService {
     static async listAddressableStaff(currentUserId, { branchId, search } = {}) {
         const me = await loadUserForChat(currentUserId);
         const where = {
-            hospitalId: me.hospitalId,
             deletedAt: null,
             role: { in: STAFF_ROLES },
             id: { not: me.id },
         };
+        // Tenancy isolation: when the caller has a hospital, scope to it AND
+        // include orphan staff (hospitalId IS NULL) so legacy / pre-binding
+        // accounts don't disappear from the picker. When the caller is itself
+        // unbound (single-hospital deployment / legacy admin), drop the filter
+        // entirely so the full staff directory is reachable.
+        if (me.hospitalId) {
+            where.OR = [
+                { hospitalId: me.hospitalId },
+                { hospitalId: null },
+            ];
+        }
         if (branchId) where.branchId = branchId;
         if (search) {
             const s = String(search).toLowerCase();
-            where.OR = [
+            const searchOr = [
                 { email: { contains: s, mode: 'insensitive' } },
                 { doctor:     { fullName: { contains: s, mode: 'insensitive' } } },
                 { therapist:  { fullName: { contains: s, mode: 'insensitive' } } },
                 { pharmacist: { fullName: { contains: s, mode: 'insensitive' } } },
             ];
+            // Compose with the hospital OR via AND so we don't clobber it.
+            if (where.OR) {
+                where.AND = [{ OR: where.OR }, { OR: searchOr }];
+                delete where.OR;
+            } else {
+                where.OR = searchOr;
+            }
         }
         const rows = await prisma.user.findMany({
             where,
@@ -642,7 +676,10 @@ export class StaffChatService {
                 pharmacist: { select: { fullName: true, profilePhoto: true } },
                 branch:     { select: { id: true, name: true } },
             },
-            take: 200,
+            // Cap raised from 200 → 1000. The picker is a flat list with
+            // client-side filtering; 200 was silently truncating large clinics
+            // sorted late in the role/email order ("not all staffs fetched").
+            take: 1000,
             orderBy: [{ role: 'asc' }, { email: 'asc' }],
         });
         return rows.map((u) => ({

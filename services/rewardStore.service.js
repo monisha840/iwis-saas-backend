@@ -37,7 +37,7 @@ export class RewardStoreService {
             select: { role: true },
         });
 
-        if (['DOCTOR', 'THERAPIST', 'ADMIN_DOCTOR'].includes(user.role)) {
+        if (['DOCTOR', 'THERAPIST'].includes(user.role)) {
             // Clinician: check ClinicianXP totalXP
             const xpProfile = await prisma.clinicianXP.findUnique({ where: { userId } });
             const totalXP = xpProfile?.totalXP || 0;
@@ -157,7 +157,7 @@ export class RewardStoreService {
                 select: { role: true },
             });
 
-            if (['DOCTOR', 'THERAPIST', 'ADMIN_DOCTOR'].includes(user.role)) {
+            if (['DOCTOR', 'THERAPIST'].includes(user.role)) {
                 await prisma.clinicianXP.update({
                     where: { userId: redemption.userId },
                     data: { totalXP: { increment: redemption.pointsSpent } },

@@ -57,6 +57,8 @@ import portalRoutes from './routes/portal.js';
 import enhancedDashboardRoutes from './routes/enhanced-dashboard.js';
 import prescribedVitalsRoutes from './routes/prescribed-vitals.js';
 import visitSummaryRoutes from './routes/visit-summary.js';
+import queueRoutes from './routes/queue.js';
+import consultationContextRoutes from './routes/consultation-context.js';
 import superAdminRoutes from './routes/super-admin.js';
 // IWIS competitor features
 import therapyRoomRoutes from './routes/therapyRoom.js';
@@ -218,6 +220,10 @@ app.use('/api/handoff', handoffRoutes);
 app.use('/api/portal', portalRoutes);
 app.use('/api/patient/dashboard', enhancedDashboardRoutes);
 app.use('/api/patients/:patientId/prescribed-vitals', prescribedVitalsRoutes);
+// Live Patient Queue Management (arrival, consultation lifecycle, board)
+app.use('/api/queue', queueRoutes);
+// Consultation Room — single-shot patient history aggregate
+app.use('/api/patient', consultationContextRoutes);
 app.use('/api/visit-summary', visitSummaryRoutes);
 
 // IWIS competitor feature additions

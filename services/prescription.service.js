@@ -1,5 +1,6 @@
 import prisma from '../lib/prisma.js';
 import logger from '../lib/logger.js';
+import PDFDocument from 'pdfkit';
 import { inventoryService } from './inventory.service.js';
 
 const includeDetails = {
@@ -467,5 +468,162 @@ export class PrescriptionService {
 
         logger.audit('DISCONTINUE_PRESCRIPTION', user.id, prescriptionId, { reason });
         return updated;
+    }
+
+    /**
+     * Authorize the caller to read a prescription, then stream a PDF rendition
+     * of it directly to the response. Includes the prescriber's full name and
+     * qualification, the patient block, the hospital + branch banner, and one
+     * row per dosage/frequency/duration field.
+     *
+     * RBAC mirrors getPatientPrescriptions:
+     *   PATIENT — only their own
+     *   DOCTOR / THERAPIST — only if they were the prescriber
+     *   ADMIN / ADMIN_DOCTOR — any prescription in scope
+     */
+    static async streamPdf(prescriptionId, user, res) {
+        const rx = await prisma.prescription.findUnique({
+            where: { id: prescriptionId },
+            include: {
+                patient: { include: { user: { select: { email: true } } } },
+                doctor:    { include: { user: { select: { email: true } } } },
+                therapist: { include: { user: { select: { email: true } } } },
+                branch:    { include: { hospital: { select: { name: true } } } },
+            },
+        });
+        if (!rx) {
+            const err = new Error('Prescription not found');
+            err.status = 404;
+            throw err;
+        }
+
+        // RBAC
+        let allowed = false;
+        if (['ADMIN', 'ADMIN_DOCTOR'].includes(user.role)) {
+            allowed = true;
+        } else if (user.role === 'PATIENT') {
+            const patient = await prisma.patient.findUnique({
+                where: { userId: user.id },
+                select: { id: true },
+            });
+            allowed = patient?.id === rx.patientId;
+        } else if (user.role === 'DOCTOR') {
+            const doctor = await prisma.doctor.findUnique({
+                where: { userId: user.id },
+                select: { id: true },
+            });
+            allowed = !!doctor && doctor.id === rx.doctorId;
+        } else if (user.role === 'THERAPIST') {
+            const therapist = await prisma.therapist.findUnique({
+                where: { userId: user.id },
+                select: { id: true },
+            });
+            allowed = !!therapist && therapist.id === rx.therapistId;
+        }
+        if (!allowed) {
+            const err = new Error('Access denied');
+            err.status = 403;
+            throw err;
+        }
+
+        const prescriber = rx.doctor || rx.therapist;
+        const prescriberRole = rx.doctor ? 'Doctor' : (rx.therapist ? 'Therapist' : 'Clinician');
+        const prescriberName = prescriber?.fullName || prescriber?.user?.email || 'Unknown';
+        const qualification = prescriber?.qualification || null;
+        const specialization = prescriber?.specialization || null;
+        const registrationNumber = prescriber?.registrationNumber || null;
+        const namePrefix = rx.doctor ? 'Dr.' : '';
+        const headerName = `${namePrefix} ${prescriberName}`.trim();
+        const patientName = rx.patient?.fullName || rx.patient?.user?.email || 'Patient';
+        const patientCode = rx.patient?.patientId || null;
+        const hospitalName = rx.branch?.hospital?.name || 'Al-Shifa Group of Hospitals';
+        const branchName = rx.branch?.name || null;
+
+        // ─── Stream the PDF ─────────────────────────────────────────────────
+        const filename = `prescription-${rx.id.slice(0, 8)}.pdf`;
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+        const doc = new PDFDocument({ size: 'A4', margin: 50 });
+        doc.pipe(res);
+
+        // Hospital banner
+        doc.fontSize(18).font('Helvetica-Bold').text(hospitalName, { align: 'center' });
+        if (branchName) {
+            doc.fontSize(11).font('Helvetica').text(branchName, { align: 'center' });
+        }
+        doc.moveDown(0.3);
+        doc.fontSize(14).font('Helvetica-Bold').fillColor('#0D6E6E')
+            .text('Prescription', { align: 'center' });
+        doc.fillColor('black').moveDown(0.5);
+        doc.moveTo(50, doc.y).lineTo(545, doc.y).strokeColor('#cccccc').stroke();
+        doc.moveDown(0.8);
+
+        // Prescriber block
+        doc.fontSize(11).font('Helvetica-Bold').text('Prescribed by');
+        doc.font('Helvetica').fontSize(12).text(`${headerName}${qualification ? `, ${qualification}` : ''}`);
+        if (specialization) {
+            doc.fontSize(10).fillColor('#555').text(specialization);
+        }
+        if (registrationNumber) {
+            doc.fontSize(9).fillColor('#777').text(`Reg. No: ${registrationNumber}`);
+        }
+        doc.fontSize(9).fillColor('#777').text(`Role: ${prescriberRole}`);
+        doc.fillColor('black').moveDown(0.8);
+
+        // Patient block
+        doc.fontSize(11).font('Helvetica-Bold').text('Patient');
+        doc.font('Helvetica').fontSize(11).text(patientName);
+        if (patientCode) doc.fontSize(9).fillColor('#777').text(`Patient ID: ${patientCode}`);
+        doc.fillColor('black').moveDown(0.3);
+
+        doc.fontSize(9).fillColor('#777').text(`Date: ${new Date(rx.createdAt).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })}`);
+        doc.fillColor('black').moveDown(0.8);
+
+        doc.moveTo(50, doc.y).lineTo(545, doc.y).strokeColor('#cccccc').stroke();
+        doc.moveDown(0.6);
+
+        // Medication block
+        doc.fontSize(13).font('Helvetica-Bold').text(rx.medicationName);
+        doc.moveDown(0.4);
+
+        const row = (label, value) => {
+            if (!value) return;
+            doc.font('Helvetica-Bold').fontSize(10).fillColor('#444')
+                .text(`${label}: `, { continued: true });
+            doc.font('Helvetica').fillColor('black').text(String(value));
+        };
+        row('Dosage', rx.dosage);
+        row('Frequency', rx.frequency);
+        row('Duration', rx.duration);
+        if (rx.notes) {
+            doc.moveDown(0.3);
+            doc.font('Helvetica-Bold').fontSize(10).fillColor('#444').text('Notes');
+            doc.font('Helvetica').fillColor('black').fontSize(10).text(rx.notes, { align: 'left' });
+        }
+
+        if (rx.discontinuedAt) {
+            doc.moveDown(0.6);
+            doc.font('Helvetica-Bold').fontSize(10).fillColor('#b91c1c')
+                .text(`Discontinued on ${new Date(rx.discontinuedAt).toLocaleDateString('en-GB')}`);
+            if (rx.discontinuedReason) {
+                doc.font('Helvetica').fontSize(9).text(`Reason: ${rx.discontinuedReason}`);
+            }
+            doc.fillColor('black');
+        }
+
+        doc.moveDown(2);
+        doc.moveTo(380, doc.y).lineTo(545, doc.y).strokeColor('#999').stroke();
+        doc.moveDown(0.2);
+        doc.font('Helvetica').fontSize(9).fillColor('#444')
+            .text(`${headerName}${qualification ? `, ${qualification}` : ''}`, 380, doc.y, { align: 'right', width: 165 });
+        doc.fontSize(8).fillColor('#777')
+            .text('Authorised signatory', 380, doc.y, { align: 'right', width: 165 });
+
+        doc.moveDown(2);
+        doc.fontSize(8).fillColor('#999')
+            .text('This prescription was generated electronically by the Al-Shifa healthcare management system.', 50, doc.y, { align: 'center' });
+
+        doc.end();
     }
 }

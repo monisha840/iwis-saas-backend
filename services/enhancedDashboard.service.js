@@ -277,7 +277,6 @@ export class EnhancedDashboardService {
     const channels = await prisma.notificationPreference.findUnique({
       where: { userId },
       select: {
-        emailEnabled: true, smsEnabled: true,
         pushEnabled: true, whatsappEnabled: true,
       },
     });
@@ -307,7 +306,6 @@ export class EnhancedDashboardService {
       smartMessages,
       careTeam,
       channels: channels || {
-        emailEnabled: true, smsEnabled: false,
         pushEnabled: true, whatsappEnabled: false,
       },
       unreadNotifications,

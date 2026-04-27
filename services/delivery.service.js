@@ -3,13 +3,13 @@
  *
  * Multi-channel message delivery with explicit fallback order and per-attempt
  * audit logging. Callers pass an ordered list of channels (e.g.
- * ['WHATSAPP','SMS','EMAIL']) — the service tries them in order until one
+ * ['WHATSAPP','IN_APP']) — the service tries them in order until one
  * succeeds. Every attempt (SENT / FAILED / SKIPPED / FALLBACK) is written to
  * `ReminderDeliveryLog` for later review.
  *
- * Respects `NotificationPreference.whatsappEnabled/smsEnabled/emailEnabled` —
- * disabled channels are marked SKIPPED (not failed) and the service moves on
- * to the next channel in the list.
+ * Respects `NotificationPreference.whatsappEnabled` — disabled channels are
+ * marked SKIPPED (not failed) and the service moves on to the next channel
+ * in the list.
  *
  * Used by:
  *   - Daily check-in broadcast (scheduler)
@@ -20,11 +20,9 @@
 import prisma from '../lib/prisma.js';
 import logger from '../lib/logger.js';
 import { WhatsAppService } from './whatsapp.service.js';
-import { smsService } from './sms.service.js';
-import { emailService } from './email.service.js';
 import { emitToUser } from '../websocket/index.js';
 
-const DEFAULT_CHANNEL_ORDER = ['WHATSAPP', 'SMS', 'EMAIL'];
+const DEFAULT_CHANNEL_ORDER = ['WHATSAPP', 'IN_APP'];
 
 export class DeliveryService {
     /**
@@ -36,9 +34,9 @@ export class DeliveryService {
      * @param {string=}  opts.appointmentId  — optional; stored on log
      * @param {string=}  opts.templateId     — optional; stored on log
      * @param {'DAILY_CHECKIN'|'APPOINTMENT_CONFIRMATION'|'APPOINTMENT_REMINDER'|'MEDICATION_MISSED_FOLLOWUP'|'MEDICATION_REFILL_3D'|'MEDICATION_REFILL_LAST_DAY'} opts.kind
-     * @param {string[]=} opts.channels      — ordered channel list; defaults to WA→SMS→EMAIL
+     * @param {string[]=} opts.channels      — ordered channel list; defaults to WA→IN_APP
      * @param {string}   opts.body           — rendered message body
-     * @param {string=}  opts.subject        — email subject; ignored for SMS/WA
+     * @param {string=}  opts.subject        — kept for back-compat; unused now that email is gone
      * @param {string=}  opts.inAppTitle     — title for the in-app notification card
      * @param {string=}  opts.inAppType      — Notification.type enum value (default matches `kind`)
      *
@@ -70,13 +68,10 @@ export class DeliveryService {
             where: { id: userId },
             select: {
                 id: true,
-                email: true,
                 patient: { select: { phoneNumber: true } },
                 notificationPreference: {
                     select: {
                         whatsappEnabled: true,
-                        smsEnabled: true,
-                        emailEnabled: true,
                         pushEnabled: true,
                         whatsappNumber: true,
                     },
@@ -95,7 +90,6 @@ export class DeliveryService {
 
         const pref = user.notificationPreference;
         const phone = user.patient?.phoneNumber || null;
-        const email = user.email || null;
         const whatsappNumber = pref?.whatsappNumber || phone;
 
         const attempts = [];
@@ -106,14 +100,6 @@ export class DeliveryService {
             if (pref) {
                 if (channel === 'WHATSAPP' && pref.whatsappEnabled === false) {
                     attempts.push(await this._record({ hospitalId, userId, appointmentId, templateId, kind, channel, status: 'SKIPPED', errorMessage: 'patient has whatsapp disabled', body }));
-                    continue;
-                }
-                if (channel === 'SMS' && pref.smsEnabled === false) {
-                    attempts.push(await this._record({ hospitalId, userId, appointmentId, templateId, kind, channel, status: 'SKIPPED', errorMessage: 'patient has sms disabled', body }));
-                    continue;
-                }
-                if (channel === 'EMAIL' && pref.emailEnabled === false) {
-                    attempts.push(await this._record({ hospitalId, userId, appointmentId, templateId, kind, channel, status: 'SKIPPED', errorMessage: 'patient has email disabled', body }));
                     continue;
                 }
             }
@@ -130,27 +116,6 @@ export class DeliveryService {
                         continue;
                     }
                     attempts.push(await this._record({ hospitalId, userId, appointmentId, templateId, kind, channel, status: 'SENT', target: digits, externalId: result.externalId, body }));
-                    delivered = true;
-                    break;
-                }
-
-                if (channel === 'SMS') {
-                    if (!phone) throw new Error('no phone number on file');
-                    if (!smsService.isConfigured()) {
-                        attempts.push(await this._record({ hospitalId, userId, appointmentId, templateId, kind, channel, status: 'SKIPPED', target: phone, errorMessage: 'twilio not configured', body }));
-                        continue;
-                    }
-                    const res = await smsService.sendNotification(phone, body);
-                    attempts.push(await this._record({ hospitalId, userId, appointmentId, templateId, kind, channel, status: 'SENT', target: phone, externalId: res?.sid || null, body }));
-                    delivered = true;
-                    break;
-                }
-
-                if (channel === 'EMAIL') {
-                    if (!email) throw new Error('no email address on file');
-                    const title = subject || inAppTitle || 'Message from Al-Shifa';
-                    const res = await emailService.sendNotification(email, title, body);
-                    attempts.push(await this._record({ hospitalId, userId, appointmentId, templateId, kind, channel, status: 'SENT', target: email, externalId: res?.messageId || null, body }));
                     delivered = true;
                     break;
                 }

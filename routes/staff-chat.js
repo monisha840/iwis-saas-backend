@@ -14,7 +14,7 @@ import { emitToUser } from '../websocket/index.js';
 import logger from '../lib/logger.js';
 
 const router = express.Router();
-const STAFF_ROLES = ['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST', 'PHARMACIST'];
+const STAFF_ROLES = ['ADMIN', 'ADMIN_DOCTOR', 'BRANCH_ADMIN', 'DOCTOR', 'THERAPIST', 'PHARMACIST'];
 
 router.use(authMiddleware);
 router.use(roleMiddleware(STAFF_ROLES));

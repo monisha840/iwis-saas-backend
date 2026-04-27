@@ -7,7 +7,10 @@ import { validate } from '../middleware/validate.js';
 
 const router = express.Router();
 
-const CLINICIAN_ROLES = ['DOCTOR', 'THERAPIST', 'ADMIN_DOCTOR'];
+// ADMIN_DOCTOR is oversight, not a participant — excluded from XP, seasonal
+// challenges, mentor sessions and reward redemption. They retain ADMIN_ROLES
+// privileges (creating challenges/rewards, processing redemptions).
+const CLINICIAN_ROLES = ['DOCTOR', 'THERAPIST'];
 const ADMIN_ROLES = ['ADMIN', 'ADMIN_DOCTOR'];
 
 // Path-prefix feature gates (one per sub-area). Auth must run first because the gate
@@ -42,7 +45,7 @@ const createChallengeSchema = z.object({
     startDate: z.string().datetime(),
     endDate: z.string().datetime(),
     scope: z.enum(['INDIVIDUAL', 'BRANCH', 'ALL']).optional(),
-    targetRoles: z.array(z.enum(['DOCTOR', 'THERAPIST', 'ADMIN_DOCTOR'])).optional(),
+    targetRoles: z.array(z.enum(['DOCTOR', 'THERAPIST'])).optional(),
     rewardXP: z.number().int().min(0).optional(),
     rewardPoints: z.number().int().min(0).optional(),
 });
@@ -50,8 +53,10 @@ const createChallengeSchema = z.object({
 /** POST /api/clinician-gamification/seasonal-challenges — create challenge */
 router.post('/seasonal-challenges', authMiddleware, roleMiddleware(ADMIN_ROLES), validate({ body: createChallengeSchema }), ClinicianGamificationController.createSeasonalChallenge);
 
-/** GET /api/clinician-gamification/seasonal-challenges — active challenges */
-router.get('/seasonal-challenges', authMiddleware, roleMiddleware(CLINICIAN_ROLES), ClinicianGamificationController.getActiveChallenges);
+/** GET /api/clinician-gamification/seasonal-challenges — active challenges.
+ *  Admins (ADMIN, ADMIN_DOCTOR) can browse the live catalog they manage —
+ *  no progress is attached for them since they don't participate. */
+router.get('/seasonal-challenges', authMiddleware, roleMiddleware([...CLINICIAN_ROLES, ...ADMIN_ROLES]), ClinicianGamificationController.getActiveChallenges);
 
 /** GET /api/clinician-gamification/seasonal-challenges/history — past challenges */
 router.get('/seasonal-challenges/history', authMiddleware, roleMiddleware(ADMIN_ROLES), ClinicianGamificationController.getChallengeHistory);

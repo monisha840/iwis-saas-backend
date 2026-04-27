@@ -89,5 +89,43 @@ export async function resolvePatientId(req, res, next) {
   }
 }
 
+/** Resolve req.user.doctorProfileId from User.id → Doctor.id. Required by
+ *  routes that scope to "the calling doctor" — e.g. their own queue. Skips
+ *  the lookup if already populated. Roles without a doctor profile are
+ *  passed through unchanged so middleware order is forgiving. */
+export async function resolveDoctorId(req, res, next) {
+  try {
+    if (!req.user) return res.status(401).json({ error: 'Missing token' });
+    if (req.user.doctorProfileId) return next();
+    if (req.user.role !== 'DOCTOR' && req.user.role !== 'ADMIN_DOCTOR') return next();
+    const doctor = await prisma.doctor.findUnique({
+      where: { userId: req.user.id },
+      select: { id: true },
+    });
+    if (doctor) req.user.doctorProfileId = doctor.id;
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
+/** Resolve req.user.branchId from User.branchId. Already in the JWT for
+ *  most users, but kept as a fallback for tokens issued before
+ *  branch-scoping was added. */
+export async function resolveBranchId(req, res, next) {
+  try {
+    if (!req.user) return res.status(401).json({ error: 'Missing token' });
+    if (req.user.branchId !== undefined) return next();
+    const u = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      select: { branchId: true },
+    });
+    req.user.branchId = u?.branchId ?? null;
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
 export const authenticateToken = authMiddleware;
 export const authorizeRoles = roleMiddleware;

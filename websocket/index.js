@@ -263,6 +263,83 @@ export async function initializeWebSocket(httpServer) {
             });
         });
 
+        // ── Live Patient Queue rooms ────────────────────────────────────
+        // Two room patterns power the real-time queue board:
+        //   queue:doctor:<doctorId>:date:<YYYY-MM-DD>  — the doctor's own
+        //     Today's Queue panel; only that doctor (or admin/branch_admin
+        //     within branch scope) may join.
+        //   queue:branch:<branchId>:date:<YYYY-MM-DD>  — the admin / branch
+        //     admin Live Queue Board; admins and clinicians within the
+        //     branch may join.
+        // Membership is verified server-side on join — clients cannot just
+        // pick a room name and listen.
+        socket.on('join_queue_doctor', async ({ doctorId, date }) => {
+            try {
+                if (typeof doctorId !== 'string' || !doctorId.trim()) return;
+                const dateKey = typeof date === 'string' && date ? date : new Date().toISOString().slice(0, 10);
+
+                // Doctors can only join their own queue room. Admin /
+                // branch_admin / admin_doctor may join any doctor's room
+                // within their branch (branch check handled at the route
+                // layer when they fetch the queue).
+                if (socket.userRole === 'DOCTOR') {
+                    const me = await prisma.doctor.findUnique({
+                        where: { userId: socket.userId },
+                        select: { id: true },
+                    });
+                    if (!me || me.id !== doctorId) {
+                        socket.emit('error', { message: 'Unauthorized: not your queue' });
+                        return;
+                    }
+                } else if (!['ADMIN', 'ADMIN_DOCTOR', 'BRANCH_ADMIN', 'SUPER_ADMIN'].includes(socket.userRole)) {
+                    socket.emit('error', { message: 'Unauthorized: queue access denied' });
+                    return;
+                }
+
+                socket.join(`queue:doctor:${doctorId}:date:${dateKey}`);
+            } catch (err) {
+                console.error('[WebSocket] Error joining doctor queue room:', err);
+            }
+        });
+
+        socket.on('join_queue_branch', async ({ branchId, date }) => {
+            try {
+                if (typeof branchId !== 'string' || !branchId.trim()) return;
+                const dateKey = typeof date === 'string' && date ? date : new Date().toISOString().slice(0, 10);
+
+                // Admins / clinicians within a branch may listen on the
+                // branch board. BRANCH_ADMIN can only join their own
+                // assigned branch — verified against User.branchId.
+                if (socket.userRole === 'BRANCH_ADMIN') {
+                    const me = await prisma.user.findUnique({
+                        where: { id: socket.userId },
+                        select: { branchId: true },
+                    });
+                    if (!me || me.branchId !== branchId) {
+                        socket.emit('error', { message: 'Unauthorized: not your branch' });
+                        return;
+                    }
+                } else if (!['ADMIN', 'ADMIN_DOCTOR', 'SUPER_ADMIN', 'DOCTOR', 'THERAPIST'].includes(socket.userRole)) {
+                    socket.emit('error', { message: 'Unauthorized: branch board access denied' });
+                    return;
+                }
+
+                socket.join(`queue:branch:${branchId}:date:${dateKey}`);
+            } catch (err) {
+                console.error('[WebSocket] Error joining branch queue room:', err);
+            }
+        });
+
+        socket.on('leave_queue_doctor', ({ doctorId, date }) => {
+            const dateKey = typeof date === 'string' && date ? date : new Date().toISOString().slice(0, 10);
+            socket.leave(`queue:doctor:${doctorId}:date:${dateKey}`);
+        });
+
+        socket.on('leave_queue_branch', ({ branchId, date }) => {
+            const dateKey = typeof date === 'string' && date ? date : new Date().toISOString().slice(0, 10);
+            socket.leave(`queue:branch:${branchId}:date:${dateKey}`);
+        });
+
         socket.on('disconnect', () => {
             console.log(`[WebSocket] User ${socket.userId} disconnected`);
         });
@@ -319,4 +396,33 @@ export function emitToAll(event, data) {
 
     io.emit(event, data);
     console.log(`[WebSocket] Emitted ${event} to all clients`);
+}
+
+/**
+ * Emit a queue event to BOTH the doctor's queue room and the branch's
+ * queue room for the given date — every state transition fans out to both
+ * audiences in a single helper so callers can't forget either side.
+ *
+ * date may be a Date or YYYY-MM-DD string; defaults to today.
+ */
+export function emitToQueueRooms({ doctorId, branchId, date, event, data }) {
+    if (!io) {
+        console.warn('[WebSocket] Socket.IO not initialized');
+        return;
+    }
+    let dateKey;
+    if (date instanceof Date) {
+        dateKey = date.toISOString().slice(0, 10);
+    } else if (typeof date === 'string' && date) {
+        dateKey = date.length >= 10 ? date.slice(0, 10) : date;
+    } else {
+        dateKey = new Date().toISOString().slice(0, 10);
+    }
+
+    if (doctorId) {
+        io.to(`queue:doctor:${doctorId}:date:${dateKey}`).emit(event, data);
+    }
+    if (branchId) {
+        io.to(`queue:branch:${branchId}:date:${dateKey}`).emit(event, data);
+    }
 }

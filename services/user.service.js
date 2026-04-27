@@ -297,11 +297,15 @@ export class UserService {
         }
     }
 
-    static async listPharmacists() {
+    static async listPharmacists({ branchId = null } = {}) {
         try {
+            // Branch scoping mirrors listDoctors / listTherapists: when a
+            // branchId is passed (BRANCH_ADMIN's JWT-pinned branch), only
+            // pharmacists assigned to that branch are returned.
+            const where = { user: { deletedAt: null, ...(branchId ? { branchId } : {}) } };
             const pharmacists = await prisma.pharmacist.findMany({
-                where: { user: { deletedAt: null } },
-                include: { user: true }
+                where,
+                include: { user: { include: { branch: true } } }
             });
             return pharmacists.map((pharma) => ({
                 id: pharma.id,
@@ -311,6 +315,8 @@ export class UserService {
                 yearsExperience: pharma.yearsExperience,
                 qualification: pharma.qualification,
                 email: pharma.user?.email,
+                branchId: pharma.user?.branchId ?? null,
+                branchName: pharma.user?.branch?.name ?? null,
             }));
         } catch (err) {
             logger.error('[UserService.listPharmacists]', err);
@@ -656,13 +662,16 @@ export class UserService {
 
     static async _validateBranchId(branchId) {
         if (!branchId) return null;
-        const branch = await prisma.branch.findUnique({ where: { id: branchId } });
+        const branch = await prisma.branch.findUnique({
+            where: { id: branchId },
+            select: { id: true, hospitalId: true },
+        });
         if (!branch) {
             const error = new Error('Invalid branchId: Branch does not exist');
             error.status = 400;
             throw error;
         }
-        return branchId;
+        return branch;
     }
 
     static async createUser(data) {
@@ -679,7 +688,13 @@ export class UserService {
         // don't have to worry about mixed-case history (Female / female / FEMALE).
         const gender = normaliseGender(rawGender);
 
-        const branchId = await this._validateBranchId(inputBranchId);
+        const branch = await this._validateBranchId(inputBranchId);
+        const branchId = branch?.id ?? null;
+        // Inherit the hospital from the assigned branch — User.hospitalId is
+        // the tenancy isolation column read by checkHospitalStatus on every
+        // request. Without it the user gets 403 NO_HOSPITAL on the very
+        // first call (e.g. GET /api/user/me right after login).
+        const hospitalId = branch?.hospitalId ?? null;
         // Branch isolation: a DOCTOR without a branchId would defeat the
         // requireBranchScoped middleware (their JWT would have no branchId
         // claim and every scoped route would 403). Reject at intake — a DB
@@ -687,6 +702,14 @@ export class UserService {
         // friendlier 400 than a Prisma constraint violation.
         if (role === 'DOCTOR' && !branchId) {
             const error = new Error('branchId is required for DOCTOR users');
+            error.status = 400;
+            throw error;
+        }
+        // BRANCH_ADMIN is hard-pinned to a single branch — without a
+        // branchId on the User record every branch-scoped query would
+        // return empty results and the role becomes useless.
+        if (role === 'BRANCH_ADMIN' && !branchId) {
+            const error = new Error('branchId is required for BRANCH_ADMIN users');
             error.status = 400;
             throw error;
         }
@@ -701,7 +724,9 @@ export class UserService {
         // Previously 10 — weaker than reset-initiated hashes. Unified here.
         const hashed = await bcrypt.hash(password, 12);
         return prisma.$transaction(async (tx) => {
-            const newUser = await tx.user.create({ data: { email, password: hashed, role, branchId } });
+            const newUser = await tx.user.create({
+                data: { email, password: hashed, role, branchId, hospitalId },
+            });
 
             // Note: Doctor, Therapist, and Pharmacist schemas DO NOT include branchId.
             // Branch isolation for them is handled via the User record.

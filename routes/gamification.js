@@ -16,15 +16,17 @@ router.get('/badges/mine', authMiddleware, GamificationController.getMyBadges);
 
 // ── Streak routes ────────────────────────────────────────────────────────────
 
-/** GET /api/gamification/streak — current clinician streak */
-router.get('/streak', authMiddleware, roleMiddleware(['DOCTOR', 'THERAPIST', 'ADMIN_DOCTOR']), GamificationController.getMyStreak);
+/** GET /api/gamification/streak — current clinician streak (excludes ADMIN_DOCTOR — oversight, not a participant) */
+router.get('/streak', authMiddleware, roleMiddleware(['DOCTOR', 'THERAPIST']), GamificationController.getMyStreak);
 
 // ── Adaptive targets ─────────────────────────────────────────────────────────
 
-/** GET /api/gamification/targets — personalized scoring targets */
-router.get('/targets', authMiddleware, roleMiddleware(['DOCTOR', 'THERAPIST', 'ADMIN_DOCTOR']), GamificationController.getMyTargets);
+/** GET /api/gamification/targets — personalized scoring targets (excludes ADMIN_DOCTOR) */
+router.get('/targets', authMiddleware, roleMiddleware(['DOCTOR', 'THERAPIST']), GamificationController.getMyTargets);
 
 // ── Branch competitions ──────────────────────────────────────────────────────
+// ADMIN_DOCTOR keeps view access on aggregate leaderboards / competitions for
+// oversight, but does not participate (won't appear as a row).
 
 /** GET /api/gamification/branch-leaderboard — aggregate branch rankings */
 router.get('/branch-leaderboard', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST']), GamificationController.getBranchLeaderboard);

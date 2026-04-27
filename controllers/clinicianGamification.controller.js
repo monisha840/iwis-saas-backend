@@ -46,7 +46,11 @@ export class ClinicianGamificationController {
 
     static async createSeasonalChallenge(req, res, next) {
         try {
-            const challenge = await SeasonalChallengeService.createChallenge(req.body);
+            const challenge = await SeasonalChallengeService.createChallenge(req.body, {
+                id: req.user.id,
+                hospitalId: req.user.hospitalId ?? null,
+                branchId: req.user.branchId ?? null,
+            });
             res.status(201).json(challenge);
         } catch (err) { next(err); }
     }

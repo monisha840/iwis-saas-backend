@@ -256,22 +256,30 @@ describe('BRANCH_ADMIN role — backend guards', () => {
         });
     });
 
-    describe('role-create matrix excludes BRANCH_ADMIN', () => {
+    describe('role-create matrix allows admins to provision BRANCH_ADMIN', () => {
         // Mirror of routes/user.js ROLE_CREATE_MATRIX.
         const ROLE_CREATE_MATRIX = {
-            SUPER_ADMIN:  ['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST', 'PATIENT', 'PHARMACIST'],
-            ADMIN_DOCTOR: ['ADMIN', 'DOCTOR', 'THERAPIST', 'PATIENT', 'PHARMACIST'],
-            ADMIN:        ['DOCTOR', 'THERAPIST', 'PATIENT', 'PHARMACIST'],
+            SUPER_ADMIN:  ['ADMIN', 'ADMIN_DOCTOR', 'BRANCH_ADMIN', 'DOCTOR', 'THERAPIST', 'PATIENT', 'PHARMACIST'],
+            ADMIN_DOCTOR: ['ADMIN', 'BRANCH_ADMIN', 'DOCTOR', 'THERAPIST', 'PATIENT', 'PHARMACIST'],
+            ADMIN:        ['BRANCH_ADMIN', 'DOCTOR', 'THERAPIST', 'PATIENT', 'PHARMACIST'],
         };
 
-        it('does not include BRANCH_ADMIN as a role any caller can create', () => {
+        it('lets every admin caller provision a BRANCH_ADMIN', () => {
             for (const allowed of Object.values(ROLE_CREATE_MATRIX)) {
-                expect(allowed).not.toContain('BRANCH_ADMIN');
+                expect(allowed).toContain('BRANCH_ADMIN');
             }
         });
 
-        it('does not include BRANCH_ADMIN as a caller key', () => {
+        it('does not give BRANCH_ADMIN the ability to create users', () => {
+            // BRANCH_ADMIN is not a key on the matrix → roleMiddleware on
+            // POST /api/user/create rejects them at the gate.
             expect(ROLE_CREATE_MATRIX.BRANCH_ADMIN).toBeUndefined();
+        });
+
+        it('keeps BRANCH_ADMIN out of ADMIN_DOCTOR-only privileged elevations', () => {
+            // ADMIN_DOCTOR may make peer ADMIN_DOCTORs / system ADMINs but
+            // a plain ADMIN cannot — verify ADMIN cannot create ADMIN_DOCTOR.
+            expect(ROLE_CREATE_MATRIX.ADMIN).not.toContain('ADMIN_DOCTOR');
         });
     });
 });

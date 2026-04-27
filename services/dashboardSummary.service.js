@@ -334,6 +334,7 @@ export class DashboardSummaryService {
                 where: { therapistId, ...branchScoped, date: { gte: today, lte: tomorrow } },
                 include: {
                     patient: { select: { id: true, fullName: true, patientId: true } },
+                    triageSession: { select: { id: true, urgencyLevel: true, suggestedSpecialty: true } },
                 },
                 orderBy: { date: 'asc' },
                 take: 20,
@@ -342,6 +343,12 @@ export class DashboardSummaryService {
                 where: { therapistId, ...branchScoped, status: { in: ['REQUESTED', 'PENDING'] } },
                 include: {
                     patient: { select: { id: true, fullName: true, patientId: true } },
+                    triageSession: {
+                        select: {
+                            id: true, urgencyLevel: true, suggestedSpecialty: true,
+                            compositeScore: true, redFlagsMatched: true,
+                        },
+                    },
                 },
                 orderBy: { createdAt: 'asc' },
                 take: 10,
@@ -357,19 +364,50 @@ export class DashboardSummaryService {
                 orderBy: { createdAt: 'desc' },
                 take: 20,
                 include: {
-                    patient: { select: { id: true, fullName: true } },
+                    patient: { select: { id: true, fullName: true, userId: true } },
                     video: { select: { id: true, title: true } },
                 },
             }).catch(() => []),
         ]);
 
+        // ── Patient progress (wellness score) ──────────────────────────────
+        // Resolve the most-recent active TreatmentJourney per patient and use
+        // its wellnessScore as the "patient progress" displayed alongside each
+        // exercise prescription. Falls back to null when the patient has no
+        // active journey, which the UI renders as "—".
+        const patientUserIds = Array.from(
+            new Set(exercisePrescriptions.map(p => p.patient?.userId).filter(Boolean)),
+        );
+        const wellnessByUserId = new Map();
+        if (patientUserIds.length > 0) {
+            const journeys = await prisma.treatmentJourney.findMany({
+                where: {
+                    patientId: { in: patientUserIds },
+                    status: 'ACTIVE',
+                },
+                select: { patientId: true, wellnessScore: true, updatedAt: true },
+                orderBy: { updatedAt: 'desc' },
+            });
+            // findMany returns in updatedAt-desc order; first hit per patient wins.
+            for (const j of journeys) {
+                if (!wellnessByUserId.has(j.patientId)) {
+                    wellnessByUserId.set(j.patientId, Math.round(j.wellnessScore));
+                }
+            }
+        }
+
         const exerciseRows = exercisePrescriptions.map(p => ({
             id: p.id,
-            patient: p.patient,
+            patient: p.patient
+                ? { id: p.patient.id, fullName: p.patient.fullName }
+                : null,
             title: p.video?.title,
             prescribedAt: p.createdAt,
-            // Completion data is out-of-scope for this summary; UI renders as "—".
-            completionRate: null,
+            // 0-100 progress derived from the patient's active TreatmentJourney
+            // wellnessScore. null when the patient has no active journey.
+            wellnessScore: p.patient?.userId
+                ? (wellnessByUserId.get(p.patient.userId) ?? null)
+                : null,
         }));
 
         return {

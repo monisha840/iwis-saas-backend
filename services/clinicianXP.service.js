@@ -48,8 +48,23 @@ export class ClinicianXPService {
     /**
      * Award XP to a clinician, applying streak multiplier (Feature 20).
      * Creates an XPLedger entry, updates ClinicianXP, recalculates level.
+     *
+     * ADMIN_DOCTOR is intentionally excluded — they are oversight, not
+     * participants, so no XP, no ledger entry, no profile creation.
      */
     static async awardXP(userId, action, xpAmount, sourceId = null, metadata = null) {
+        // Excluded-role gate. Bail out before touching the ledger so all
+        // upstream callers (consultation feedback, journey feedback, mentor
+        // sessions, todo completions, diet-package approvals, etc.) become
+        // automatic no-ops for ADMIN_DOCTOR.
+        const target = await prisma.user.findUnique({
+            where: { id: userId },
+            select: { role: true },
+        });
+        if (!target || target.role === 'ADMIN_DOCTOR') {
+            return null;
+        }
+
         // Fetch streak multiplier (Feature 20: Consistency Multiplier)
         let multiplier = 1.0;
         try {
@@ -171,7 +186,7 @@ export class ClinicianXPService {
         if (branchId) {
             // Get user IDs belonging to this branch
             const branchUsers = await prisma.user.findMany({
-                where: { branchId, role: { in: ['DOCTOR', 'THERAPIST', 'ADMIN_DOCTOR'] }, deletedAt: null },
+                where: { branchId, role: { in: ['DOCTOR', 'THERAPIST'] }, deletedAt: null },
                 select: { id: true },
             });
             whereClause = { userId: { in: branchUsers.map(u => u.id) } };

@@ -90,7 +90,7 @@ const createUserSchema = z.object({
   // `<FirstName>@123` value which only needs the non-empty check.
   password: z.string().min(1).max(128),
   fullName: z.string().min(2, 'Full name is required'),
-  role: z.enum(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST', 'PATIENT', 'PHARMACIST']),
+  role: z.enum(['ADMIN', 'ADMIN_DOCTOR', 'BRANCH_ADMIN', 'DOCTOR', 'THERAPIST', 'PATIENT', 'PHARMACIST']),
   branchId: z.string().min(1, 'Branch is required'),
 
   phoneNumber: phoneShape.optional(),
@@ -246,9 +246,13 @@ router.get('/list-doctors', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCT
   }
 });
 
-router.get('/list-pharmacists', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']), async (req, res, next) => {
+router.get('/list-pharmacists', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'BRANCH_ADMIN']), async (req, res, next) => {
   try {
-    const data = await UserService.listPharmacists();
+    // BRANCH_ADMIN is hard-pinned to their JWT branch — same scoping rule
+    // used by /list-doctors and /list-therapists so a branch admin can't
+    // peek at staff in another branch.
+    const branchId = req.user.role === 'BRANCH_ADMIN' ? req.user.branchId : (req.query.branchId || null);
+    const data = await UserService.listPharmacists({ branchId });
     res.json(data);
   } catch (err) {
     next(err);
@@ -413,9 +417,9 @@ router.put('/patient/onboarding', authMiddleware, roleMiddleware(['PATIENT']), v
 // Without this, any ADMIN could create another ADMIN or elevate to ADMIN_DOCTOR.
 // Keep in sync with roleMiddleware() gate below.
 const ROLE_CREATE_MATRIX = {
-  SUPER_ADMIN:  ['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST', 'PATIENT', 'PHARMACIST'],
-  ADMIN_DOCTOR: ['ADMIN', 'DOCTOR', 'THERAPIST', 'PATIENT', 'PHARMACIST'],
-  ADMIN:        ['DOCTOR', 'THERAPIST', 'PATIENT', 'PHARMACIST'],
+  SUPER_ADMIN:  ['ADMIN', 'ADMIN_DOCTOR', 'BRANCH_ADMIN', 'DOCTOR', 'THERAPIST', 'PATIENT', 'PHARMACIST'],
+  ADMIN_DOCTOR: ['ADMIN', 'BRANCH_ADMIN', 'DOCTOR', 'THERAPIST', 'PATIENT', 'PHARMACIST'],
+  ADMIN:        ['BRANCH_ADMIN', 'DOCTOR', 'THERAPIST', 'PATIENT', 'PHARMACIST'],
 };
 
 router.post(

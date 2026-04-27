@@ -10,7 +10,7 @@ import prisma from '../lib/prisma.js';
 
 const ADMIN_ROLES = new Set(['ADMIN', 'ADMIN_DOCTOR']);
 const HHMM_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
-const VALID_CHANNELS = new Set(['WHATSAPP', 'SMS', 'EMAIL', 'IN_APP']);
+const VALID_CHANNELS = new Set(['WHATSAPP', 'IN_APP']);
 
 export class ReminderSettingService {
     /** Fetch the hospital's reminder setting; creates a default row on first read. */

@@ -260,6 +260,28 @@ router.get('/:id/adherence', authMiddleware, async (req, res, next) => {
   }
 });
 
+/**
+ * Stream a one-page PDF rendition of a single prescription. Authorisation
+ * mirrors GET /patient/:id — patients can pull their own, the authoring
+ * clinician can pull what they prescribed, and ADMIN / ADMIN_DOCTOR can pull
+ * any prescription. The PDF includes the prescriber's name + qualification,
+ * the patient block, and dosage/frequency/duration/notes.
+ */
+router.get('/:id/pdf', authMiddleware, async (req, res, next) => {
+  try {
+    await PrescriptionService.streamPdf(req.params.id, req.user, res);
+  } catch (err) {
+    if (res.headersSent) {
+      // Body already started — abort the response; don't send a JSON error after binary.
+      try { res.end(); } catch { /* swallow */ }
+      return;
+    }
+    if (err.status === 403) return res.status(403).json({ error: err.message });
+    if (err.status === 404) return res.status(404).json({ error: err.message });
+    next(err);
+  }
+});
+
 router.get('/download/:filename', authMiddleware, (req, res) => {
   try {
     const filename = req.params.filename;

@@ -188,7 +188,7 @@ function sanitizeInput(data, { partial = false } = {}) {
     }
     if (out.channels) {
         for (const c of out.channels) {
-            if (!['WHATSAPP', 'SMS', 'EMAIL', 'IN_APP'].includes(c)) {
+            if (!['WHATSAPP', 'IN_APP'].includes(c)) {
                 throw badRequest(`channel "${c}" is not supported`);
             }
         }

@@ -822,6 +822,14 @@ class SchedulerService {
 
     /**
      * No-show detection: 30 min after appointment start, if status still PENDING → mark as NO_SHOW.
+     *
+     * Also flips the live QueueEntry to ABSENT (if one exists or the
+     * appointment is queueable) so the branch admin's Live Queue Board
+     * lights up the absent patient automatically without waiting for
+     * manual detection. The PatientQueueService.markAbsent helper emits
+     * the patient_absent Socket.IO event to the branch room, so the
+     * Live Queue Board's "Contact Patient" affordance appears in real
+     * time and notifies the branch admin.
      */
     async detectNoShows() {
         try {
@@ -832,15 +840,34 @@ class SchedulerService {
                 where: {
                     date: { gte: sixtyMinAgo, lte: thirtyMinAgo },
                     status: { in: ['PENDING', 'CONFIRMED', 'ACCEPTED'] },
+                    arrivalStatus: { in: ['NOT_ARRIVED'] },
                 },
-                include: { patient: { include: { user: true } } },
+                include: { patient: { include: { user: true } }, branch: true },
             });
+
+            // Lazy import to avoid a circular dep (queue service imports
+            // websocket → websocket pulls prisma → prisma is fine, but the
+            // queue service calls scheduler types in tests).
+            const { PatientQueueService } = await import('./patientQueue.service.js');
 
             for (const appt of noShows) {
                 await prisma.appointment.update({
                     where: { id: appt.id },
                     data: { status: 'NO_SHOW' },
                 });
+
+                // Mirror onto the queue board → ABSENT. Best-effort: only
+                // queueable appointments (with a doctorId + branchId) go
+                // through this path; rest fall back to legacy NO_SHOW only.
+                if (appt.doctorId && appt.branchId) {
+                    try {
+                        await PatientQueueService.markAbsent(appt.id, { actorUserId: null });
+                    } catch (qErr) {
+                        logger.warn('[SchedulerService] queue markAbsent hook failed', {
+                            appointmentId: appt.id, err: qErr.message,
+                        });
+                    }
+                }
 
                 // Audit event
                 logger.audit('APPOINTMENT_NO_SHOW', null, appt.id, {
@@ -858,6 +885,32 @@ class SchedulerService {
                         priority: 'MEDIUM',
                         data: { appointmentId: appt.id },
                     });
+                }
+
+                // Notify branch admins so they can immediately initiate
+                // the absent-patient contact flow from the Live Queue Board.
+                if (appt.branchId) {
+                    try {
+                        const branchAdmins = await prisma.user.findMany({
+                            where: { branchId: appt.branchId, role: 'BRANCH_ADMIN' },
+                            select: { id: true },
+                        });
+                        await Promise.all(branchAdmins.map((admin) =>
+                            notificationService.createNotification({
+                                userId: admin.id,
+                                type: 'PATIENT_ABSENT',
+                                title: 'Patient marked absent',
+                                message: `${appt.patient?.fullName || 'A patient'} did not arrive for their scheduled appointment. Reach out from the Live Queue Board.`,
+                                priority: 'HIGH',
+                                relatedId: appt.id,
+                                data: { appointmentId: appt.id, branchId: appt.branchId },
+                            }).catch(() => null),
+                        ));
+                    } catch (notifErr) {
+                        logger.warn('[SchedulerService] branch admin no-show notify failed', {
+                            err: notifErr.message,
+                        });
+                    }
                 }
             }
 

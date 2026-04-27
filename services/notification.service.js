@@ -3,8 +3,6 @@ import { emitToUser } from '../websocket/index.js';
 import logger from '../lib/logger.js';
 import config from '../config/index.js';
 import { enqueueAppointmentWhatsApp } from './queue.service.js';
-import { emailService } from './email.service.js';
-import { smsService } from './sms.service.js';
 import { DeliveryService } from './delivery.service.js';
 import { renderTemplate, buildAppointmentContext } from '../lib/templateRenderer.js';
 
@@ -190,7 +188,7 @@ export class NotificationService {
                     appointmentId,
                     templateId,
                     kind: 'APPOINTMENT_CONFIRMATION',
-                    channels: channels && channels.length ? channels : ['WHATSAPP', 'SMS', 'EMAIL', 'IN_APP'],
+                    channels: channels && channels.length ? channels : ['WHATSAPP', 'IN_APP'],
                     body: renderedBody,
                     subject: renderedSubject || undefined,
                     inAppTitle: renderedSubject || 'Appointment confirmed',
@@ -456,45 +454,6 @@ export class NotificationService {
         });
     }
 
-    /**
-     * Send an email and track the delivery against a notification record
-     */
-    async sendTrackedEmail(notificationId, to, title, message, data = {}) {
-        try {
-            const result = await emailService.sendNotification(to, title, message, data);
-            await NotificationService.trackDelivery(notificationId, 'EMAIL', {
-                status: 'SENT',
-                externalId: result?.messageId || null,
-            });
-            return result;
-        } catch (err) {
-            await NotificationService.trackDelivery(notificationId, 'EMAIL', {
-                status: 'FAILED',
-                errorMessage: err.message,
-            });
-            throw err;
-        }
-    }
-
-    /**
-     * Send an SMS and track the delivery against a notification record
-     */
-    async sendTrackedSMS(notificationId, to, message) {
-        try {
-            const result = await smsService.sendNotification(to, message);
-            await NotificationService.trackDelivery(notificationId, 'SMS', {
-                status: 'SENT',
-                externalId: result?.sid || null,
-            });
-            return result;
-        } catch (err) {
-            await NotificationService.trackDelivery(notificationId, 'SMS', {
-                status: 'FAILED',
-                errorMessage: err.message,
-            });
-            throw err;
-        }
-    }
 }
 
 export const notificationService = new NotificationService();

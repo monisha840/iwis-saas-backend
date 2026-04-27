@@ -1,8 +1,10 @@
 import express from 'express';
 import { z } from 'zod';
 import { ConsultationService } from '../services/consultation.service.js';
+import { PatientQueueService } from '../services/patientQueue.service.js';
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
+import logger from '../lib/logger.js';
 
 const router = express.Router();
 
@@ -54,6 +56,19 @@ router.post('/session/:appointmentId/complete', authMiddleware, roleMiddleware([
             user: req.user,
             followUp: req.body?.followUp,
         });
+
+        // Mirror onto the queue board: flip QueueEntry → COMPLETED and emit
+        // consultation_ended to both the doctor and branch queue rooms so
+        // the live board updates without waiting for a poll. Best-effort —
+        // the consultation was already saved successfully if we got here.
+        try {
+            await PatientQueueService.endConsultation(req.params.appointmentId, { actorUserId: req.user.id });
+        } catch (qErr) {
+            logger.warn('[Consultation] queue end-consultation hook failed', {
+                appointmentId: req.params.appointmentId, err: qErr.message,
+            });
+        }
+
         res.json(data);
     } catch (err) {
         next(err);

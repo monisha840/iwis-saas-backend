@@ -371,9 +371,8 @@ export async function runMissedDoseSweep() {
             await DeliveryService.send({
                 userId,
                 kind: 'MEDICATION_MISSED_FOLLOWUP',
-                channels: ['WHATSAPP', 'SMS', 'IN_APP'],
+                channels: ['WHATSAPP', 'IN_APP'],
                 body,
-                subject: rendered?.subject || null,
                 templateId: rendered?.templateId || null,
                 inAppTitle: `💊 2 days without logging ${rx.medicationName}`,
                 inAppType: 'MEDICATION_MISSED_FOLLOWUP',
@@ -462,7 +461,7 @@ export async function runRefillForecastSweep() {
                 }
             }
 
-            // Last-day reminder (WhatsApp → SMS → IN_APP)
+            // Last-day reminder (WhatsApp → IN_APP)
             if (userId && daysRemaining === 0 && !rx.lastDayNotifiedAt) {
                 const pref = await prisma.notificationPreference.findUnique({ where: { userId } });
                 if (!pref || pref.medicationReminders !== false) {
@@ -472,9 +471,8 @@ export async function runRefillForecastSweep() {
                     await DeliveryService.send({
                         userId,
                         kind: 'MEDICATION_REFILL_LAST_DAY',
-                        channels: ['WHATSAPP', 'SMS', 'IN_APP'],
+                        channels: ['WHATSAPP', 'IN_APP'],
                         body,
-                        subject: rendered?.subject || null,
                         templateId: rendered?.templateId || null,
                         inAppTitle: `🚨 ${rx.medicationName} runs out today`,
                         inAppType: 'MEDICATION_REFILL_LAST_DAY',
