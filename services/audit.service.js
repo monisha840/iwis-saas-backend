@@ -123,4 +123,61 @@ export class AuditService {
       take: limit,
     });
   }
+
+  /**
+   * Recent system-wide audit events for the admin dashboard "Activity Feed".
+   *
+   * Optionally hospital-scoped by joining through `user.hospitalId`. For events
+   * with no userId (system actions) we surface them tenant-agnostically so the
+   * feed never silently drops them.
+   *
+   * Returns a denormalised, dashboard-friendly shape so the frontend can render
+   * each row without extra lookups.
+   */
+  static async getRecentActivity({ hospitalId = null, limit = 20, entityTypes } = {}) {
+    const cap = Math.min(Math.max(Number(limit) || 20, 1), 100);
+    const where = {};
+    if (Array.isArray(entityTypes) && entityTypes.length) {
+      where.entityType = { in: entityTypes };
+    }
+    if (hospitalId) {
+      where.OR = [
+        { userId: null },
+        { user: { hospitalId } },
+      ];
+    }
+    const rows = await prisma.auditLog.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: cap,
+      include: {
+        user: {
+          select: {
+            id: true, email: true, role: true,
+            doctor: { select: { fullName: true } },
+            therapist: { select: { fullName: true } },
+            patient: { select: { fullName: true } },
+          },
+        },
+      },
+    });
+    return rows.map((r) => {
+      const actorName = r.user
+        ? (r.user.doctor?.fullName ||
+           r.user.therapist?.fullName ||
+           r.user.patient?.fullName ||
+           r.user.email)
+        : 'System';
+      return {
+        id:         r.id,
+        action:     r.action,
+        entityType: r.entityType,
+        entityId:   r.entityId,
+        createdAt:  r.createdAt,
+        actor:      { id: r.user?.id || null, name: actorName, role: r.user?.role || 'SYSTEM' },
+        oldData:    r.oldData,
+        newData:    r.newData,
+      };
+    });
+  }
 }

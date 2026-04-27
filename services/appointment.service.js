@@ -144,6 +144,9 @@ export class AppointmentService {
             contactDetails, consultationType, consultationMode,
             // Custom reminder template attached at booking time by admin / doctor
             customReminderTemplateId, customReminderBody, customReminderSubject, customReminderChannels,
+            // Optional treatment-journey link for co-treater XP attribution on
+            // end-of-journey feedback. Validated inside the tx below.
+            journeyId,
         } = data;
 
         let actualPatientId;
@@ -376,6 +379,34 @@ export class AppointmentService {
                 reminderFields.customReminderUpdatedById = user.id;
             }
 
+            // Validate journey link (if supplied): the journey must exist AND
+            // belong to the appointment's patient. Mismatched journey =
+            // 400 to surface the bug rather than silently dropping the link.
+            let journeyIdToPersist = null;
+            if (journeyId) {
+                // TreatmentJourney.patientId references User.id (not Patient.id);
+                // need to resolve the patient's userId before the equality check.
+                const patient = await tx.patient.findUnique({
+                    where: { id: actualPatientId },
+                    select: { userId: true },
+                });
+                const journey = await tx.treatmentJourney.findUnique({
+                    where: { id: journeyId },
+                    select: { id: true, patientId: true, status: true },
+                });
+                if (!journey) {
+                    const err = new Error('journeyId does not exist');
+                    err.status = 400;
+                    throw err;
+                }
+                if (!patient || journey.patientId !== patient.userId) {
+                    const err = new Error('journeyId does not belong to this patient');
+                    err.status = 400;
+                    throw err;
+                }
+                journeyIdToPersist = journey.id;
+            }
+
             const created = await tx.appointment.create({
                 data: {
                     patientId: actualPatientId,
@@ -394,6 +425,7 @@ export class AppointmentService {
                     consultationMode: consultationMode || 'OFFLINE',
                     meetingLink,
                     branchId: branchIdToUse,
+                    journeyId: journeyIdToPersist,
                     ...reminderFields,
                 },
                 include: { ...includeDetails, triageSession: true }

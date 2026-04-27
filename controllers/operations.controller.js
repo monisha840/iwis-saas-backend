@@ -17,12 +17,43 @@ export class OperationsController {
 
     static async createSharingRequest(req, res, next) {
         try {
-            const { userId, fromBranchId, toBranchId, date, startTime, endTime, reason } = req.body;
+            const { userId, fromBranchId, toBranchId, date, endDate, startTime, endTime, reason } = req.body;
             const record = await ResourceSharingService.createSharingRequest(
-                userId, fromBranchId, toBranchId, date, startTime, endTime, reason
+                userId, fromBranchId, toBranchId, date, startTime, endTime, reason,
+                { endDate: endDate || null, createdById: req.user.id },
             );
             res.status(201).json(record);
-        } catch (err) { next(err); }
+        } catch (err) {
+            if (err.status) return res.status(err.status).json({ error: err.message });
+            next(err);
+        }
+    }
+
+    static async updateSharingRequest(req, res, next) {
+        try {
+            const record = await ResourceSharingService.updateSharingRequest(
+                req.params.id,
+                { id: req.user.id, role: req.user.role, branchId: req.user.branchId || null },
+                req.body || {},
+            );
+            res.json(record);
+        } catch (err) {
+            if (err.status) return res.status(err.status).json({ error: err.message });
+            next(err);
+        }
+    }
+
+    static async deleteSharingRequest(req, res, next) {
+        try {
+            const result = await ResourceSharingService.deleteSharingRequest(
+                req.params.id,
+                { id: req.user.id, role: req.user.role, branchId: req.user.branchId || null },
+            );
+            res.json(result);
+        } catch (err) {
+            if (err.status) return res.status(err.status).json({ error: err.message });
+            next(err);
+        }
     }
 
     static async getRequests(req, res, next) {
@@ -88,7 +119,11 @@ export class OperationsController {
                 medicineId, fromBranchId, toBranchId, quantity, req.user.id, notes
             );
             res.status(201).json(transfer);
-        } catch (err) { next(err); }
+        } catch (err) {
+            // Surface 4xx body so the frontend toast can read the message.
+            if (err.status) return res.status(err.status).json({ error: err.message, code: err.code });
+            next(err);
+        }
     }
 
     static async getTransfers(req, res, next) {

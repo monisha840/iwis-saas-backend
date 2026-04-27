@@ -47,6 +47,10 @@ router.get('/', authorizeRoles('ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST'), 
     } catch (err) { next(err); }
 });
 
+// Package CRUD is admin-only — DOCTOR can view (GET) and enrol patients
+// (POST /:id/enrol) but not create, edit, or deactivate package templates.
+// Authoring is treated as a catalog/admin function. THERAPIST is also
+// excluded — they don't have this entry in their sidebar nav.
 router.post('/', authorizeRoles('ADMIN', 'ADMIN_DOCTOR'), async (req, res, next) => {
     try {
         const data = pkgSchema.parse(req.body);

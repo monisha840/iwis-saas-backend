@@ -109,6 +109,19 @@ router.delete('/block/:id', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCT
 
 router.get('/:doctorId', authMiddleware, async (req, res, next) => {
     try {
+        // BRANCH_ADMIN may only view availability for clinicians in their own
+        // branch. The :doctorId path param is matched against Doctor.id first,
+        // and Therapist.id as a fallback for therapist availability lookups.
+        if (req.user.role === 'BRANCH_ADMIN') {
+            const [doc, ther] = await Promise.all([
+                prisma.doctor.findUnique({ where: { id: req.params.doctorId }, include: { user: { select: { branchId: true } } } }),
+                prisma.therapist.findUnique({ where: { id: req.params.doctorId }, include: { user: { select: { branchId: true } } } }),
+            ]);
+            const targetBranchId = doc?.user?.branchId ?? ther?.user?.branchId ?? null;
+            if (!targetBranchId || targetBranchId !== req.user.branchId) {
+                return res.status(403).json({ error: 'Forbidden: clinician is not in your branch' });
+            }
+        }
         const blocks = await AvailabilityService.getBlocks(req.params.doctorId);
         res.json(blocks);
     } catch (err) {
@@ -124,8 +137,17 @@ const availabilityCheckSchema = z.object({
     startTime: z.string().regex(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/, 'Invalid HH:mm'),
     endTime:   z.string().regex(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/, 'Invalid HH:mm'),
 });
-router.get('/user/:userId/check', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']), validate({ query: availabilityCheckSchema }), async (req, res, next) => {
+router.get('/user/:userId/check', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'BRANCH_ADMIN']), validate({ query: availabilityCheckSchema }), async (req, res, next) => {
     try {
+        if (req.user.role === 'BRANCH_ADMIN') {
+            const target = await prisma.user.findUnique({
+                where: { id: req.params.userId },
+                select: { branchId: true },
+            });
+            if (!target || target.branchId !== req.user.branchId) {
+                return res.status(403).json({ error: 'Forbidden: user is not in your branch' });
+            }
+        }
         const { date, startTime, endTime } = req.query;
         const result = await AvailabilityService.checkAvailabilityForUser(req.params.userId, date, startTime, endTime);
         res.json(result);

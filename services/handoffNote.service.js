@@ -369,6 +369,7 @@ export class HandoffNoteService {
 
     return {
       patientId: appointment.patientId,
+      patientName: appointment.patient?.fullName || null,
       summary: appointment.notes || appointment.sessionNotes || '',
       currentMedications,
       activeConditions,

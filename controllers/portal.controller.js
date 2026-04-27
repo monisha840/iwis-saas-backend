@@ -81,6 +81,19 @@ export class PortalController {
     }
   }
 
+  // Doctor / therapist sees the visit summaries they authored.
+  static async getMyVisitSummaries(req, res, next) {
+    try {
+      const result = await VisitSummaryService.listClinicianVisitSummaries(
+        req.user.id,
+        req.query,
+      );
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  }
+
   static async sendToPatient(req, res, next) {
     try {
       const result = await VisitSummaryService.sendToPatient(req.params.id);

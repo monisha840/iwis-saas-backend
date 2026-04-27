@@ -137,7 +137,7 @@ export class ClinicianXPService {
             title: currentTier.title,
             nextLevel: nextTier ? { level: nextTier.level, title: nextTier.title, minXP: nextTier.minXP } : null,
             xpToNext,
-            progressPercent: Math.min(progressPercent, 100),
+            progress: Math.min(progressPercent, 100),
         };
     }
 

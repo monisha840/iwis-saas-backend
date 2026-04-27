@@ -111,6 +111,9 @@ router.get('/patient/:id', authMiddleware, async (req, res, next) => {
 
 const batchPrescriptionSchema = z.object({
   patientId: z.string(),
+  // Optional treatment-package context shared across all medicines in
+  // this batch — written to Prescription.packageId on every row created.
+  packageId: z.string().optional(),
   medicines: z.array(z.object({
     medicationName: z.string(),
     dosage: z.string(),
@@ -127,7 +130,12 @@ const batchPrescriptionSchema = z.object({
 
 router.post('/batch-add', authMiddleware, roleMiddleware(['DOCTOR', 'THERAPIST', 'ADMIN', 'ADMIN_DOCTOR']), validate({ body: batchPrescriptionSchema }), auditAction('CREATE_PRESCRIPTION', 'Prescription', () => null), async (req, res, next) => {
   try {
-    const prescriptions = await PrescriptionService.createBatchPrescriptions(req.user, req.body.patientId, req.body.medicines);
+    const prescriptions = await PrescriptionService.createBatchPrescriptions(
+      req.user,
+      req.body.patientId,
+      req.body.medicines,
+      { packageId: req.body.packageId || null },
+    );
     res.status(201).json(prescriptions);
   } catch (err) {
     next(err);

@@ -107,9 +107,16 @@ export class GroupSessionService {
                 therapist: { select: { fullName: true } },
                 room: true,
                 appointments: {
-                    include: { patient: { select: { id: true, fullName: true, phoneNumber: true } } }
-                }
-            }
+                    include: {
+                        // `patientId` is the human-readable identifier (e.g.
+                        // "JOHN@123"); `id` is the UUID used for joins. The
+                        // dashboard roster modal needs both — the UUID to key
+                        // rows / link to profiles, and the readable string to
+                        // display next to the patient's name.
+                        patient: { select: { id: true, fullName: true, patientId: true, phoneNumber: true } },
+                    },
+                },
+            },
         });
         return session;
     }

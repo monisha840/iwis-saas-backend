@@ -126,10 +126,15 @@ router.post('/:id/phases',
     }
 );
 
-// PATCH /api/journeys/:id/phases/:phaseId — update phase status
+// PATCH /api/journeys/:id/phases/:phaseId — update phase status, name,
+// duration, or order. Status flips still funnel through activateNextPhase
+// so the journey-completion side effects keep firing.
 const updatePhaseSchema = z.object({
-    status: z.enum(['UPCOMING', 'ACTIVE', 'COMPLETED', 'SKIPPED']),
-});
+    status: z.enum(['UPCOMING', 'ACTIVE', 'COMPLETED', 'SKIPPED']).optional(),
+    name: z.string().min(1).optional(),
+    durationDays: z.number().int().min(1).optional(),
+    order: z.number().int().min(0).optional(),
+}).refine((v) => Object.keys(v).length > 0, { message: 'No fields to update' });
 
 router.patch('/:id/phases/:phaseId',
     authMiddleware,
@@ -141,11 +146,71 @@ router.patch('/:id/phases/:phaseId',
                 const next = await JourneyService.activateNextPhase(req.params.id);
                 return res.json({ message: 'Phase completed', nextPhase: next });
             }
+            const data = {};
+            if (req.body.status       !== undefined) data.status       = req.body.status;
+            if (req.body.name         !== undefined) data.name         = req.body.name;
+            if (req.body.durationDays !== undefined) data.durationDays = req.body.durationDays;
+            if (req.body.order        !== undefined) data.order        = req.body.order;
             const phase = await prisma.journeyPhase.update({
                 where: { id: req.params.phaseId },
-                data: { status: req.body.status }
+                data,
             });
             res.json(phase);
+        } catch (err) { next(err); }
+    }
+);
+
+// DELETE /api/journeys/:id/phases/:phaseId — remove a phase. Cascades to
+// PhaseTask via the schema's onDelete: Cascade.
+router.delete('/:id/phases/:phaseId',
+    authMiddleware,
+    roleMiddleware(['DOCTOR', 'ADMIN_DOCTOR', 'THERAPIST']),
+    async (req, res, next) => {
+        try {
+            await prisma.journeyPhase.delete({ where: { id: req.params.phaseId } });
+            res.json({ message: 'Phase deleted', id: req.params.phaseId });
+        } catch (err) { next(err); }
+    }
+);
+
+// POST /api/journeys/:id/phases/:phaseId/tasks — append a task to a phase.
+// Backend mirror for the UI's per-row "Add Task" button when editing an
+// existing journey rather than building one from scratch.
+const addTaskSchema = z.object({
+    type: z.enum(['MEDICATION', 'EXERCISE', 'DIET', 'THERAPY', 'LIFESTYLE']),
+    title: z.string().min(1),
+    description: z.string().optional(),
+    frequency: z.string().min(1),
+});
+
+router.post('/:id/phases/:phaseId/tasks',
+    authMiddleware,
+    roleMiddleware(['DOCTOR', 'ADMIN_DOCTOR', 'THERAPIST']),
+    validate({ body: addTaskSchema }),
+    async (req, res, next) => {
+        try {
+            const task = await prisma.phaseTask.create({
+                data: {
+                    phaseId: req.params.phaseId,
+                    type: req.body.type,
+                    title: req.body.title,
+                    description: req.body.description || null,
+                    frequency: req.body.frequency,
+                },
+            });
+            res.status(201).json(task);
+        } catch (err) { next(err); }
+    }
+);
+
+// DELETE /api/journeys/:id/phases/:phaseId/tasks/:taskId
+router.delete('/:id/phases/:phaseId/tasks/:taskId',
+    authMiddleware,
+    roleMiddleware(['DOCTOR', 'ADMIN_DOCTOR', 'THERAPIST']),
+    async (req, res, next) => {
+        try {
+            await prisma.phaseTask.delete({ where: { id: req.params.taskId } });
+            res.json({ message: 'Task deleted', id: req.params.taskId });
         } catch (err) { next(err); }
     }
 );

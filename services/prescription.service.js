@@ -134,7 +134,7 @@ export class PrescriptionService {
         };
     }
 
-    static async createBatchPrescriptions(user, patientId, medicines) {
+    static async createBatchPrescriptions(user, patientId, medicines, { packageId = null } = {}) {
         let doctorId = null, therapistId = null;
         let allowed = false;
 
@@ -173,6 +173,21 @@ export class PrescriptionService {
         const patient = await prisma.patient.findUnique({ where: { id: patientId } });
         if (!patient) throw new Error('Patient not found');
 
+        // Sanity-check the package: must exist, belong to the same branch
+        // (or no patient branch), and be active. Bad ids are dropped to
+        // null rather than failing the whole batch — the prescriptions
+        // themselves are still useful without the package context.
+        let resolvedPackageId = null;
+        if (packageId) {
+            const pkg = await prisma.treatmentPackage.findUnique({
+                where: { id: packageId },
+                select: { id: true, branchId: true, isActive: true },
+            });
+            if (pkg && pkg.isActive && (!patient.branchId || pkg.branchId === patient.branchId)) {
+                resolvedPackageId = pkg.id;
+            }
+        }
+
         const created = await prisma.$transaction(async (tx) =>
             Promise.all(medicines.map(med => {
                 const extendedNotes = [
@@ -196,6 +211,7 @@ export class PrescriptionService {
                         sku: med.sku,
                         branchId: patient.branchId,
                         lowStockThreshold: med.lowStockThreshold || 5,
+                        packageId: resolvedPackageId,
                     }
                 });
             }))

@@ -40,7 +40,7 @@ export async function initializeWebSocket(httpServer) {
         }
 
         try {
-            const decoded = jwt.verify(token, process.env.JWT_SECRET);
+            const decoded = jwt.verify(token, config.jwt.secret);
             socket.userId = decoded.id;
             socket.userRole = decoded.role;
             next();

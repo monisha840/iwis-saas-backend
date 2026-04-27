@@ -88,6 +88,24 @@ class SchedulerService {
             })
         );
 
+        // Consultation-feedback 24h reminder push — hourly sweep over the
+        // 24–48h window. No separate expiry job: the 48h cutoff is applied at
+        // read time by ConsultationFeedbackService.getPending.
+        this.jobs.push(
+            cron.schedule('30 * * * *', () => {
+                this.sendConsultationFeedbackReminders();
+            })
+        );
+
+        // Journey-feedback 72h reminder push — hourly sweep. Pending feedback
+        // rows older than 72h with no reminderSentAt get one notification.
+        // Expiry (30 days) is applied at read time, no separate cleanup job.
+        this.jobs.push(
+            cron.schedule('45 * * * *', () => {
+                this.sendJourneyFeedbackReminders();
+            })
+        );
+
         // Advanced care gap detection — daily at 7am
         this.jobs.push(
             cron.schedule('0 7 * * *', () => {
@@ -899,6 +917,39 @@ class SchedulerService {
             }
         } catch (error) {
             logger.error('[SchedulerService] Error sending CSAT surveys:', error);
+        }
+    }
+
+    /**
+     * 24-hour reminder for the 4-question post-consultation feedback flow.
+     * Fires at most once per appointment; expiry is handled by the read-time
+     * 48h cutoff inside ConsultationFeedbackService.getPending.
+     */
+    async sendConsultationFeedbackReminders() {
+        try {
+            const { ConsultationFeedbackService } = await import('./consultationFeedback.service.js');
+            const sent = await ConsultationFeedbackService.sendRemindersForPending();
+            if (sent > 0) {
+                logger.info(`[SchedulerService] Consultation-feedback reminders: ${sent} sent`);
+            }
+        } catch (error) {
+            logger.error('[SchedulerService] Error sending consultation-feedback reminders:', error);
+        }
+    }
+
+    /**
+     * 72h reminder push for end-of-journey feedback rows the patient hasn't
+     * engaged with. Idempotent via reminderSentAt stamp on each row.
+     */
+    async sendJourneyFeedbackReminders() {
+        try {
+            const { JourneyFeedbackService } = await import('./journeyFeedback.service.js');
+            const sent = await JourneyFeedbackService.sendRemindersForPending();
+            if (sent > 0) {
+                logger.info(`[SchedulerService] Journey-feedback reminders: ${sent} sent`);
+            }
+        } catch (error) {
+            logger.error('[SchedulerService] Error sending journey-feedback reminders:', error);
         }
     }
 

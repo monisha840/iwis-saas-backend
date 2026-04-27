@@ -95,7 +95,8 @@ export class VisitSummaryService {
       prisma.visitSummary.findMany({
         where,
         include: {
-          appointment: { select: { date: true, consultationType: true } },
+          appointment: { select: { id: true, date: true, consultationType: true } },
+          patient: { select: { id: true, fullName: true } },
         },
         orderBy: { createdAt: 'desc' },
         skip,
@@ -104,8 +105,61 @@ export class VisitSummaryService {
       prisma.visitSummary.count({ where }),
     ]);
 
+    // Surface the patient's full name on the row itself so the UI can
+    // render "Patient: Jane Doe" without a second lookup.
+    const summaries = data.map((s) => ({
+      ...s,
+      patientName: s.patient?.fullName ?? null,
+    }));
+
     return {
-      data,
+      // Two shapes are intentional: legacy callers consume `summaries`,
+      // newer callers consume the paginated `data` envelope.
+      summaries,
+      data: summaries,
+      pagination: {
+        page: currentPage,
+        limit: take,
+        total,
+        totalPages: Math.ceil(total / take),
+      },
+    };
+  }
+
+  /**
+   * List visit summaries authored by a given clinician (most recent first).
+   * Used by the doctor-side Visit Summary page so the table reflects the
+   * current user's drafts/sent records, not just one patient's history.
+   */
+  static async listClinicianVisitSummaries(clinicianId, { page = 1, limit = 50 } = {}) {
+    const currentPage = Math.max(1, parseInt(page) || 1);
+    const take = Math.min(parseInt(limit) || 50, 100);
+    const skip = (currentPage - 1) * take;
+
+    const where = { clinicianId };
+
+    const [rows, total] = await Promise.all([
+      prisma.visitSummary.findMany({
+        where,
+        include: {
+          appointment: { select: { id: true, date: true, consultationType: true, branchId: true } },
+          patient: { select: { id: true, fullName: true, branchId: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+        skip,
+        take,
+      }),
+      prisma.visitSummary.count({ where }),
+    ]);
+
+    const summaries = rows.map((s) => ({
+      ...s,
+      patientName: s.patient?.fullName ?? null,
+    }));
+
+    return {
+      summaries,
+      data: summaries,
       pagination: {
         page: currentPage,
         limit: take,

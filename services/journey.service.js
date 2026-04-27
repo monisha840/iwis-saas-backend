@@ -97,10 +97,12 @@ export class JourneyService {
     }
 
     /**
-     * Activate the next phase when the current one completes.
+     * Activate the next phase when the current one completes. When no
+     * upcoming phase exists, the journey itself flips to COMPLETED and the
+     * end-of-journey feedback invite is fanned out to the patient.
      */
     static async activateNextPhase(journeyId) {
-        return prisma.$transaction(async (tx) => {
+        const result = await prisma.$transaction(async (tx) => {
             const phases = await tx.journeyPhase.findMany({
                 where: { journeyId },
                 orderBy: { order: 'asc' }
@@ -120,7 +122,7 @@ export class JourneyService {
                     where: { id: nextPhase.id },
                     data: { status: 'ACTIVE', startedAt: new Date() }
                 });
-                return nextPhase;
+                return { nextPhase, completed: false };
             }
 
             await tx.treatmentJourney.update({
@@ -128,12 +130,89 @@ export class JourneyService {
                 data: { status: 'COMPLETED' }
             });
 
-            return null;
+            return { nextPhase: null, completed: true };
         });
+
+        // Outside the tx so feedback init failure can't roll back the phase
+        // transition — the journey is already completed and that has to stick.
+        if (result.completed) {
+            await this._onJourneyCompleted(journeyId).catch((err) => {
+                logger.error('[Journey] _onJourneyCompleted hook failed', { journeyId, err: err.message });
+            });
+        }
+
+        return result.nextPhase;
+    }
+
+    /**
+     * Explicit "mark complete" path used by admin tooling / manual completion
+     * from the journey detail page. Idempotent — calling on an already
+     * COMPLETED journey re-fires the feedback init (which is itself
+     * idempotent on the unique journeyId).
+     */
+    static async completeJourney(journeyId) {
+        const updated = await prisma.treatmentJourney.update({
+            where: { id: journeyId },
+            data: { status: 'COMPLETED' },
+            select: { id: true },
+        });
+        await this._onJourneyCompleted(updated.id).catch((err) => {
+            logger.error('[Journey] _onJourneyCompleted hook failed', { journeyId, err: err.message });
+        });
+        return updated;
+    }
+
+    /**
+     * Private hook fired when a journey transitions to COMPLETED. Initialises
+     * the feedback record + notifies the patient. Best-effort across both
+     * sub-steps so an outage in one channel doesn't block the other.
+     */
+    static async _onJourneyCompleted(journeyId) {
+        const { JourneyFeedbackService } = await import('./journeyFeedback.service.js');
+
+        // 1) Create the pending feedback row (30-day window). Idempotent via
+        //    UNIQUE(journeyId).
+        const feedback = await JourneyFeedbackService.initFromJourney(journeyId);
+        if (!feedback) return;
+
+        // 2) Patient invite — in-app notification + Socket emit. Best-effort.
+        const journey = await prisma.treatmentJourney.findUnique({
+            where: { id: journeyId },
+            select: {
+                title: true,
+                patientId: true,
+                doctor: { select: { fullName: true } },
+            },
+        });
+        if (!journey) return;
+
+        const doctorName = journey.doctor?.fullName || 'your doctor';
+        try {
+            await notificationService.createNotification({
+                userId:   journey.patientId,
+                type:     'JOURNEY_FEEDBACK_AVAILABLE',
+                title:    'Your treatment journey is complete',
+                message:  `Share a quick reflection on your time with ${doctorName} — under two minutes.`,
+                priority: 'MEDIUM',
+                data:     {
+                    journeyId,
+                    feedbackId: feedback.id,
+                    expiresAt:  feedback.expiresAt,
+                    kind:       'journey_feedback_available',
+                },
+            });
+        } catch (err) {
+            logger.warn('[Journey] feedback invite notification failed', { journeyId, err: err.message });
+        }
     }
 
     /**
      * Log a task completion by a patient.
+     *
+     * Each task can be completed AT MOST ONCE per calendar day. If the patient
+     * has already completed this task today, the prior completion is returned
+     * and no zen points are re-awarded — clicking "Done" twice in a row should
+     * be a no-op rather than a points farm. Direct API callers get a 409.
      */
     static async completeTask(taskId, patientId, completionData) {
         const task = await prisma.phaseTask.findUnique({
@@ -141,6 +220,26 @@ export class JourneyService {
             include: { phase: { include: { journey: true } } }
         });
         if (!task) throw Object.assign(new Error('Task not found'), { status: 404 });
+
+        // Day boundary in the server's local timezone. Anything from 00:00 today
+        // onward counts as "already done today" and short-circuits.
+        const startOfDay = new Date();
+        startOfDay.setHours(0, 0, 0, 0);
+
+        const alreadyToday = await prisma.taskCompletion.findFirst({
+            where: {
+                taskId,
+                patientId,
+                completedAt: { gte: startOfDay },
+            },
+            orderBy: { completedAt: 'desc' },
+        });
+        if (alreadyToday) {
+            throw Object.assign(
+                new Error('This task is already completed for today. Try again tomorrow.'),
+                { status: 409, code: 'TASK_ALREADY_COMPLETED_TODAY', completion: alreadyToday },
+            );
+        }
 
         const completion = await prisma.taskCompletion.create({
             data: {
@@ -151,7 +250,8 @@ export class JourneyService {
             }
         });
 
-        // Award zen points for task completion
+        // Award zen points for task completion. Only fires on a NEW completion —
+        // the early-return above means duplicates never reach this branch.
         await prisma.patient.updateMany({
             where: { userId: patientId },
             data: { zenPoints: { increment: 10 } }

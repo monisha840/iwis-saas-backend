@@ -109,6 +109,71 @@ export class ChatService {
         return conversation;
     }
 
+    /**
+     * Ensure the admin doctor has a conversation row with every patient in the
+     * given hospital. Idempotent — getOrCreateConversation skips existing rows.
+     * Best-effort: per-patient failures are swallowed so a single bad row does
+     * not block the rest of the chat list from loading.
+     */
+    static async _ensureAdminDoctorConversations(adminDoctorId, hospitalId) {
+        const patientWhere = hospitalId ? { user: { hospitalId } } : {};
+        const patients = await prisma.patient.findMany({
+            where: patientWhere,
+            select: { id: true }
+        });
+        for (const p of patients) {
+            try {
+                await this.getOrCreateConversation(p.id, adminDoctorId, 'DOCTOR');
+            } catch { /* skip — assignment may fail for edge cases, do not block */ }
+        }
+    }
+
+    /**
+     * Ensure a doctor/therapist has a conversation row with every patient they
+     * have an active or completed appointment with.
+     */
+    static async _ensureClinicianPatientConversations(clinicianId, clinicianType) {
+        const apptWhere = { status: { in: ['CONFIRMED', 'COMPLETED', 'ASSIGNED'] } };
+        if (clinicianType === 'DOCTOR') apptWhere.doctorId = clinicianId;
+        else if (clinicianType === 'THERAPIST') apptWhere.therapistId = clinicianId;
+        else return;
+
+        const appointments = await prisma.appointment.findMany({
+            where: apptWhere,
+            select: { patientId: true },
+            distinct: ['patientId']
+        });
+        for (const a of appointments) {
+            if (!a.patientId) continue;
+            try {
+                await this.getOrCreateConversation(a.patientId, clinicianId, clinicianType);
+            } catch { /* skip — assignment check may fail for stale rows */ }
+        }
+    }
+
+    /**
+     * Pharmacists are linked to patients via dispensing records, not appointments.
+     */
+    static async _ensurePharmacistPatientConversations(pharmacistId) {
+        const pharmacist = await prisma.pharmacist.findUnique({
+            where: { id: pharmacistId },
+            select: { userId: true }
+        });
+        if (!pharmacist) return;
+
+        const dispenses = await prisma.pharmacyDispense.findMany({
+            where: { dispensedBy: pharmacist.userId },
+            select: { patientId: true },
+            distinct: ['patientId']
+        });
+        for (const d of dispenses) {
+            if (!d.patientId) continue;
+            try {
+                await this.getOrCreateConversation(d.patientId, pharmacistId, 'PHARMACIST');
+            } catch { /* skip */ }
+        }
+    }
+
     static async listUserConversations(userId) {
         const user = await prisma.user.findUnique({
             where: { id: userId },
@@ -120,16 +185,26 @@ export class ChatService {
         let where = {};
 
         if (user.role === 'ADMIN_DOCTOR' && user.doctor) {
-            // ADMIN_DOCTOR sees all conversations (top of hierarchy)
+            // ADMIN_DOCTOR is visible to all patients — auto-create a conversation
+            // with every patient in the same hospital so the admin always shows up
+            // in the patient's chat list AND the admin's own list, regardless of
+            // who opens chat first.
+            await this._ensureAdminDoctorConversations(user.doctor.id, user.hospitalId);
             where = {};
         } else if (user.role === 'ADMIN') {
             // ADMIN sees all conversations
             where = {};
         } else if (user.doctor) {
+            // A doctor must see every patient they're consulting with, even if
+            // the patient has not opened chat yet. Auto-create conversations for
+            // every patient with an active/completed appointment under this doctor.
+            await this._ensureClinicianPatientConversations(user.doctor.id, 'DOCTOR');
             where = { doctorId: user.doctor.id };
         } else if (user.therapist) {
+            await this._ensureClinicianPatientConversations(user.therapist.id, 'THERAPIST');
             where = { therapistId: user.therapist.id };
         } else if (user.pharmacist) {
+            await this._ensurePharmacistPatientConversations(user.pharmacist.id);
             where = { pharmacistId: user.pharmacist.id };
         } else if (user.patient) {
             const patientId = user.patient.id;

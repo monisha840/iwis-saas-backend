@@ -1,4 +1,5 @@
 import express from 'express';
+import prisma from '../lib/prisma.js';
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
 import { requireFeature } from '../utils/featureGate.js';
 import { OperationsController } from '../controllers/operations.controller.js';
@@ -6,9 +7,41 @@ import { OperationsController } from '../controllers/operations.controller.js';
 const router = express.Router();
 
 const ADMIN_ROLES = ['ADMIN', 'ADMIN_DOCTOR'];
-const ALL_STAFF = ['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST', 'PHARMACIST'];
+// Branch-scoped admin operations: BRANCH_ADMIN may call them but only against
+// their own branch — enforced by `requireOwnBranch` for path-param routes.
+const BRANCH_SCOPED_ADMIN_ROLES = [...ADMIN_ROLES, 'BRANCH_ADMIN'];
+const ALL_STAFF = ['ADMIN', 'ADMIN_DOCTOR', 'BRANCH_ADMIN', 'DOCTOR', 'THERAPIST', 'PHARMACIST'];
 const INVENTORY_ROLES = ['ADMIN', 'ADMIN_DOCTOR', 'PHARMACIST'];
 const CLINICIAN_ROLES = ['DOCTOR', 'THERAPIST', 'ADMIN_DOCTOR'];
+
+// For BRANCH_ADMIN callers, require that the :branchId path param matches the
+// branchId on their JWT. ADMIN / ADMIN_DOCTOR are allowed to query any branch.
+function requireOwnBranch(paramName = 'branchId') {
+    return (req, res, next) => {
+        if (req.user?.role === 'BRANCH_ADMIN' && req.params[paramName] !== req.user.branchId) {
+            return res.status(403).json({ error: 'Forbidden: branch mismatch' });
+        }
+        next();
+    };
+}
+
+// For BRANCH_ADMIN callers, require that the :userId path param resolves to a
+// user whose branchId matches the JWT branchId.
+async function requireUserInOwnBranch(req, res, next) {
+    try {
+        if (req.user?.role !== 'BRANCH_ADMIN') return next();
+        const target = await prisma.user.findUnique({
+            where: { id: req.params.userId },
+            select: { branchId: true },
+        });
+        if (!target || target.branchId !== req.user.branchId) {
+            return res.status(403).json({ error: 'Forbidden: user is not in your branch' });
+        }
+        next();
+    } catch (err) {
+        next(err);
+    }
+}
 
 // Path-prefix feature gates. Each operations sub-area maps to its own FeatureRegistry
 // key so Super Admin can toggle them independently. Auth is asserted here first since
@@ -60,6 +93,24 @@ router.patch(
     authMiddleware,
     roleMiddleware(ADMIN_ROLES),
     OperationsController.rejectSharingRequest
+);
+
+/** PATCH /api/operations/resource-sharing/:id — edit a PENDING request.
+ *  Authorization handled in service: creator, source-branch admin,
+ *  destination-branch admin, or global ADMIN. */
+router.patch(
+    '/resource-sharing/:id',
+    authMiddleware,
+    roleMiddleware(ADMIN_ROLES),
+    OperationsController.updateSharingRequest
+);
+
+/** DELETE /api/operations/resource-sharing/:id — delete a PENDING request */
+router.delete(
+    '/resource-sharing/:id',
+    authMiddleware,
+    roleMiddleware(ADMIN_ROLES),
+    OperationsController.deleteSharingRequest
 );
 
 // ── Centralized Inventory ───────────────────────────────────────────────────────
@@ -148,11 +199,14 @@ router.get(
     OperationsController.getMyScorecards
 );
 
-/** GET /api/operations/scorecards/branch/:branchId — branch scorecards */
+/** GET /api/operations/scorecards/branch/:branchId — branch scorecards.
+ *  BRANCH_ADMIN may only request their own branch (enforced by requireOwnBranch);
+ *  ADMIN / ADMIN_DOCTOR may query any branch. */
 router.get(
     '/scorecards/branch/:branchId',
     authMiddleware,
-    roleMiddleware(ADMIN_ROLES),
+    roleMiddleware(BRANCH_SCOPED_ADMIN_ROLES),
+    requireOwnBranch('branchId'),
     OperationsController.getBranchScorecards
 );
 
@@ -190,11 +244,13 @@ router.get(
     OperationsController.getMyAttendance
 );
 
-/** GET /api/operations/attendance/branch/:branchId — branch attendance */
+/** GET /api/operations/attendance/branch/:branchId — branch attendance.
+ *  BRANCH_ADMIN may only request their own branch. */
 router.get(
     '/attendance/branch/:branchId',
     authMiddleware,
-    roleMiddleware(ADMIN_ROLES),
+    roleMiddleware(BRANCH_SCOPED_ADMIN_ROLES),
+    requireOwnBranch('branchId'),
     OperationsController.getBranchAttendance
 );
 
@@ -206,11 +262,13 @@ router.get(
     OperationsController.getMyAttendanceStats
 );
 
-/** GET /api/operations/attendance/report/:branchId — punctuality report */
+/** GET /api/operations/attendance/report/:branchId — punctuality report.
+ *  BRANCH_ADMIN may only request their own branch. */
 router.get(
     '/attendance/report/:branchId',
     authMiddleware,
-    roleMiddleware(ADMIN_ROLES),
+    roleMiddleware(BRANCH_SCOPED_ADMIN_ROLES),
+    requireOwnBranch('branchId'),
     OperationsController.getPunctualityReport
 );
 
@@ -222,7 +280,8 @@ router.get(
 router.put(
     '/attendance/user/:userId',
     authMiddleware,
-    roleMiddleware(ADMIN_ROLES),
+    roleMiddleware(BRANCH_SCOPED_ADMIN_ROLES),
+    requireUserInOwnBranch,
     OperationsController.setAttendance
 );
 
@@ -230,7 +289,8 @@ router.put(
 router.delete(
     '/attendance/user/:userId',
     authMiddleware,
-    roleMiddleware(ADMIN_ROLES),
+    roleMiddleware(BRANCH_SCOPED_ADMIN_ROLES),
+    requireUserInOwnBranch,
     OperationsController.deleteAttendance
 );
 
@@ -253,6 +313,7 @@ router.get(
     '/calendar/clinician/:userId',
     authMiddleware,
     roleMiddleware(ALL_STAFF),
+    requireUserInOwnBranch,
     OperationsController.getClinicianCalendar
 );
 
@@ -266,21 +327,25 @@ router.get(
 );
 
 /** GET /api/operations/calendar/branch/:branchId?year=&month=
- *  Branch-wide workload heatmap — one row per clinician, one cell per day. */
+ *  Branch-wide workload heatmap — one row per clinician, one cell per day.
+ *  BRANCH_ADMIN may only request their own branch. */
 router.get(
     '/calendar/branch/:branchId',
     authMiddleware,
-    roleMiddleware(ADMIN_ROLES),
+    roleMiddleware(BRANCH_SCOPED_ADMIN_ROLES),
+    requireOwnBranch('branchId'),
     OperationsController.getBranchCalendar
 );
 
 // ── Skill Matrix ────────────────────────────────────────────────────────────────
 
-/** POST /api/operations/skills — add a skill */
+/** POST /api/operations/skills — add a skill (clinicians edit their own skills;
+ *  BRANCH_ADMIN is explicitly excluded — skill editing belongs to ADMIN /
+ *  ADMIN_DOCTOR or the clinician themself, never to a branch admin). */
 router.post(
     '/skills',
     authMiddleware,
-    roleMiddleware(ALL_STAFF),
+    roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST', 'PHARMACIST']),
     OperationsController.addSkill
 );
 
@@ -288,7 +353,7 @@ router.post(
 router.delete(
     '/skills/:skillType/:skillName',
     authMiddleware,
-    roleMiddleware(ALL_STAFF),
+    roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST', 'PHARMACIST']),
     OperationsController.removeSkill
 );
 
@@ -300,11 +365,14 @@ router.get(
     OperationsController.getMySkills
 );
 
-/** GET /api/operations/skills/matrix/:branchId — branch skill matrix */
+/** GET /api/operations/skills/matrix/:branchId — branch skill matrix.
+ *  BRANCH_ADMIN may read their own branch (read-only — POST/DELETE /skills
+ *  remain blocked since BRANCH_ADMIN is not in ALL_STAFF for those handlers). */
 router.get(
     '/skills/matrix/:branchId',
     authMiddleware,
-    roleMiddleware(ADMIN_ROLES),
+    roleMiddleware(BRANCH_SCOPED_ADMIN_ROLES),
+    requireOwnBranch('branchId'),
     OperationsController.getSkillMatrix
 );
 

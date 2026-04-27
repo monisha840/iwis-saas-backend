@@ -101,9 +101,39 @@ model User {
   staffThreadMemberships     StaffThreadMember[]     @relation("StaffThreadMembership")
   staffThreadMembersAdded    StaffThreadMember[]     @relation("StaffMemberAddedBy")
   staffMessagesSent          StaffMessage[]          @relation("StaffMessageSender")
+  // Journey feedback (patient-side submissions + lead-doctor attribution)
+  journeyFeedbackPatient     JourneyFeedback[]       @relation("JourneyFeedbackPatient")
+  journeyFeedbackLeadDoctor  JourneyFeedback[]       @relation("JourneyFeedbackLeadDoctor")
+  thankYouCardsReceived      ThankYouCard[]          @relation("ThankYouCardRecipient")
+  // Flattened export-friendly snapshot kept in sync with this user
+  snapshot                   UserSnapshot?
 
   @@index([branchId])
   @@index([hospitalId])
+}
+
+/// Flattened, role-agnostic record of every user's reportable core data.
+/// Maintained in lock-step with User via UserService.upsertSnapshot() so
+/// the admin export endpoint can serve a single denormalised query without
+/// having to join across Doctor / Therapist / Patient / Pharmacist tables.
+model UserSnapshot {
+  userId      String   @id
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  fullName    String?
+  email       String
+  role        String
+  branchId    String?
+  branchName  String?
+  hospitalId  String?
+  phoneNumber String?
+  status      String   // ACTIVE | DELETED | INVITED
+  createdAt   DateTime
+  updatedAt   DateTime @default(now())
+
+  @@index([role])
+  @@index([branchId])
+  @@index([hospitalId])
+  @@index([status])
 }
 
 model RefreshToken {
@@ -188,6 +218,9 @@ model Branch {
   criticalFlags       PatientCriticalFlag[]
   // Staff group chats scoped to this branch
   staffThreads        StaffThread[]
+  consultationFeedback ConsultationFeedback[]
+  // Journey feedback scoped to this branch (for branch-filtered admin views)
+  journeyFeedback     JourneyFeedback[]    @relation("JourneyFeedbackBranch")
 }
 
 model AuditLog {
@@ -238,6 +271,7 @@ model Doctor {
   // IWIS competitor features
   dietPrescriptions  DietPrescription[]
   patientAssignments PatientAssignment[]
+  consultationFeedback ConsultationFeedback[]
 }
 
 // Canonical record of who's looking after a patient. Supersedes the old
@@ -396,6 +430,7 @@ model Patient {
   referralsReceived   Referral[]          @relation("PatientReferredBy")
   retentionChecklists RetentionChecklist[]
   appointmentFeedback AppointmentFeedback[]
+  consultationFeedback ConsultationFeedback[]
   challengeCompletions PatientChallengeCompletion[]
   zenPointsLedger     ZenPointsLedger[]
   patientStreak       PatientStreak?
@@ -438,6 +473,13 @@ model DailyCheckIn {
   id         String   @id @default(uuid())
   patientId  String
   painLevel  Int
+  // Structured per-region pain log captured via the body-map step of the
+  // 3-step daily check-in. Shape (JSON array): [{ regionId, regionLabel,
+  // intensity (1-10), characters: string[], radiates: bool, radiatesTo? }].
+  // Mirrors TriageSession.painRegions so the same body-map component renders
+  // both. painLevel is kept as the legacy/derived max intensity for older
+  // analytics paths and quick filtering.
+  painRegions  Json?
   mobilityScore Int?
   sleepHours    Float
   mood         String
@@ -506,6 +548,7 @@ model Appointment {
   csatSentAt       DateTime?
   retentionChecklist RetentionChecklist?
   feedback           AppointmentFeedback?
+  consultationFeedback ConsultationFeedback?
   visitSummary       VisitSummary?
   // IWIS competitor features
   therapyRoomId      String?
@@ -533,6 +576,11 @@ model Appointment {
   reminderDeliveryLogs       ReminderDeliveryLog[]
   // Follow-up schedule captured at consultation completion (1:1)
   followUp                   AppointmentFollowUp?
+  // Optional link to a TreatmentJourney — drives co-treater XP attribution
+  // on JourneyFeedback. Existing rows stay null; populated by booking flow
+  // or admin tooling going forward.
+  journeyId                  String?
+  journey                    TreatmentJourney? @relation("JourneyAppointments", fields: [journeyId], references: [id], onDelete: SetNull)
 
   @@index([patientId])
   @@index([doctorId])
@@ -540,6 +588,7 @@ model Appointment {
   @@index([status])
   @@index([date])
   @@index([branchId])
+  @@index([journeyId])
   // Composite indexes for high-frequency joined queries
   @@index([doctorId, date])         // Availability check: "is the doctor free on date X?"
   @@index([therapistId, date])      // Availability check: "is the therapist free on date X?"
@@ -598,6 +647,11 @@ model Prescription {
   // VisitSummary to surface the exact prescriptions authored during the visit.
   appointmentId     String?
   appointment       Appointment?       @relation(fields: [appointmentId], references: [id], onDelete: SetNull)
+  // Optional link to a TreatmentPackage selected during prescription
+  // creation. Lets the receiving pharmacist / patient see the broader
+  // package context without joining through PackageEnrolment.
+  packageId         String?
+  package           TreatmentPackage?  @relation(fields: [packageId], references: [id], onDelete: SetNull)
 
   @@index([patientId])
   @@index([doctorId])
@@ -605,6 +659,7 @@ model Prescription {
   @@index([createdAt])
   @@index([branchId])
   @@index([appointmentId])
+  @@index([packageId])
   @@index([discontinuedAt, expectedEndDate])
 }
 
@@ -1193,6 +1248,7 @@ enum Role {
   PATIENT
   ADMIN
   PHARMACIST
+  BRANCH_ADMIN
 }
 
 enum ConsultationType {
@@ -1332,6 +1388,115 @@ model AppointmentFeedback {
   @@index([branchId])
 }
 
+// ── Structured post-consultation feedback ────────────────────────────────────
+// 4-question flow shown to the patient on their next app open after a doctor
+// marks the consultation COMPLETED. Each positive response awards 1 XP to the
+// doctor via ClinicianXPService (max 4 XP per submission). Stars live on
+// AppointmentFeedback; this table captures the richer qualitative answers.
+
+enum FeedbackMcqOption {
+  A
+  B
+  C
+  D
+}
+
+model ConsultationFeedback {
+  id                    String             @id @default(cuid())
+  appointmentId         String             @unique
+  appointment           Appointment        @relation(fields: [appointmentId], references: [id])
+  patientId             String
+  patient               Patient            @relation(fields: [patientId], references: [id])
+  doctorId              String
+  doctor                Doctor             @relation(fields: [doctorId], references: [id])
+  branchId              String?
+  branch                Branch?            @relation(fields: [branchId], references: [id])
+  faceScaleEmotional    Int?               // 1–5
+  faceScaleConfidence   Int?               // 1–5
+  mcqListening          FeedbackMcqOption?
+  mcqReturn             FeedbackMcqOption?
+  xpAwarded             Int                @default(0)
+  createdAt             DateTime           @default(now())
+  completedAt           DateTime?
+
+  @@index([doctorId])
+  @@index([patientId])
+  @@index([branchId])
+  @@index([createdAt])
+}
+
+// 7-stage feedback experience triggered when a TreatmentJourney is marked
+// COMPLETED. 1:1 with TreatmentJourney via UNIQUE(journeyId). Single
+// submission only — once `completedAt` is set, the row is final.
+model JourneyFeedback {
+  id                       String              @id @default(cuid())
+  journeyId                String              @unique
+  journey                  TreatmentJourney    @relation(fields: [journeyId], references: [id], onDelete: Cascade)
+  patientId                String
+  patient                  User                @relation("JourneyFeedbackPatient", fields: [patientId], references: [id])
+  leadDoctorId             String
+  leadDoctor               User                @relation("JourneyFeedbackLeadDoctor", fields: [leadDoctorId], references: [id])
+  branchId                 String?
+  branch                   Branch?             @relation("JourneyFeedbackBranch", fields: [branchId], references: [id])
+
+  // 4 operational MCQs — each individually skippable (null = skipped)
+  mcqAppointments          FeedbackMcqOption?
+  mcqReminders             FeedbackMcqOption?
+  mcqMedications           FeedbackMcqOption?
+  mcqFamilyRecommendation  FeedbackMcqOption?
+
+  // Garden / growth metaphor — 5 levels (1, 3, 5, 7, 10)
+  gardenScore              Int?
+  // Face-of-care experience — 1-5
+  faceScaleExperience      Int?
+
+  // Thank-you card (optional, free-form, max 2000 chars)
+  thankYouCardText         String?
+  thankYouCardPublic       Boolean             @default(false)
+
+  photosViewed             Boolean             @default(false)
+  // Immutable snapshots — DO NOT update if grading rules change later.
+  xpAwarded                Int                 @default(0)
+  xpDistribution           Json                @default("{}")
+
+  // Spec: feedback remains available 30 days; silently closes after that.
+  expiresAt                DateTime
+  // 72h reminder push tracker (idempotency stamp).
+  reminderSentAt           DateTime?
+
+  createdAt                DateTime            @default(now())
+  completedAt              DateTime?
+
+  thankYouCard             ThankYouCard?
+
+  @@index([leadDoctorId])
+  @@index([patientId])
+  @@index([branchId])
+  @@index([completedAt])
+  @@index([completedAt, reminderSentAt])
+}
+
+// Privacy-isolated thank-you note. Separate model so the doctor recognition
+// panel can join only on visibility-allowed cards without leaking the rest
+// of the feedback payload.
+model ThankYouCard {
+  id                  String                  @id @default(cuid())
+  feedbackId          String                  @unique
+  feedback            JourneyFeedback         @relation(fields: [feedbackId], references: [id], onDelete: Cascade)
+  recipientDoctorId   String
+  recipientDoctor     User                    @relation("ThankYouCardRecipient", fields: [recipientDoctorId], references: [id])
+  content             String
+  visibility          ThankYouCardVisibility  @default(PRIVATE)
+  createdAt           DateTime                @default(now())
+
+  @@index([recipientDoctorId, visibility, createdAt])
+}
+
+enum ThankYouCardVisibility {
+  PRIVATE
+  PUBLIC
+}
+
 // ── Treatment Journey Engine ─────────────────────────────────────────────────
 // Structured illness-to-wellness journey with phases, tasks, milestones, and vitals.
 
@@ -1352,6 +1517,8 @@ model TreatmentJourney {
   milestones      JourneyMilestone[]
   vitals          PatientVital[]
   clinicalPhotos  ClinicalPhoto[]
+  appointments    Appointment[]     @relation("JourneyAppointments")
+  feedback        JourneyFeedback?
   wellnessScore   Float             @default(0)
   createdAt       DateTime          @default(now())
   updatedAt       DateTime          @updatedAt
@@ -1681,12 +1848,18 @@ model ResourceSharing {
   fromBranch    Branch   @relation("SharingFrom", fields: [fromBranchId], references: [id], onDelete: Cascade)
   toBranchId    String
   toBranch      Branch   @relation("SharingTo", fields: [toBranchId], references: [id], onDelete: Cascade)
+  // `date` is the start date. `endDate` was added so the form can capture
+  // a true date range; nullable so back-fill of legacy rows is a no-op.
   date          DateTime
+  endDate       DateTime?
   startTime     String
   endTime       String
   status        SharingStatus @default(PENDING)
   reason        String?
   approvedBy    String?
+  // The user that created this request — used for "creator can edit/delete
+  // their own pending request" gating. Nullable for legacy rows.
+  createdById   String?
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
@@ -1695,6 +1868,7 @@ model ResourceSharing {
   @@index([toBranchId])
   @@index([date])
   @@index([status])
+  @@index([createdById])
 }
 
 enum SharingStatus {
@@ -2610,7 +2784,8 @@ model TreatmentPackage {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
-  enrolments PackageEnrolment[]
+  enrolments    PackageEnrolment[]
+  prescriptions Prescription[]
 
   @@index([branchId])
   @@index([isActive])

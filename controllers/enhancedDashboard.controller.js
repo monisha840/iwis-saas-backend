@@ -93,6 +93,15 @@ export class EnhancedDashboardController {
     }
   }
 
+  static async getLastPainRegions(req, res, next) {
+    try {
+      const result = await EnhancedDashboardService.getLastPainRegions(req.user.patientId);
+      res.json(result);
+    } catch (err) {
+      next(err);
+    }
+  }
+
   // ── Medication lifecycle ──────────────────────────────────────────────
   static async getMedicationForecast(req, res, next) {
     try {

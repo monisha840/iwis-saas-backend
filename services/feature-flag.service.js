@@ -103,6 +103,7 @@ export class FeatureFlagService {
             { key: 'prescription_refill',       enabled: true,  description: 'Enable patient self-service prescription refill requests' },
             { key: 'branch_leaderboard',        enabled: true,  description: 'Show branch-level performance benchmarking to ADMIN_DOCTOR' },
             { key: 'patient_timeline',          enabled: true,  description: 'Show EHR-style longitudinal patient timeline' },
+            { key: 'consultation_feedback_flow', enabled: true, description: '4-question post-consultation feedback prompt on the patient Today dashboard' },
         ];
 
         for (const flag of defaults) {

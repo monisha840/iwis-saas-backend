@@ -30,7 +30,23 @@ router.get('/', authMiddleware, async (req, res, next) => {
 
 router.put('/:id/read', authMiddleware, async (req, res, next) => {
     try {
-        const notification = await notificationService.markAsRead(req.params.id);
+        const notification = await notificationService.markAsRead(req.params.id, req.user.id);
+        if (!notification) {
+            return res.status(404).json({ error: 'Notification not found' });
+        }
+        res.json(notification);
+    } catch (err) {
+        next(err);
+    }
+});
+
+// Frontend specs sometimes expect POST for the mark-as-read action; accept both.
+router.post('/:id/read', authMiddleware, async (req, res, next) => {
+    try {
+        const notification = await notificationService.markAsRead(req.params.id, req.user.id);
+        if (!notification) {
+            return res.status(404).json({ error: 'Notification not found' });
+        }
         res.json(notification);
     } catch (err) {
         next(err);

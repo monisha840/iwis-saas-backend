@@ -23,6 +23,10 @@ router.get('/smart-messages', EnhancedDashboardController.getSmartMessages);
 // Smart insight (recomputed pattern from last 14 check-ins)
 router.get('/insight', EnhancedDashboardController.getInsight);
 
+// Last persisted pain regions (used to pre-populate the body-map step of
+// the daily check-in so returning patients see their previous selection)
+router.get('/last-pain-regions', EnhancedDashboardController.getLastPainRegions);
+
 // Inline actions
 router.post('/check-in', EnhancedDashboardController.submitCheckIn);
 router.post('/medications/mark-taken', EnhancedDashboardController.markMedicationTaken);

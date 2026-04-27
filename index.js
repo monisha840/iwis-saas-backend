@@ -22,6 +22,7 @@ import { globalLimiter } from './middleware/rateLimiter.js';
 import authRoutes from './routes/auth.js';
 // ... other imports
 import userRoutes from './routes/user.js';
+import feedbackRoutes from './routes/feedback.js';
 import appointmentsRoutes from './routes/appointments.js';
 import prescriptionRoutes from './routes/prescription.js';
 import consultationRoutes from './routes/consultation.js';
@@ -77,6 +78,8 @@ import messageTemplateRoutes from './routes/message-templates.js';
 import reminderSettingRoutes from './routes/reminder-settings.js';
 // Critical-journey: admin view of at-risk patients
 import criticalJourneyRoutes from './routes/critical-journey.js';
+// Recent audit-log feed (admin dashboard activity widget)
+import auditLogRoutes from './routes/audit-logs.js';
 // Inbound webhooks (Daily.co room-ended, etc.)
 import webhooksRoutes from './routes/webhooks.js';
 
@@ -176,6 +179,9 @@ app.use('/api/auth', authRoutes);
 // User profile routes
 app.use('/api/user', userRoutes);
 
+// Patient feedback (star ratings + 4-question consultation flow)
+app.use('/api/feedback', feedbackRoutes);
+
 // Appointments routes
 app.use('/api/appointments', appointmentsRoutes);
 app.use('/api/prescriptions', prescriptionRoutes);
@@ -235,6 +241,9 @@ app.use('/api/reminder-settings', reminderSettingRoutes);
 
 // Critical-journey — admin view of at-risk patients (feature-gated)
 app.use('/api/critical-journey', criticalJourneyRoutes);
+
+// Recent audit-log activity feed for the admin dashboard
+app.use('/api/audit-logs', auditLogRoutes);
 
 // Inbound webhooks (Daily.co room-ended → auto-complete appointment, etc.)
 // Route uses express.raw() internally for HMAC verification — scoped local

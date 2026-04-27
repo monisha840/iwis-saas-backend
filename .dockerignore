@@ -1,8 +1,47 @@
-node_modules/
+node_modules
 npm-debug.log*
 .env
 .env.*
+!.env.example
+.git
+.github
+
+# Runtime artefacts — generated, must not ship
 uploads/
 exports/
+logs/
 *.log
-.git/
+error.txt
+test-output.txt
+
+# Tests, fixtures, coverage
+tests/
+coverage/
+vitest.config.js
+
+# One-off diagnostic / backfill scripts at the repo root. The Dockerfile
+# already strips these from the image, but excluding them up-front keeps the
+# build context small and avoids accidental inclusion.
+audit-*.js
+check-*.js
+cleanup-*.js
+diag-*.js
+fix-*.js
+get-*.js
+list-*.js
+migrate-branches.js
+reproduce_issue.js
+seed-database.js
+seed-med.js
+seed-message-templates.js
+send-test-*.js
+update-*.js
+test-*.js
+test_*.txt
+
+# Docs / editor junk
+*.md
+.vscode
+.idea
+.DS_Store
+Thumbs.db

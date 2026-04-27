@@ -6,6 +6,7 @@ import config from '../config/index.js';
 import logger from '../lib/logger.js';
 import { cacheService } from './cache.service.js';
 import { emailService } from './email.service.js';
+import { StreakService } from './streak.service.js';
 
 const BCRYPT_ROUNDS = 12;
 
@@ -81,6 +82,7 @@ export class AuthService {
             return { mfaRequired: true, tempToken };
         }
 
+        await this._bumpPatientStreakOnLogin(user);
         return this._issueTokens(user, { ip, userAgent });
     }
 
@@ -434,6 +436,7 @@ export class AuthService {
             throw error;
         }
 
+        await this._bumpPatientStreakOnLogin(user);
         return this._issueTokens(user, { ip, userAgent });
     }
 
@@ -469,6 +472,26 @@ export class AuthService {
     }
 
     // ── Private Helpers ─────────────────────────────────────────────────────────
+
+    /**
+     * Treat a successful patient login as an "active day" so the dashboard
+     * streak advances. Best-effort: any failure is logged but never blocks
+     * login. No-op for non-patient roles (clinician streaks have a separate
+     * activity definition driven by the daily scheduler).
+     */
+    static async _bumpPatientStreakOnLogin(user) {
+        if (user.role !== 'PATIENT') return;
+        try {
+            const patient = await prisma.patient.findUnique({
+                where: { userId: user.id },
+                select: { id: true }
+            });
+            if (!patient) return;
+            await StreakService.updatePatientStreak(patient.id);
+        } catch (err) {
+            logger.error('Failed to bump patient streak on login', err, { userId: user.id });
+        }
+    }
 
     static async _issueTokens(user, { ip, userAgent } = {}) {
         const jti = crypto.randomUUID();

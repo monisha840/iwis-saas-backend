@@ -40,12 +40,23 @@ export const DietPackageService = {
         if (hospitalId) where.hospitalId = hospitalId;
         if (status)     where.status = status;
 
+        // When the caller is asking for APPROVED packages (the assignment-time
+        // dropdown), strip out archived/inactive rows so they never show up in
+        // the patient assignment selector. Other status filters (PENDING /
+        // REJECTED / ARCHIVED) intentionally don't apply isActive — admins
+        // need to see the full review queue.
+        if (status === 'APPROVED') {
+            where.isActive = true;
+        }
+
         // Creators (DOCTOR / THERAPIST) see: any APPROVED package in the
         // hospital (so they can assign from a colleague's work) + all of
         // their own submissions in any status. Approvers see everything.
+        // PENDING packages authored by the caller still show up here so
+        // doctors can track their own submissions awaiting review.
         if (CREATOR_ROLES.has(role) && mineUserId) {
             where.OR = [
-                { status: 'APPROVED' },
+                { status: 'APPROVED', isActive: true },
                 { createdById: mineUserId },
             ];
         }

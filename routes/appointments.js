@@ -42,7 +42,11 @@ const appointmentSchema = z.object({
   customReminderTemplateId: z.string().nullable().optional(),
   customReminderBody: z.string().nullable().optional(),
   customReminderSubject: z.string().nullable().optional(),
-  customReminderChannels: z.array(channelEnum).optional()
+  customReminderChannels: z.array(channelEnum).optional(),
+  // Optional link to a TreatmentJourney — drives co-treater XP attribution
+  // on JourneyFeedback. Server validates the journey exists and belongs to
+  // the same patient before persisting.
+  journeyId: z.string().nullable().optional(),
 });
 
 const reminderTemplatePatchSchema = z.object({

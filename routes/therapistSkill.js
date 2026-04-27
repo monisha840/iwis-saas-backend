@@ -1,5 +1,6 @@
 import express from 'express';
 import { z } from 'zod';
+import prisma from '../lib/prisma.js';
 import { TherapistSkillService } from '../services/therapistSkill.service.js';
 import { authenticateToken, authorizeRoles } from '../middleware/auth.js';
 import { requireFeature } from '../utils/featureGate.js';
@@ -36,6 +37,16 @@ router.get('/coverage', authorizeRoles('ADMIN', 'ADMIN_DOCTOR'), async (req, res
 
 router.get('/:therapistId/skills', async (req, res, next) => {
     try {
+        // BRANCH_ADMIN may only inspect skills of therapists in their branch.
+        if (req.user?.role === 'BRANCH_ADMIN') {
+            const ther = await prisma.therapist.findUnique({
+                where: { id: req.params.therapistId },
+                include: { user: { select: { branchId: true } } },
+            });
+            if (!ther || ther.user?.branchId !== req.user.branchId) {
+                return res.status(403).json({ error: 'Forbidden: therapist is not in your branch' });
+            }
+        }
         res.json(await TherapistSkillService.listSkills(req.params.therapistId));
     } catch (err) { next(err); }
 });

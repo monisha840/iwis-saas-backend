@@ -16,6 +16,7 @@ import { ZenPointsService } from './zenPoints.service.js';
 import { notificationService } from './notification.service.js';
 import { emitToUser } from '../websocket/index.js';
 import { parseDailyDoseCount } from './medicationFrequency.js';
+import { SmartInsightService } from './smartInsight.service.js';
 
 const MS_HOUR = 60 * 60 * 1000;
 const MS_DAY = 24 * MS_HOUR;
@@ -82,8 +83,10 @@ export class EnhancedDashboardService {
       nextAppointment,
       patientStreak,
       latestTriage,
+      latestCheckInWithRegions,
       unreadNotifications,
       prescribedVitals,
+      careTeamAssignments,
     ] = await Promise.all([
       prisma.patient.findUnique({
         where: { id: patientId },
@@ -161,6 +164,14 @@ export class EnhancedDashboardService {
         orderBy: { createdAt: 'desc' },
         select: { id: true, painRegions: true, createdAt: true },
       }),
+      // Latest DailyCheckIn that actually has a body-map array — primary
+      // source for the dashboard pain map. Falls back to TriageSession
+      // inside buildPainMap when this is null.
+      prisma.dailyCheckIn.findFirst({
+        where: { patientId, painRegions: { not: null } },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true, painRegions: true, createdAt: true },
+      }),
       prisma.notification.count({ where: { userId, isRead: false } }),
       prisma.prescribedVital.findMany({
         where: { patientId, active: true },
@@ -176,6 +187,23 @@ export class EnhancedDashboardService {
           },
         },
       }),
+      // Active care-team assignments — surfaced on the patient dashboard so
+      // the patient can see at a glance who their primary doctor is (and any
+      // consulting / temporary fall-backs). Sorted by type so PRIMARY is
+      // always first regardless of insertion order.
+      prisma.patientAssignment.findMany({
+        where: { patientId, status: 'ACTIVE' },
+        orderBy: [{ type: 'asc' }, { assignedAt: 'desc' }],
+        include: {
+          doctor: {
+            select: {
+              id: true, fullName: true, specialization: true,
+              qualification: true, profilePhoto: true,
+              user: { select: { email: true } },
+            },
+          },
+        },
+      }).catch(() => []),
     ]);
 
     if (!patient) {
@@ -213,12 +241,37 @@ export class EnhancedDashboardService {
     const journey = this.buildJourneyCard(activeJourneyByUser);
 
     // ── Pain Map ─────────────────────────────────────────────────────────
-    const painMap = this.buildPainMap(latestTriage);
+    const painMap = this.buildPainMap(latestCheckInWithRegions, latestTriage);
 
     // ── Smart Messages ───────────────────────────────────────────────────
     const smartMessages = await this.getSmartMessages(patientId, userId, {
       todayCheckIn, medications, nextAppointment, patientStreak,
     });
+
+    // ── Care Team — patient-facing snapshot of who's assigned ────────────
+    // PRIMARY is the lead doctor; CONSULTING / TEMPORARY are surfaced as
+    // "additional" rows so the patient understands fall-back coverage.
+    const careTeam = (() => {
+      const primary = careTeamAssignments.find((a) => a.type === 'PRIMARY') || null;
+      const additional = careTeamAssignments.filter((a) => a.type !== 'PRIMARY');
+      const mapAssignment = (a) => ({
+        assignmentId: a.id,
+        type: a.type,
+        assignedAt: a.assignedAt,
+        doctor: {
+          id: a.doctor.id,
+          fullName: a.doctor.fullName || null,
+          specialization: a.doctor.specialization || null,
+          qualification: a.doctor.qualification || null,
+          profilePhoto: a.doctor.profilePhoto || null,
+          email: a.doctor.user?.email || null,
+        },
+      });
+      return {
+        primary: primary ? mapAssignment(primary) : null,
+        additional: additional.map(mapAssignment),
+      };
+    })();
 
     // ── Notification preference (channel indicators) ─────────────────────
     const channels = await prisma.notificationPreference.findUnique({
@@ -252,6 +305,7 @@ export class EnhancedDashboardService {
       zen: zenProfile,
       painMap,
       smartMessages,
+      careTeam,
       channels: channels || {
         emailEnabled: true, smsEnabled: false,
         pushEnabled: true, whatsappEnabled: false,
@@ -629,20 +683,95 @@ export class EnhancedDashboardService {
     };
   }
 
-  static buildPainMap(latestTriage) {
-    if (!latestTriage || !latestTriage.painRegions) {
-      return { regions: [], lastUpdated: null };
+  /**
+   * Build the dashboard pain map. Latest DailyCheckIn.painRegions is the
+   * primary source — patients now log pain through the daily check-in body
+   * map. Falls back to the latest TriageSession.painRegions when the patient
+   * triaged but hasn't done a check-in yet (so returning patients still see
+   * their last known pain map). Always emits the simplified
+   * { region, severity } shape that the existing dashboard tile expects;
+   * the rich body-map view reads `painRegionsRaw` instead.
+   */
+  static buildPainMap(latestCheckInWithRegions, latestTriage) {
+    const source = (latestCheckInWithRegions && Array.isArray(latestCheckInWithRegions.painRegions))
+      ? latestCheckInWithRegions
+      : latestTriage;
+
+    if (!source || !source.painRegions) {
+      return { regions: [], regionsRaw: [], lastUpdated: null };
     }
-    const regions = Array.isArray(latestTriage.painRegions) ? latestTriage.painRegions : [];
+    const regions = Array.isArray(source.painRegions) ? source.painRegions : [];
     return {
       regions: regions
         .filter((r) => r && (r.severity || r.intensity || r.score) != null)
         .map((r) => ({
-          region: r.region || r.regionId || r.label || 'Unknown',
+          region: r.regionLabel || r.region || r.label || 'Unknown',
           severity: r.severity ?? r.intensity ?? r.score ?? 0,
         })),
-      lastUpdated: latestTriage.createdAt,
+      // Full structured regions for the body-map renderer (read-only).
+      regionsRaw: regions.filter((r) => r && (r.intensity || r.severity || r.score) != null),
+      lastUpdated: source.createdAt,
     };
+  }
+
+  /**
+   * Normalize a pain-regions array off the request body. Caps array length,
+   * clamps intensity to 0-10, sanitizes characters to a known whitelist,
+   * defaults regionLabel from regionId. Anything malformed is dropped
+   * silently rather than failing the whole check-in.
+   */
+  static normalizePainRegions(input) {
+    if (!Array.isArray(input)) return [];
+    const allowedCharacters = new Set(['Aching', 'Burning', 'Stabbing', 'Throbbing', 'Cramping', 'Numbness', 'Tingling']);
+    const out = [];
+    for (const r of input.slice(0, 26)) {
+      if (!r || typeof r !== 'object') continue;
+      const regionId = String(r.regionId || r.region || '').trim();
+      if (!regionId) continue;
+      const intensityRaw = Number(r.intensity ?? r.severity ?? r.score);
+      if (!Number.isFinite(intensityRaw)) continue;
+      const intensity = Math.max(0, Math.min(10, Math.round(intensityRaw)));
+      const characters = Array.isArray(r.characters)
+        ? r.characters.filter((c) => typeof c === 'string' && allowedCharacters.has(c))
+        : [];
+      const radiates = Boolean(r.radiates);
+      const radiatesTo = typeof r.radiatesTo === 'string' && r.radiatesTo ? r.radiatesTo : undefined;
+      out.push({
+        regionId,
+        regionLabel: String(r.regionLabel || r.label || regionId).slice(0, 80),
+        intensity,
+        characters,
+        radiates,
+        ...(radiatesTo ? { radiatesTo } : {}),
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Last persisted pain regions for a patient — used to pre-populate the
+   * body map in Step 2 of the daily check-in so returning patients only
+   * have to adjust rather than re-enter from scratch. Reads the most
+   * recent DailyCheckIn first, falling back to the latest TriageSession.
+   */
+  static async getLastPainRegions(patientId) {
+    const lastCheckIn = await prisma.dailyCheckIn.findFirst({
+      where: { patientId, painRegions: { not: null } },
+      orderBy: { createdAt: 'desc' },
+      select: { painRegions: true, createdAt: true },
+    });
+    if (lastCheckIn && Array.isArray(lastCheckIn.painRegions)) {
+      return { painRegions: lastCheckIn.painRegions, source: 'check_in', recordedAt: lastCheckIn.createdAt };
+    }
+    const lastTriage = await prisma.triageSession.findFirst({
+      where: { patientId },
+      orderBy: { createdAt: 'desc' },
+      select: { painRegions: true, createdAt: true },
+    });
+    if (lastTriage && Array.isArray(lastTriage.painRegions)) {
+      return { painRegions: lastTriage.painRegions, source: 'triage', recordedAt: lastTriage.createdAt };
+    }
+    return { painRegions: [], source: null, recordedAt: null };
   }
 
   // ── Smart Messages ───────────────────────────────────────────────────────
@@ -697,59 +826,12 @@ export class EnhancedDashboardService {
     return 'CLINICAL';
   }
 
-  // ── Smart Insight Engine: detect patterns in last 14 check-ins ───────────
+  // ── Smart Insight Engine — multi-region pattern detection ────────────────
+  // Delegates to SmartInsightService so the engine is unit-testable and
+  // independently usable. Engine surfaces multi-region patterns
+  // (persistent_region, new_region) plus the legacy sleep / trend rules.
   static async computeSmartInsight(patientId) {
-    const checkIns = await prisma.dailyCheckIn.findMany({
-      where: { patientId },
-      orderBy: { createdAt: 'desc' },
-      take: 14,
-    });
-    if (checkIns.length < 4) return null;
-
-    // Pattern: pain higher on low-sleep days
-    const lowSleep = checkIns.filter((c) => (c.sleepHours || 0) < 6);
-    const adequateSleep = checkIns.filter((c) => (c.sleepHours || 0) >= 6);
-    if (lowSleep.length >= 2 && adequateSleep.length >= 2) {
-      const lowAvg = avg(lowSleep.map((c) => c.painLevel));
-      const adqAvg = avg(adequateSleep.map((c) => c.painLevel));
-      if (lowAvg - adqAvg >= 1.5) {
-        return {
-          title: 'Sleep impacts your pain',
-          message: `Your pain levels are highest on days when you sleep under 6 hours (${lowAvg.toFixed(1)} vs ${adqAvg.toFixed(1)}). Try a consistent bedtime.`,
-        };
-      }
-    }
-
-    // Pattern: improving sleep trend (last 7 vs prior 7)
-    if (checkIns.length >= 8) {
-      const recent = checkIns.slice(0, 7);
-      const prior = checkIns.slice(7);
-      const recentSleep = avg(recent.map((c) => c.sleepHours || 0));
-      const priorSleep = avg(prior.map((c) => c.sleepHours || 0));
-      if (priorSleep > 0 && recentSleep > priorSleep * 1.1) {
-        const pct = Math.round(((recentSleep - priorSleep) / priorSleep) * 100);
-        return {
-          title: 'Your sleep is improving',
-          message: `Your sleep quality improved ${pct}% this week. The breathing exercises are working — keep going!`,
-        };
-      }
-    }
-
-    // Pattern: wellness improving (pain trending down)
-    const recent3 = checkIns.slice(0, 3);
-    const prior3 = checkIns.slice(3, 6);
-    if (recent3.length === 3 && prior3.length === 3) {
-      const r = avg(recent3.map((c) => c.painLevel));
-      const p = avg(prior3.map((c) => c.painLevel));
-      if (p - r >= 1.5) {
-        return {
-          title: 'Your pain is trending down',
-          message: `Average pain dropped from ${p.toFixed(1)} to ${r.toFixed(1)} over the last week. Great progress!`,
-        };
-      }
-    }
-
-    return null;
+    return SmartInsightService.computeForPatient(patientId);
   }
 
   // ── Action: submit 3-step check-in ───────────────────────────────────────
@@ -765,11 +847,28 @@ export class EnhancedDashboardService {
     const moodMap = { TERRIBLE: 'terrible', LOW: 'low', OKAY: 'okay', GOOD: 'good', GREAT: 'great' };
     const sleepMap = { POOR: 3, FAIR: 5.5, GOOD: 7, GREAT: 8.5 };
 
+    // Normalize the body-map regions sent from Step 2. Empty array is a
+    // valid "no pain today" state — the patient can mark zero regions and
+    // proceed; we record painRegions: [] and set painLevel to the
+    // explicit slider value or 0.
+    const painRegions = this.normalizePainRegions(body.painRegions);
+    const maxIntensityFromRegions = painRegions.reduce(
+      (max, r) => Math.max(max, r.intensity || 0),
+      0,
+    );
+    // painLevel is kept for legacy analytics paths — derive it from the
+    // body map's max intensity when regions are present, otherwise fall
+    // back to the explicit numeric the client sent.
+    const painLevel = painRegions.length > 0
+      ? maxIntensityFromRegions
+      : (Number(body.painLevel) || 0);
+
     const checkIn = await prisma.$transaction(async (tx) => {
       const created = await tx.dailyCheckIn.create({
         data: {
           patientId,
-          painLevel: Number(body.painLevel) || 0,
+          painLevel,
+          painRegions: painRegions.length > 0 ? painRegions : [],
           mood: moodMap[String(body.mood || '').toUpperCase()] || 'okay',
           sleepHours: typeof body.sleepHours === 'number'
             ? body.sleepHours
@@ -784,8 +883,15 @@ export class EnhancedDashboardService {
       return created;
     });
 
-    // Care-gap alert if pain is severe
-    if (Number(body.painLevel) >= 8) {
+    // Care-gap alert: trigger when ANY single body region was rated
+    // intensity >= 8 (or the legacy painLevel scalar in the no-regions
+    // path). Includes the offending region names + scores in the message
+    // so the doctor sees actionable context immediately.
+    const highPainRegions = painRegions.filter((r) => r.intensity >= 8);
+    const triggerAlert = highPainRegions.length > 0
+      || (painRegions.length === 0 && Number(body.painLevel) >= 8);
+
+    if (triggerAlert) {
       try {
         const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
         const existingAlert = await prisma.notification.findFirst({
@@ -797,30 +903,55 @@ export class EnhancedDashboardService {
           select: { id: true },
         });
         if (!existingAlert) {
-          const patient = await prisma.patient.findUnique({
+          const patientRow = await prisma.patient.findUnique({
             where: { id: patientId },
             select: { fullName: true, branchId: true },
           });
           const doctors = await prisma.user.findMany({
             where: {
               role: { in: ['DOCTOR', 'ADMIN_DOCTOR'] },
-              ...(patient?.branchId ? { branchId: patient.branchId } : {}),
+              ...(patientRow?.branchId ? { branchId: patientRow.branchId } : {}),
             },
             select: { id: true },
             take: 10,
           });
+
+          const patientLabel = patientRow?.fullName || 'A patient';
+          const message = highPainRegions.length > 0
+            ? `${patientLabel} reported ${highPainRegions
+                .map((r) => `intensity ${r.intensity} in ${r.regionLabel}`)
+                .join(' and ')} in today's check-in.`
+            : `${patientLabel} reported pain ${body.painLevel}/10 in today's check-in.`;
+
+          const wsPayload = {
+            patientId,
+            checkInId: checkIn.id,
+            patientName: patientLabel,
+            highPainRegions: highPainRegions.map((r) => ({
+              regionId: r.regionId,
+              regionLabel: r.regionLabel,
+              intensity: r.intensity,
+            })),
+            message,
+          };
+
           for (const d of doctors) {
             await prisma.notification.create({
               data: {
                 userId: d.id,
                 type: 'CARE_GAP_HIGH_PAIN',
                 title: 'High pain reported',
-                message: `${patient?.fullName || 'A patient'} reported pain ${body.painLevel}/10 in today's check-in.`,
+                message,
                 priority: 'HIGH',
                 relatedId: patientId,
-                data: { patientId },
+                data: wsPayload,
               },
             });
+            try {
+              emitToUser(d.id, 'care_gap.high_pain', wsPayload);
+            } catch (wsErr) {
+              logger.warn('[EnhancedDashboard] care-gap socket emit failed', { err: wsErr.message });
+            }
           }
         }
       } catch (err) {
@@ -967,12 +1098,33 @@ export class EnhancedDashboardService {
   }
 
   // ── Action: complete a phase task ────────────────────────────────────────
+  // A task can be completed at most once per calendar day. Tapping the same
+  // task twice on the dashboard used to create a second TaskCompletion row
+  // (and award zen points twice via the journey path); both endpoints now
+  // surface a 409 instead so the UI can keep the row marked DONE without
+  // farming points.
   static async completePhaseTask(userId, taskId) {
     const task = await prisma.phaseTask.findUnique({
       where: { id: taskId },
       include: { phase: true },
     });
     if (!task) throw Object.assign(new Error('Task not found'), { status: 404 });
+
+    const startOfDay = new Date();
+    startOfDay.setHours(0, 0, 0, 0);
+    const alreadyToday = await prisma.taskCompletion.findFirst({
+      where: {
+        taskId,
+        patientId: userId,
+        completedAt: { gte: startOfDay },
+      },
+    });
+    if (alreadyToday) {
+      throw Object.assign(
+        new Error('This task is already completed for today. Try again tomorrow.'),
+        { status: 409, code: 'TASK_ALREADY_COMPLETED_TODAY' },
+      );
+    }
 
     const completion = await prisma.taskCompletion.create({
       data: { taskId, patientId: userId },

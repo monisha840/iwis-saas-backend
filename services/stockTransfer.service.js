@@ -57,6 +57,21 @@ export class StockTransferService {
      * Create a stock transfer request between branches.
      */
     static async createTransferRequest(medicineId, fromBranchId, toBranchId, quantity, requestedBy, notes) {
+        // Same-branch guard: a transfer that doesn't move stock anywhere is
+        // an obvious user error. Block at the API boundary so the frontend
+        // dropdown filter can't be the only safeguard.
+        if (fromBranchId && toBranchId && fromBranchId === toBranchId) {
+            const err = new Error('Source and destination branch cannot be the same');
+            err.status = 400;
+            err.code = 'SAME_BRANCH_TRANSFER';
+            throw err;
+        }
+        if (!Number.isFinite(quantity) || quantity <= 0) {
+            const err = new Error('Transfer quantity must be a positive number');
+            err.status = 400;
+            throw err;
+        }
+
         const transfer = await prisma.stockTransfer.create({
             data: {
                 medicineId,

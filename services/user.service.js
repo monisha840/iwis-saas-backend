@@ -31,6 +31,68 @@ function computeAge(dob) {
 }
 
 export class UserService {
+    /**
+     * Upsert the flattened UserSnapshot row for a given userId. Called from
+     * createUser, deleteUser, and any role-specific update endpoint so the
+     * admin export endpoint can serve a single denormalised query without
+     * having to join across Doctor / Therapist / Patient / Pharmacist.
+     *
+     * Failures here MUST NOT roll back the parent operation — we log and
+     * continue. The snapshot is a reporting cache, not the source of truth.
+     */
+    static async upsertSnapshot(userId, { tx } = {}) {
+        const client = tx || prisma;
+        try {
+            const u = await client.user.findUnique({
+                where: { id: userId },
+                include: {
+                    branch:     { select: { id: true, name: true } },
+                    doctor:     { select: { fullName: true } },
+                    therapist:  { select: { fullName: true } },
+                    patient:    { select: { fullName: true, phoneNumber: true } },
+                    pharmacist: { select: { fullName: true } },
+                },
+            });
+            if (!u) return;
+
+            const fullName = u.doctor?.fullName
+                ?? u.therapist?.fullName
+                ?? u.patient?.fullName
+                ?? u.pharmacist?.fullName
+                ?? null;
+            const status = u.deletedAt ? 'DELETED'
+                : (u.emailVerifiedAt ? 'ACTIVE' : 'INVITED');
+
+            await client.userSnapshot.upsert({
+                where: { userId: u.id },
+                create: {
+                    userId:      u.id,
+                    fullName,
+                    email:       u.email,
+                    role:        u.role,
+                    branchId:    u.branchId,
+                    branchName:  u.branch?.name || null,
+                    hospitalId:  u.hospitalId,
+                    phoneNumber: u.patient?.phoneNumber || null,
+                    status,
+                    createdAt:   u.createdAt,
+                },
+                update: {
+                    fullName,
+                    email:       u.email,
+                    role:        u.role,
+                    branchId:    u.branchId,
+                    branchName:  u.branch?.name || null,
+                    hospitalId:  u.hospitalId,
+                    phoneNumber: u.patient?.phoneNumber || null,
+                    status,
+                },
+            });
+        } catch (err) {
+            logger.warn?.(`UserSnapshot upsert failed for ${userId}: ${err.message}`);
+        }
+    }
+
     static async listTherapists({ search = '', branchId = null } = {}) {
         try {
             // Build root-level AND conditions so that the OR search clause does not
@@ -119,12 +181,18 @@ export class UserService {
     }
 
     static async listDoctors(options = null) {
-        // Supports legacy positional call listDoctors(branchId) and new object form listDoctors({ branchId, search })
-        const branchId = typeof options === 'string' ? options : (options?.branchId ?? null);
-        const search   = typeof options === 'string' ? ''      : (options?.search   ?? '');
+        // Supports legacy positional call listDoctors(branchId) and new object form
+        // listDoctors({ branchId, search, includeAvailability }).
+        const branchId          = typeof options === 'string' ? options : (options?.branchId ?? null);
+        const search            = typeof options === 'string' ? ''      : (options?.search   ?? '');
+        const includeAvailability = typeof options === 'object' && options !== null
+            ? options.includeAvailability !== false
+            : true;
 
         try {
-            // Build root-level AND conditions so each filter is composed cleanly
+            // Both DOCTOR and ADMIN_DOCTOR get a Doctor profile at user-creation time
+            // (see createUser), so we don't filter by role — ADMIN_DOCTOR doctors
+            // need to be assignable as a regular doctor target.
             const conditions = [{ user: { deletedAt: null } }];
             if (branchId) conditions.push({ user: { branchId } });
             if (search)   conditions.push({ fullName: { contains: search, mode: 'insensitive' } });
@@ -132,21 +200,97 @@ export class UserService {
 
             const doctors = await prisma.doctor.findMany({
                 where,
-                include: { user: { include: { branch: true } }, _count: { select: { appointments: true } } }
+                include: {
+                    user: { include: { branch: true } },
+                    _count: { select: { appointments: true } },
+                },
             });
-            return doctors.map((doc) => ({
-                id: doc.id,
-                fullName: doc.fullName,
-                specialization: doc.specialization,
-                profilePhoto: doc.profilePhoto,
-                yearsExperience: doc.yearsExperience,
-                qualification: doc.qualification,
-                clinic: doc.clinic,
-                email: doc.user?.email,
-                branchId: doc.user?.branchId,
-                branchName: doc.user?.branch?.name,
-                appointmentCount: doc._count?.appointments || 0,
-            }));
+
+            // Best-effort availability check: a doctor is "unavailable today" if
+            // they have a BlockedSlot covering today's date (LEAVE / WFH / OFF) or
+            // their appointment count for today is at-or-above a soft cap.
+            const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+            const todayEnd   = new Date(todayStart); todayEnd.setDate(todayEnd.getDate() + 1);
+
+            let blockedByDoctorId = new Map();
+            let appointmentsTodayByDoctorId = new Map();
+            if (includeAvailability && doctors.length > 0) {
+                const doctorIds = doctors.map((d) => d.id);
+                const [blocks, todayAppts] = await Promise.all([
+                    prisma.blockedSlot.findMany({
+                        where: {
+                            doctorId: { in: doctorIds },
+                            OR: [
+                                { date: { gte: todayStart, lt: todayEnd } },
+                                { date: null }, // recurring (dayOfWeek-based) blocks
+                            ],
+                        },
+                        select: { doctorId: true, kind: true, reason: true, date: true, dayOfWeek: true },
+                    }).catch(() => []),
+                    prisma.appointment.groupBy({
+                        by: ['doctorId'],
+                        where: {
+                            doctorId: { in: doctorIds },
+                            date: { gte: todayStart, lt: todayEnd },
+                            status: { in: ['PENDING', 'CONFIRMED', 'ASSIGNED', 'ACCEPTED'] },
+                        },
+                        _count: { _all: true },
+                    }).catch(() => []),
+                ]);
+
+                const todayDow = todayStart.getDay();
+                for (const b of blocks) {
+                    if (b.date) {
+                        blockedByDoctorId.set(b.doctorId, b);
+                    } else if (b.dayOfWeek === todayDow) {
+                        blockedByDoctorId.set(b.doctorId, b);
+                    }
+                }
+                for (const a of todayAppts) {
+                    appointmentsTodayByDoctorId.set(a.doctorId, a._count._all);
+                }
+            }
+
+            const SOFT_DAILY_CAP = 12; // doctors with >=12 appointments today flagged AT_CAPACITY
+
+            return doctors.map((doc) => {
+                const block = blockedByDoctorId.get(doc.id) || null;
+                const apptsToday = appointmentsTodayByDoctorId.get(doc.id) || 0;
+                let availability = 'AVAILABLE';
+                let unavailableReason = null;
+                if (block) {
+                    availability = 'UNAVAILABLE';
+                    unavailableReason = block.kind === 'LEAVE'
+                        ? `On leave${block.reason ? ` — ${block.reason}` : ''}`
+                        : block.kind === 'WFH'
+                            ? 'Working from home'
+                            : block.kind === 'OFF'
+                                ? 'Off today'
+                                : (block.reason || 'Unavailable today');
+                } else if (apptsToday >= SOFT_DAILY_CAP) {
+                    availability = 'AT_CAPACITY';
+                    unavailableReason = `Fully booked today (${apptsToday} appointments)`;
+                }
+
+                return {
+                    id: doc.id,
+                    userId: doc.userId,
+                    fullName: doc.fullName,
+                    specialization: doc.specialization,
+                    profilePhoto: doc.profilePhoto,
+                    yearsExperience: doc.yearsExperience,
+                    qualification: doc.qualification,
+                    clinic: doc.clinic,
+                    email: doc.user?.email,
+                    role: doc.user?.role || 'DOCTOR',
+                    branchId: doc.user?.branchId,
+                    branchName: doc.user?.branch?.name,
+                    appointmentCount: doc._count?.appointments || 0,
+                    appointmentsToday: apptsToday,
+                    availability,
+                    unavailableReason,
+                };
+            });
         } catch (err) {
             logger.error('[UserService.listDoctors]', err);
             throw err;
@@ -174,7 +318,7 @@ export class UserService {
         }
     }
 
-    static async listPatients({ search = '', branchId = null } = {}) {
+    static async listPatients({ search = '', branchId = null, assignedDoctorId = null, assignedTherapistId = null } = {}) {
         try {
             // Use explicit AND so that the OR search clause is scoped correctly alongside
             // the user.deletedAt filter and the optional branchId filter. Without explicit
@@ -188,6 +332,20 @@ export class UserService {
                         { patientId:   { contains: search, mode: 'insensitive' } },
                         { phoneNumber: { contains: search, mode: 'insensitive' } },
                     ],
+                });
+            }
+            // Restrict to patients with an active or completed appointment under
+            // the calling clinician — same definition the chat & assignment
+            // checks use, so visibility stays consistent across the app.
+            const ASSIGNED_STATUSES = ['CONFIRMED', 'COMPLETED', 'ASSIGNED'];
+            if (assignedDoctorId) {
+                conditions.push({
+                    appointments: { some: { doctorId: assignedDoctorId, status: { in: ASSIGNED_STATUSES } } },
+                });
+            }
+            if (assignedTherapistId) {
+                conditions.push({
+                    appointments: { some: { therapistId: assignedTherapistId, status: { in: ASSIGNED_STATUSES } } },
                 });
             }
             const where = conditions.length === 1 ? conditions[0] : { AND: conditions };
@@ -244,6 +402,7 @@ export class UserService {
             createdAt: user.createdAt,
             emailVerifiedAt: user.emailVerifiedAt,
             mfaEnabled: user.mfaEnabled,
+            branchId: user.branchId,
             branch: user.branch,
             hospital: user.hospital,
             doctor: user.doctor,
@@ -377,19 +536,68 @@ export class UserService {
         if (role === 'THERAPIST') {
             const therapist = await prisma.therapist.findUnique({ where: { userId } });
             if (!therapist) throw new Error('Therapist profile not found');
-            const journeys = await prisma.journey.findMany({
-                where:   { therapistId: therapist.id },
-                include: { patient: { include: { user: { select: { email: true } } } } },
-            });
-            return journeys.map((j) => ({
-                id:           j.patient.id,
-                userId:       j.patient.userId,
-                fullName:     j.patient.fullName,
-                email:        j.patient.user?.email,
-                phoneNumber:  j.patient.phoneNumber,
-                status:       j.status,
-                journeyType:  j.status,
-            }));
+
+            // Therapists' patient roster is the union of:
+            //   1. Patients linked via legacy Journey.therapistId
+            //   2. Patients on any Appointment for this therapist that is
+            //      currently active (PENDING / CONFIRMED / SCHEDULED) or
+            //      already COMPLETED — i.e. patients the therapist has
+            //      worked with or is about to. The Journey-only query
+            //      missed everyone for therapists with no journey rows.
+            const [journeys, appointments] = await Promise.all([
+                prisma.journey.findMany({
+                    where:   { therapistId: therapist.id },
+                    include: { patient: { include: { user: { select: { email: true, branchId: true } } } } },
+                }),
+                prisma.appointment.findMany({
+                    where: {
+                        therapistId: therapist.id,
+                        status: { in: ['PENDING', 'CONFIRMED', 'SCHEDULED', 'ACCEPTED', 'COMPLETED', 'PENDING_DOCTOR_APPROVAL', 'PENDING_THERAPIST_APPROVAL'] },
+                    },
+                    include: { patient: { include: { user: { select: { email: true, branchId: true } } } } },
+                    orderBy: { date: 'desc' },
+                }),
+            ]);
+
+            // De-dupe by patient.id while preserving the most useful
+            // status column from a journey when present.
+            const byId = new Map();
+            for (const j of journeys) {
+                if (!j.patient) continue;
+                byId.set(j.patient.id, {
+                    id:           j.patient.id,
+                    userId:       j.patient.userId,
+                    fullName:     j.patient.fullName,
+                    email:        j.patient.user?.email,
+                    phoneNumber:  j.patient.phoneNumber,
+                    branchId:     j.patient.branchId ?? j.patient.user?.branchId ?? null,
+                    therapyType:  j.patient.therapyType,
+                    status:       j.status,
+                    journeyType:  j.status,
+                    completedSittings: j.completedSessions ?? 0,
+                    totalSittings:     j.totalSessions ?? 0,
+                });
+            }
+            for (const a of appointments) {
+                if (!a.patient) continue;
+                if (byId.has(a.patient.id)) continue;
+                byId.set(a.patient.id, {
+                    id:           a.patient.id,
+                    userId:       a.patient.userId,
+                    fullName:     a.patient.fullName,
+                    email:        a.patient.user?.email,
+                    phoneNumber:  a.patient.phoneNumber,
+                    branchId:     a.patient.branchId ?? a.patient.user?.branchId ?? null,
+                    therapyType:  a.patient.therapyType,
+                    // No journey → derive a synthetic status from the most
+                    // recent appointment status so the UI can still bucket.
+                    status:       a.status === 'COMPLETED' ? 'COMPLETED' : 'ACTIVE',
+                    journeyType:  null,
+                    completedSittings: 0,
+                    totalSittings:     0,
+                });
+            }
+            return Array.from(byId.values());
         }
 
         if (role !== 'DOCTOR' && role !== 'ADMIN_DOCTOR') {
@@ -464,12 +672,24 @@ export class UserService {
             specialization, qualification, yearsExperience, clinic,
             registrationNumber,
             initialSkills,
+            patientId,
+            medicalHistory,
         } = data;
         // Canonicalise gender to uppercase so downstream checks (e.g. pregnancy toggle)
         // don't have to worry about mixed-case history (Female / female / FEMALE).
         const gender = normaliseGender(rawGender);
 
         const branchId = await this._validateBranchId(inputBranchId);
+        // Branch isolation: a DOCTOR without a branchId would defeat the
+        // requireBranchScoped middleware (their JWT would have no branchId
+        // claim and every scoped route would 403). Reject at intake — a DB
+        // CHECK constraint enforces the same rule, but failing here gives a
+        // friendlier 400 than a Prisma constraint violation.
+        if (role === 'DOCTOR' && !branchId) {
+            const error = new Error('branchId is required for DOCTOR users');
+            error.status = 400;
+            throw error;
+        }
         const existing = await prisma.user.findUnique({ where: { email } });
         if (existing) {
             const error = new Error('Email already registered');
@@ -509,18 +729,24 @@ export class UserService {
                         registrationNumber: registrationNumber || null,
                     },
                 });
-                // Seed the therapist's skill matrix. Primary specialization is
-                // always added as CERTIFIED (if it maps to an enum value);
-                // additional picks default to EXPERIENCED. De-duped so a skill
-                // listed in both slots only produces one row.
+                // Seed the therapist's skill matrix. Each `initialSkills`
+                // entry is either a bare enum string (legacy clients —
+                // defaults to EXPERIENCED) or `{ skill, proficiency }` from
+                // the new Create User form. Primary specialization always
+                // wins as CERTIFIED so a therapist's main skill never gets
+                // downgraded by a stray entry.
                 const skillSet = new Map();
+                if (Array.isArray(initialSkills)) {
+                    for (const entry of initialSkills) {
+                        if (typeof entry === 'string') {
+                            if (!skillSet.has(entry)) skillSet.set(entry, 'EXPERIENCED');
+                        } else if (entry && typeof entry === 'object' && entry.skill) {
+                            skillSet.set(entry.skill, entry.proficiency || 'EXPERIENCED');
+                        }
+                    }
+                }
                 if (specialization && THERAPIST_SKILLS.has(specialization)) {
                     skillSet.set(specialization, 'CERTIFIED');
-                }
-                if (Array.isArray(initialSkills)) {
-                    for (const s of initialSkills) {
-                        if (!skillSet.has(s)) skillSet.set(s, 'EXPERIENCED');
-                    }
                 }
                 if (skillSet.size > 0) {
                     await tx.therapistSkill.createMany({
@@ -537,6 +763,26 @@ export class UserService {
                 const age = dobDate
                     ? Math.floor((Date.now() - dobDate.getTime()) / (365.25 * 24 * 60 * 60 * 1000))
                     : null;
+                // Patient.patientId is unique — if the auto-generated value
+                // collides (e.g. two patients share a first name), append
+                // a short suffix until we find a free slot. Cap retries so
+                // we never spin on pathological inputs.
+                let resolvedPatientId = patientId || null;
+                if (resolvedPatientId) {
+                    let candidate = resolvedPatientId;
+                    for (let attempt = 0; attempt < 25; attempt += 1) {
+                        const clash = await tx.patient.findUnique({
+                            where: { patientId: candidate },
+                            select: { id: true },
+                        });
+                        if (!clash) {
+                            resolvedPatientId = candidate;
+                            break;
+                        }
+                        candidate = `${resolvedPatientId}_${attempt + 2}`;
+                        if (attempt === 24) resolvedPatientId = candidate; // best-effort
+                    }
+                }
                 await tx.patient.create({
                     data: {
                         userId: newUser.id,
@@ -547,6 +793,18 @@ export class UserService {
                         age,
                         gender: gender || null,
                         therapyType: therapyType || null,
+                        patientId: resolvedPatientId,
+                        // Medical history is stashed in the existing
+                        // onboardingData JSON column so we don't need a
+                        // schema migration for the intake fields.
+                        onboardingData: medicalHistory
+                            ? {
+                                patientType: medicalHistory.patientType,
+                                previousDoctorName: medicalHistory.previousDoctorName ?? null,
+                                previousDoctorDetails: medicalHistory.previousDoctorDetails ?? null,
+                                capturedAt: new Date().toISOString(),
+                            }
+                            : undefined,
                     },
                 });
             } else if (role === 'PHARMACIST') {
@@ -559,8 +817,42 @@ export class UserService {
                     },
                 });
             }
+            // Sync the flattened reporting row inside the same transaction
+            // so we never have a User without a matching UserSnapshot.
+            await UserService.upsertSnapshot(newUser.id, { tx });
             return newUser;
         });
+    }
+
+    /**
+     * List every user in a flattened, role-agnostic shape. Used by the
+     * admin "Export All Users" endpoint. Reads from UserSnapshot when
+     * available; falls back to a JOIN-based query for legacy rows where
+     * the snapshot was never written.
+     */
+    static async exportAllUsers({ branchId = null, role = null, includeDeleted = false } = {}) {
+        const where = {};
+        if (branchId) where.branchId = branchId;
+        if (role)     where.role     = role;
+        if (!includeDeleted) where.status = { not: 'DELETED' };
+
+        const rows = await prisma.userSnapshot.findMany({
+            where,
+            orderBy: [{ role: 'asc' }, { fullName: 'asc' }],
+        });
+
+        return rows.map((r) => ({
+            id:          r.userId,
+            fullName:    r.fullName,
+            email:       r.email,
+            role:        r.role,
+            branchId:    r.branchId,
+            branchName:  r.branchName,
+            phoneNumber: r.phoneNumber,
+            status:      r.status,
+            createdAt:   r.createdAt,
+            updatedAt:   r.updatedAt,
+        }));
     }
 
     /**
@@ -587,6 +879,22 @@ export class UserService {
         if (!patient) { const e = new Error('Patient not found'); e.status = 404; throw e; }
         if (!doctor)  { const e = new Error('Doctor not found');  e.status = 404; throw e; }
 
+        // Guard against soft-deleted target doctors. Both DOCTOR and ADMIN_DOCTOR
+        // user records map to a Doctor profile and are valid assignee targets;
+        // this is the explicit confirmation that ADMIN_DOCTOR self-assignment
+        // (assignedById === doctor.userId) is permitted.
+        if (doctor.user?.deletedAt) {
+            const e = new Error('Cannot assign to a deactivated doctor');
+            e.status = 400;
+            throw e;
+        }
+        const targetRole = doctor.user?.role;
+        if (targetRole && !['DOCTOR', 'ADMIN_DOCTOR'].includes(targetRole)) {
+            const e = new Error(`Cannot assign patient to a user with role ${targetRole}`);
+            e.status = 400;
+            throw e;
+        }
+
         if (!allowCrossBranch
             && patient.branchId
             && doctor.user?.branchId
@@ -612,6 +920,9 @@ export class UserService {
                     data:  { status: 'REPLACED', endedAt: new Date(), endReason: 'Replaced by new assignment' },
                 });
             }
+            // TEMPORARY (or CONSULTING) assignments leave the existing PRIMARY
+            // intact — the patient's primary doctor relationship is preserved
+            // for the duration of the unavailability.
             return tx.patientAssignment.create({
                 data: {
                     patientId, doctorId, type,
@@ -677,11 +988,16 @@ export class UserService {
      * the AdminDashboard "Unassigned Patients" card.
      */
     static async listUnassignedPatients({ branchId = null, hospitalId = null } = {}) {
+        // Build the user filter atomically — previously the spread for
+        // hospitalId and the explicit deletedAt key collided on the
+        // `user` field, silently dropping the hospital scope.
+        const userFilter = { deletedAt: null };
+        if (hospitalId) userFilter.hospitalId = hospitalId;
+
         const patients = await prisma.patient.findMany({
             where: {
-                ...(branchId   ? { branchId } : {}),
-                ...(hospitalId ? { user: { hospitalId } } : {}),
-                user: { deletedAt: null },
+                ...(branchId ? { branchId } : {}),
+                user: userFilter,
             },
             include: {
                 user:                { select: { id: true, email: true, branchId: true } },
@@ -691,6 +1007,7 @@ export class UserService {
                     select: { id: true },
                 },
             },
+            orderBy: { createdAt: 'desc' },
         });
         return patients
             .filter((p) => p.patientAssignments.length === 0)
@@ -789,7 +1106,10 @@ export class UserService {
         else if (type === 'pharmacist') profile = await prisma.pharmacist.findUnique({ where: { id }, include: { user: true } });
 
         if (!profile) throw new Error(`${type} not found`);
-        return prisma.user.update({ where: { id: profile.userId }, data: { deletedAt: new Date() } });
+        const updated = await prisma.user.update({ where: { id: profile.userId }, data: { deletedAt: new Date() } });
+        // Reflect the soft-delete on the snapshot row.
+        await UserService.upsertSnapshot(profile.userId);
+        return updated;
     }
 
     static async updateProfile(type, id, data) {

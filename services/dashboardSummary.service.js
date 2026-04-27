@@ -77,6 +77,13 @@ export class DashboardSummaryService {
         const scope = (!branchId || branchId === 'ALL') ? null : branchId;
         const branchScoped = scope ? { branchId: scope } : {};
 
+        // Branch scope used for surfacing group sessions on the doctor's My
+        // Tasks list. Falls back to the doctor's home branch when the top-bar
+        // scope selector says "ALL". Null when neither is available — we then
+        // skip the group-session query entirely rather than running an
+        // unscoped one.
+        const groupSessionBranchId = (!branchId || branchId === 'ALL') ? user.branchId : branchId;
+
         const [
             appointmentsToday,
             pendingApprovals,
@@ -90,6 +97,7 @@ export class DashboardSummaryService {
             xp,
             rank,
             roster,
+            groupSessionsTodayOnwards,
         ] = await Promise.all([
             prisma.appointment.count({
                 where: {
@@ -168,6 +176,30 @@ export class DashboardSummaryService {
                 orderBy: { updatedAt: 'desc' },
                 take: 10,
             }).catch(() => []),
+            // Upcoming group sessions in the doctor's branch scope, OR any
+            // session with a participating appointment owned by this doctor —
+            // covers the case where a doctor co-runs a session alongside the
+            // lead therapist. OPEN + FULL only; COMPLETED / CANCELLED don't
+            // belong on a forward-looking task list.
+            groupSessionBranchId
+                ? prisma.groupSession.findMany({
+                    where: {
+                        date: { gte: today },
+                        status: { in: ['OPEN', 'FULL'] },
+                        OR: [
+                            { branchId: groupSessionBranchId },
+                            { appointments: { some: { doctorId } } },
+                        ],
+                    },
+                    include: {
+                        therapist: { select: { id: true, fullName: true } },
+                        room: { select: { id: true, name: true } },
+                        _count: { select: { appointments: true } },
+                    },
+                    orderBy: [{ date: 'asc' }, { startTime: 'asc' }],
+                    take: 25,
+                }).catch(() => [])
+                : Promise.resolve([]),
         ]);
 
         // Simple care-gap surrogate: recent triage flagged as HIGH/CRITICAL + no follow-up appointment booked.
@@ -222,6 +254,20 @@ export class DashboardSummaryService {
                     patientId: j.patient.patient.patientId,
                 } : { id: j.patientId, fullName: j.patient?.email, patientId: null },
                 currentPhase: j.phases?.[0]?.name || null,
+            })),
+            groupSessions: groupSessionsTodayOnwards.map(s => ({
+                id: s.id,
+                title: s.title,
+                sessionType: s.sessionType,
+                date: s.date,
+                startTime: s.startTime,
+                endTime: s.endTime,
+                status: s.status,
+                maxCapacity: s.maxCapacity,
+                enrolledCount: s._count?.appointments ?? 0,
+                room: s.room ? { id: s.room.id, name: s.room.name } : null,
+                therapist: s.therapist ? { id: s.therapist.id, fullName: s.therapist.fullName } : null,
+                branchId: s.branchId,
             })),
             todos,
             performance: {

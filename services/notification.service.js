@@ -423,13 +423,18 @@ export class NotificationService {
     }
 
     /**
-     * Mark notification as read
+     * Mark notification as read. Scoped by userId so a caller can only mark
+     * their own notifications — previously this updated by id alone, which
+     * meant any authenticated user could clear someone else's unread badge
+     * by guessing IDs. Returns null if no matching row was found.
      */
-    async markAsRead(notificationId) {
-        return await prisma.notification.update({
-            where: { id: notificationId },
-            data: { isRead: true }
+    async markAsRead(notificationId, userId) {
+        const result = await prisma.notification.updateMany({
+            where: { id: notificationId, ...(userId ? { userId } : {}) },
+            data: { isRead: true },
         });
+        if (result.count === 0) return null;
+        return prisma.notification.findUnique({ where: { id: notificationId } });
     }
 
     /**
