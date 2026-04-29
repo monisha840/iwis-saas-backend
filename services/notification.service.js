@@ -341,10 +341,10 @@ export class NotificationService {
     /**
      * Create a notification for a user
      */
-    async createNotification({ userId, type, title, message, priority = 'INFO', data = {} }) {
+    async createNotification({ userId, type, title, message, priority = 'INFO', data = {}, relatedId = null }) {
         try {
             const notification = await prisma.notification.create({
-                data: { userId, type, title, message, priority, data }
+                data: { userId, type, title, message, priority, data, relatedId }
             });
 
             emitToUser(userId, 'new_notification', notification);

@@ -508,6 +508,11 @@ model Patient {
   followUps           AppointmentFollowUp[]
   // Critical-journey flag (at most one active row per patient — upsert-based)
   criticalFlag        PatientCriticalFlag?
+  // Ayurvedic Voice Health Coach (AYURVEDIC_VOICE_COACH feature flag).
+  // Per-patient enable + preferred response language ('ta' | 'en').
+  voiceCoachEnabled   Boolean             @default(true)
+  preferredCoachLang  String              @default("ta")
+  voiceConversations  VoiceConversation[]
 
   // ── Home Therapy: location & contact fields ──────────────────────────────
   addressLine1        String?
@@ -3761,4 +3766,49 @@ model HomeTherapyFeedback {
 
   @@index([sessionId])
   @@index([authorRole, createdAt])
+}
+
+// ── Ayurvedic Voice Health Coach (AYURVEDIC_VOICE_COACH feature) ─────────────
+// Each VoiceConversation is one back-and-forth coaching session, scoped to a
+// single Patient. A turn is a VoiceMessage. Conversations stay open across
+// brief disconnects (resume window handled at the service layer); endedAt is
+// set when the patient explicitly closes the session or the resume window
+// expires. Audio is not persisted by default — see plan §8.
+
+model VoiceConversation {
+  id              String             @id @default(cuid())
+  patientId       String
+  patient         Patient            @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  language        String             // 'ta' | 'en'
+  startedAt       DateTime           @default(now())
+  endedAt         DateTime?
+  turnCount       Int                @default(0)
+  escalated       Boolean            @default(false)
+  escalationNote  String?
+  sessionSummary  String?
+  createdAt       DateTime           @default(now())
+  messages        VoiceMessage[]
+
+  @@index([patientId, createdAt(sort: Desc)])
+  @@index([escalated])
+}
+
+model VoiceMessage {
+  id              String             @id @default(cuid())
+  conversationId  String
+  conversation    VoiceConversation  @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  role            VoiceRole
+  transcript      String
+  audioStorageKey String?
+  detectedIntent  String?            // MEDICATION_QUERY | SYMPTOM_REPORT | LIFESTYLE | EMERGENCY | GENERAL | BOOKING_REQUEST
+  severityFlag    String?            // LOW | MEDIUM | HIGH | CRITICAL
+  createdAt       DateTime           @default(now())
+
+  @@index([conversationId, createdAt])
+}
+
+enum VoiceRole {
+  USER
+  ASSISTANT
+  SYSTEM
 }

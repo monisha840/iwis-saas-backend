@@ -49,6 +49,7 @@
     "multer": "^2.0.2",
     "node-cron": "^4.2.1",
     "nodemailer": "^8.0.0",
+    "openai": "^6.34.0",
     "otplib": "^13.4.0",
     "pdfkit": "^0.17.2",
     "qrcode": "^1.5.4",

@@ -85,6 +85,8 @@ import criticalJourneyRoutes from './routes/critical-journey.js';
 import auditLogRoutes from './routes/audit-logs.js';
 // Inbound webhooks (Daily.co room-ended, etc.)
 import webhooksRoutes from './routes/webhooks.js';
+// Ayurvedic Voice Health Coach (AYURVEDIC_VOICE_COACH feature)
+import voiceCoachRoutes from './routes/voice-coach.js';
 
 import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from './config/swagger.js';
@@ -253,6 +255,9 @@ app.use('/api/critical-journey', criticalJourneyRoutes);
 
 // Recent audit-log activity feed for the admin dashboard
 app.use('/api/audit-logs', auditLogRoutes);
+
+// Ayurvedic Voice Health Coach — patient-facing 24/7 coach (feature-gated)
+app.use('/api/voice-coach', voiceCoachRoutes);
 
 // Inbound webhooks (Daily.co room-ended → auto-complete appointment, etc.)
 // Route uses express.raw() internally for HMAC verification — scoped local
