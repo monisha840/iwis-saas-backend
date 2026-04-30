@@ -129,6 +129,52 @@ router.get('/:doctorId', authMiddleware, async (req, res, next) => {
     }
 });
 
+/**
+ * GET /api/availability/check?doctorId=X&date=YYYY-MM-DD
+ *
+ * Lightweight pre-flight check used by the patient booking flow: does this
+ * doctor have ANY available slot on the requested date, and if not, what's
+ * the nearest future date that does (within 30 days)?
+ *
+ * Wraps AvailabilityService.getAvailableSlots — no new query logic, just a
+ * boolean projection + a 30-day forward scan.
+ */
+const checkSchema = z.object({
+    doctorId: z.string().min(1, 'doctorId is required'),
+    date: z.string().optional(), // ISO YYYY-MM-DD; defaults to today
+});
+router.get('/check', authMiddleware, validate({ query: checkSchema }), async (req, res, next) => {
+    try {
+        const { doctorId, date } = req.query;
+        const baseDate = date ? new Date(date) : new Date();
+        if (Number.isNaN(baseDate.getTime())) {
+            return res.status(400).json({ error: 'Invalid date' });
+        }
+        baseDate.setHours(0, 0, 0, 0);
+
+        const slots = await AvailabilityService.getAvailableSlots(doctorId, baseDate);
+        const hasAvailableSlots = slots.some((s) => s.status === 'AVAILABLE');
+        if (hasAvailableSlots) {
+            return res.json({ hasAvailableSlots: true, nextAvailable: null });
+        }
+
+        // Forward scan up to 30 days. Each iteration is ~2 queries; bounded so
+        // a permanently-unavailable doctor can't blow up the request budget.
+        for (let i = 1; i <= 30; i++) {
+            const probe = new Date(baseDate);
+            probe.setDate(probe.getDate() + i);
+            const probeSlots = await AvailabilityService.getAvailableSlots(doctorId, probe);
+            if (probeSlots.some((s) => s.status === 'AVAILABLE')) {
+                return res.json({
+                    hasAvailableSlots: false,
+                    nextAvailable: probe.toISOString().slice(0, 10),
+                });
+            }
+        }
+        res.json({ hasAvailableSlots: false, nextAvailable: null });
+    } catch (err) { next(err); }
+});
+
 // Availability check by User.id — used by resource-sharing to verify a
 // clinician is free before submitting a cross-branch share. Query params:
 // ?date=YYYY-MM-DD&startTime=HH:mm&endTime=HH:mm. Returns `{ available, reason? }`.

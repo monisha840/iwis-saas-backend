@@ -392,4 +392,252 @@ router.get(
     OperationsController.getExpiringCertifications
 );
 
+// ── Staff Overview (admin dashboard role-grouped cards) ────────────────────────
+//
+// Two read-only endpoints powering the dashboard "Staff Overview" cards.
+// Inlined here (rather than added to OperationsController) because they are
+// self-contained Prisma reads with no shared service layer to live in.
+
+const STAFF_OVERVIEW_ROLES = ['DOCTOR', 'THERAPIST', 'PHARMACIST', 'ADMIN_DOCTOR'];
+
+function _startOfDay(d = new Date())   { const x = new Date(d); x.setHours(0, 0, 0, 0); return x; }
+function _endOfDay(d = new Date())     { const x = new Date(d); x.setHours(23, 59, 59, 999); return x; }
+function _startOfMonth(d = new Date()) { return new Date(d.getFullYear(), d.getMonth(), 1); }
+
+/** GET /api/operations/staff-overview — counts per role for the dashboard cards. */
+router.get(
+    '/staff-overview',
+    authMiddleware,
+    roleMiddleware(ADMIN_ROLES),
+    async (req, res, next) => {
+        try {
+            const where = {
+                role: { in: STAFF_OVERVIEW_ROLES },
+                deletedAt: null,
+                ...(req.user.hospitalId ? { hospitalId: req.user.hospitalId } : {}),
+            };
+            const grouped = await prisma.user.groupBy({
+                by: ['role'],
+                where,
+                _count: { _all: true },
+            });
+            const counts = Object.fromEntries(STAFF_OVERVIEW_ROLES.map((r) => [r, 0]));
+            for (const row of grouped) counts[row.role] = row._count._all;
+            res.json({ counts });
+        } catch (err) { next(err); }
+    },
+);
+
+/** GET /api/operations/staff-overview/:role — paginated detail with role-specific metrics.
+ *  Query: page (default 1), pageSize (default 20, max 100), q (name search). */
+router.get(
+    '/staff-overview/:role',
+    authMiddleware,
+    roleMiddleware(ADMIN_ROLES),
+    async (req, res, next) => {
+        try {
+            const role = req.params.role;
+            if (!STAFF_OVERVIEW_ROLES.includes(role)) {
+                return res.status(400).json({ error: 'Invalid role' });
+            }
+            const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+            const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize, 10) || 20));
+            const q = (req.query.q || '').toString().trim();
+
+            const userWhere = {
+                role,
+                deletedAt: null,
+                ...(req.user.hospitalId ? { hospitalId: req.user.hospitalId } : {}),
+            };
+
+            const total = await prisma.user.count({ where: userWhere });
+
+            // Pull the user rows (with branch + role-specific profile) up front.
+            const users = await prisma.user.findMany({
+                where: userWhere,
+                include: {
+                    branch: { select: { id: true, name: true } },
+                    doctor: role === 'DOCTOR' || role === 'ADMIN_DOCTOR'
+                        ? { select: { id: true, fullName: true, profilePhoto: true, specialization: true } }
+                        : false,
+                    therapist: role === 'THERAPIST'
+                        ? { select: { id: true, fullName: true, profilePhoto: true } }
+                        : false,
+                    pharmacist: role === 'PHARMACIST'
+                        ? { select: { id: true, fullName: true, profilePhoto: true } }
+                        : false,
+                },
+                orderBy: { createdAt: 'desc' },
+            });
+
+            // In-memory name filter (post-query since fullName lives on the role
+            // profile, not User). Acceptable for the typical staff size; revisit
+            // with a denormalized search column if we ever cross ~5k users/role.
+            const matched = q
+                ? users.filter((u) => {
+                    const name = u.doctor?.fullName ?? u.therapist?.fullName ?? u.pharmacist?.fullName ?? u.email;
+                    return (name || '').toLowerCase().includes(q.toLowerCase());
+                })
+                : users;
+
+            const filteredTotal = q ? matched.length : total;
+            const pageRows = matched.slice((page - 1) * pageSize, page * pageSize);
+            const userIds = pageRows.map((u) => u.id);
+
+            // ── Batch the metric lookups so this scales linearly in pageSize, not in
+            //    pageSize × #queries. All four metric blocks below run in parallel.
+
+            // Last login — newest StaffActivity LOGIN per user.
+            const lastLoginPromise = prisma.staffActivity.findMany({
+                where: { userId: { in: userIds }, activityType: 'LOGIN' },
+                orderBy: { startedAt: 'desc' },
+                distinct: ['userId'],
+                select: { userId: true, startedAt: true },
+            });
+
+            const todayStart = _startOfDay();
+            const todayEnd = _endOfDay();
+            const monthStart = _startOfMonth();
+            const monthEnd = new Date(); // up to "now"
+
+            const doctorIds = pageRows.map((u) => u.doctor?.id).filter(Boolean);
+            const therapistIds = pageRows.map((u) => u.therapist?.id).filter(Boolean);
+
+            // Doctor / Therapist appointment counts
+            const apptTodayPromise = (role === 'DOCTOR' || role === 'THERAPIST')
+                ? prisma.appointment.groupBy({
+                    by: role === 'DOCTOR' ? ['doctorId'] : ['therapistId'],
+                    where: {
+                        ...(role === 'DOCTOR'
+                            ? { doctorId: { in: doctorIds } }
+                            : { therapistId: { in: therapistIds } }),
+                        date: { gte: todayStart, lte: todayEnd },
+                    },
+                    _count: { _all: true },
+                })
+                : Promise.resolve([]);
+
+            const apptMonthPromise = (role === 'DOCTOR' || role === 'THERAPIST')
+                ? prisma.appointment.groupBy({
+                    by: role === 'DOCTOR' ? ['doctorId'] : ['therapistId'],
+                    where: {
+                        ...(role === 'DOCTOR'
+                            ? { doctorId: { in: doctorIds } }
+                            : { therapistId: { in: therapistIds } }),
+                        date: { gte: monthStart, lte: monthEnd },
+                    },
+                    _count: { _all: true },
+                })
+                : Promise.resolve([]);
+
+            // Streaks + leaderboard rank — keyed on the role profile id (Doctor.id /
+            // Therapist.id), matching how ClinicianStreak / LeaderboardAudit store
+            // participantId.
+            const profileIds = role === 'DOCTOR' ? doctorIds
+                : role === 'THERAPIST' ? therapistIds
+                : [];
+            const streakPromise = profileIds.length
+                ? prisma.clinicianStreak.findMany({
+                    where: { participantId: { in: profileIds } },
+                    select: { participantId: true, currentStreak: true },
+                })
+                : Promise.resolve([]);
+
+            // Leaderboard rank: take the most recent calculation per participant.
+            const leaderboardPromise = profileIds.length
+                ? prisma.leaderboardAudit.findMany({
+                    where: { participantId: { in: profileIds } },
+                    orderBy: { calculationDate: 'desc' },
+                    distinct: ['participantId'],
+                    select: { participantId: true, rank: true },
+                })
+                : Promise.resolve([]);
+
+            // Pharmacist dispenses this month — keyed on User.id (PharmacyDispense.dispensedBy).
+            const pharmacyPromise = role === 'PHARMACIST'
+                ? prisma.pharmacyDispense.groupBy({
+                    by: ['dispensedBy'],
+                    where: { dispensedBy: { in: userIds }, createdAt: { gte: monthStart } },
+                    _count: { _all: true },
+                })
+                : Promise.resolve([]);
+
+            // Admin doctors — managed-patient count via PatientAssignment (active).
+            const managedPromise = role === 'ADMIN_DOCTOR' && doctorIds.length
+                ? prisma.patientAssignment.groupBy({
+                    by: ['doctorId'],
+                    where: { doctorId: { in: doctorIds }, status: 'ACTIVE' },
+                    _count: { _all: true },
+                })
+                : Promise.resolve([]);
+
+            const [
+                lastLogins,
+                apptToday,
+                apptMonth,
+                streaks,
+                leaderboard,
+                pharmacyDispenses,
+                managed,
+            ] = await Promise.all([
+                lastLoginPromise,
+                apptTodayPromise,
+                apptMonthPromise,
+                streakPromise,
+                leaderboardPromise,
+                pharmacyPromise,
+                managedPromise,
+            ]);
+
+            const lastLoginByUser = new Map(lastLogins.map((r) => [r.userId, r.startedAt]));
+            const apptTodayBy = new Map(apptToday.map((r) => [(r.doctorId ?? r.therapistId), r._count._all]));
+            const apptMonthBy = new Map(apptMonth.map((r) => [(r.doctorId ?? r.therapistId), r._count._all]));
+            const streakBy = new Map(streaks.map((s) => [s.participantId, s.currentStreak]));
+            const rankBy = new Map(leaderboard.map((l) => [l.participantId, l.rank]));
+            const pharmacyBy = new Map(pharmacyDispenses.map((p) => [p.dispensedBy, p._count._all]));
+            const managedBy = new Map(managed.map((m) => [m.doctorId, m._count._all]));
+
+            const items = pageRows.map((u) => {
+                const profile = u.doctor || u.therapist || u.pharmacist || null;
+                const profileId = profile?.id ?? null;
+                const name = profile?.fullName || u.email;
+                const lastLogin = lastLoginByUser.get(u.id) ?? null;
+                const base = {
+                    id: u.id,
+                    name,
+                    email: u.email,
+                    branchName: u.branch?.name ?? null,
+                    profilePhoto: profile?.profilePhoto ?? null,
+                    isActive: !u.deletedAt,
+                    joinedAt: u.createdAt,
+                    lastLogin,
+                };
+                if (role === 'DOCTOR' || role === 'THERAPIST') {
+                    return {
+                        ...base,
+                        specialization: u.doctor?.specialization ?? null,
+                        todayAppointments: apptTodayBy.get(profileId) ?? 0,
+                        thisMonthAppointments: apptMonthBy.get(profileId) ?? 0,
+                        currentStreak: streakBy.get(profileId) ?? 0,
+                        leaderboardRank: rankBy.get(profileId) ?? null,
+                    };
+                }
+                if (role === 'PHARMACIST') {
+                    return { ...base, totalDispensedThisMonth: pharmacyBy.get(u.id) ?? 0 };
+                }
+                // ADMIN_DOCTOR
+                return { ...base, managedPatientCount: managedBy.get(profileId) ?? 0 };
+            });
+
+            res.json({
+                role,
+                page,
+                pageSize,
+                total: filteredTotal,
+                items,
+            });
+        } catch (err) { next(err); }
+    },
+);
+
 export default router;

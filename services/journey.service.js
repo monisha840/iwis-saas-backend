@@ -139,9 +139,26 @@ export class JourneyService {
             await this._onJourneyCompleted(journeyId).catch((err) => {
                 logger.error('[Journey] _onJourneyCompleted hook failed', { journeyId, err: err.message });
             });
+        } else if (result.nextPhase) {
+            // Fresh phase activation = clinically the best moment to capture a
+            // baseline photo. Skip the 3-day cooldown the daily sweep applies.
+            this._onPhaseActivated(journeyId, result.nextPhase).catch((err) => {
+                logger.warn('[Journey] _onPhaseActivated hook failed', { journeyId, err: err.message });
+            });
         }
 
         return result.nextPhase;
+    }
+
+    /** Photo-reminder fan-out on phase activation — best-effort. */
+    static async _onPhaseActivated(journeyId, phase) {
+        const journey = await prisma.treatmentJourney.findUnique({
+            where: { id: journeyId },
+            select: { patientId: true }, // User.id of the patient
+        });
+        if (!journey?.patientId) return;
+        const { schedulerService } = await import('./scheduler.service.js');
+        await schedulerService._sendPhotoReminder(journey.patientId, phase.name, journeyId, phase.id);
     }
 
     /**

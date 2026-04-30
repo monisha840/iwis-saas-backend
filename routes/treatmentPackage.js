@@ -74,9 +74,20 @@ router.put('/:id', authorizeRoles('ADMIN', 'ADMIN_DOCTOR'), async (req, res, nex
 
 router.delete('/:id', authorizeRoles('ADMIN', 'ADMIN_DOCTOR'), async (req, res, next) => {
     try {
-        await TreatmentPackageService.deactivate(req.params.id);
-        res.json({ success: true });
-    } catch (err) { next(err); }
+        const result = await TreatmentPackageService.deleteOrFail(req.params.id);
+        const message = result.mode === 'soft'
+            ? 'Package deactivated (kept on file because of past enrolments)'
+            : 'Package deleted';
+        res.json({ success: true, ...result, message });
+    } catch (err) {
+        // Conflict = active enrolments. Surface the human message and the
+        // structured code so the frontend can branch on it without parsing
+        // the message string.
+        if (err.status === 409) {
+            return res.status(409).json({ error: err.message, code: err.code });
+        }
+        next(err);
+    }
 });
 
 router.post('/:id/enrol', authorizeRoles('ADMIN', 'ADMIN_DOCTOR', 'DOCTOR'), async (req, res, next) => {

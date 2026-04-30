@@ -39,7 +39,9 @@ const CHRONIC_THRESHOLD = 6;
 function isAcuteLabel(label) { return (DURATION_SCORES[label] ?? 5) <= ACUTE_THRESHOLD; }
 function isChronicLabel(label) { return (DURATION_SCORES[label] ?? 5) >= CHRONIC_THRESHOLD; }
 
-const HIGH_RISK_CHARACTERS = ['Stabbing', 'Numbness', 'Tingling'];
+// Swelling indicates inflammation/oedema — elevated clinical risk in
+// Ayurvedic assessment. Treated as the same weight tier as Stabbing/Numbness.
+const HIGH_RISK_CHARACTERS = ['Stabbing', 'Numbness', 'Tingling', 'Swelling'];
 
 // Fallback routing (used only when the SpecialtyRoute table is empty or unreachable)
 const FALLBACK_SPECIALTY_ROUTING = [

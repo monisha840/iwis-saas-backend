@@ -1,8 +1,11 @@
 import express from 'express';
 import { TimelineService } from '../services/timeline.service.js';
 import { EnhancedDashboardService } from '../services/enhancedDashboard.service.js';
+import { ClinicianXPService } from '../services/clinicianXP.service.js';
+import { cacheService } from '../services/cache.service.js';
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
 import prisma from '../lib/prisma.js';
+import logger from '../lib/logger.js';
 
 const router = express.Router();
 
@@ -73,5 +76,91 @@ router.get(
         }
     },
 );
+
+/**
+ * POST /api/patients/:patientId/record-review
+ *
+ * Awards XP to a clinician who has spent meaningful time reviewing a patient
+ * record. Anti-spam:
+ *   • duration floor: ≥60s (anything shorter is treated as a tab-skim)
+ *   • per-day rate limit: one award per (doctor, patient, calendar day)
+ *     keyed in Redis with 24h TTL
+ *
+ * ADMIN_DOCTOR is allowed to call (and is rate-limited the same way) but
+ * ClinicianXPService.awardXP is a no-op for that role — they are oversight,
+ * not participants. We still return 200 with the rate-limit + duration verdict
+ * so the frontend toast is consistent.
+ */
+router.post('/:patientId/record-review', authMiddleware, roleMiddleware(['DOCTOR', 'ADMIN_DOCTOR']), async (req, res, next) => {
+    try {
+        const { patientId } = req.params;
+        const durationSeconds = Number(req.body?.durationSeconds);
+        if (!Number.isFinite(durationSeconds) || durationSeconds < 0) {
+            return res.status(400).json({ error: 'durationSeconds (number) is required' });
+        }
+
+        if (durationSeconds < 60) {
+            return res.json({
+                xpAwarded: 0,
+                tooShort: true,
+                message: 'Spend at least 1 minute reviewing the record to earn XP.',
+            });
+        }
+
+        // Daily rate limit. Falls open when Redis is unavailable so a
+        // degraded cache layer never silently drops legit XP.
+        const today = new Date().toISOString().slice(0, 10);
+        const rateKey = `review_xp:${req.user.id}:${patientId}:${today}`;
+        try {
+            const seen = await cacheService.get(rateKey);
+            if (seen) {
+                return res.json({
+                    alreadyAwarded: true,
+                    message: 'XP already awarded for reviewing this patient today',
+                });
+            }
+        } catch (err) {
+            logger.warn('[record-review] cache read failed, falling open', { err: err.message });
+        }
+
+        const xpAmount = ClinicianXPService.XP_ACTIONS.PATIENT_REVIEW;
+        const ledger = await ClinicianXPService.awardXP(
+            req.user.id,
+            'PATIENT_REVIEW',
+            xpAmount,
+            patientId,
+            { durationSeconds },
+        );
+
+        // awardXP returns null for ADMIN_DOCTOR (excluded from XP pipeline).
+        // Still set the rate-limit key so they can't poll the endpoint.
+        try {
+            await cacheService.set(rateKey, '1', 24 * 60 * 60);
+        } catch (err) {
+            logger.warn('[record-review] cache write failed', { err: err.message });
+        }
+
+        if (!ledger) {
+            return res.json({
+                xpAwarded: 0,
+                excludedRole: true,
+                message: 'XP not granted (oversight role excluded from the XP pipeline).',
+            });
+        }
+
+        const profile = await prisma.clinicianXP.findUnique({
+            where: { userId: req.user.id },
+            select: { totalXP: true },
+        });
+
+        res.json({
+            xpAwarded: xpAmount,
+            totalXP: profile?.totalXP ?? xpAmount,
+            message: 'XP awarded for patient review',
+        });
+    } catch (err) {
+        next(err);
+    }
+});
 
 export default router;

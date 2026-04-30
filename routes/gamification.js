@@ -3,6 +3,7 @@ import { authMiddleware, roleMiddleware, resolvePatientId } from '../middleware/
 import { GamificationController } from '../controllers/gamification.controller.js';
 import { z } from 'zod';
 import { validate } from '../middleware/validate.js';
+import prisma from '../lib/prisma.js';
 
 const router = express.Router();
 
@@ -13,6 +14,70 @@ router.get('/badges', authMiddleware, GamificationController.getAllBadges);
 
 /** GET /api/gamification/badges/mine — only earned badges */
 router.get('/badges/mine', authMiddleware, GamificationController.getMyBadges);
+
+/**
+ * GET /api/gamification/badges/:idOrCode/holders — admin click-through from
+ * the Badge Distribution chart. Resolves either Badge.id or Badge.code so the
+ * existing analytics endpoint (which only exposes `code`) can drive this lookup
+ * without a schema change.
+ */
+router.get('/badges/:idOrCode/holders', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']), async (req, res, next) => {
+    try {
+        const key = req.params.idOrCode;
+        const badge = await prisma.badge.findFirst({
+            where: { OR: [{ id: key }, { code: key }] },
+            select: { id: true, code: true, name: true, icon: true, tier: true, description: true },
+        });
+        if (!badge) return res.status(404).json({ error: 'Badge not found' });
+
+        const awards = await prisma.userBadge.findMany({
+            where: { badgeId: badge.id },
+            orderBy: { awardedAt: 'desc' },
+            include: {
+                user: {
+                    select: {
+                        id: true, role: true,
+                        branch: { select: { name: true } },
+                        doctor:    { select: { id: true, fullName: true, profilePhoto: true } },
+                        therapist: { select: { id: true, fullName: true, profilePhoto: true } },
+                    },
+                },
+            },
+        });
+
+        // Pull current ranks in a single batch — keyed on the role-profile id
+        // (Doctor.id / Therapist.id) since LeaderboardAudit.participantId stores
+        // the profile id, not User.id.
+        const profileIds = awards
+            .map((a) => a.user.doctor?.id ?? a.user.therapist?.id)
+            .filter(Boolean);
+        const ranks = profileIds.length
+            ? await prisma.leaderboardAudit.findMany({
+                where: { participantId: { in: profileIds } },
+                orderBy: { calculationDate: 'desc' },
+                distinct: ['participantId'],
+                select: { participantId: true, rank: true },
+            })
+            : [];
+        const rankBy = new Map(ranks.map((r) => [r.participantId, r.rank]));
+
+        const holders = awards.map((a) => {
+            const profile = a.user.doctor || a.user.therapist || null;
+            const profileId = profile?.id ?? null;
+            return {
+                userId: a.user.id,
+                name: profile?.fullName || 'Unknown',
+                role: a.user.role,
+                branchName: a.user.branch?.name ?? null,
+                profilePhoto: profile?.profilePhoto ?? null,
+                awardedAt: a.awardedAt,
+                currentRank: profileId ? (rankBy.get(profileId) ?? null) : null,
+            };
+        });
+
+        res.json({ badge, holders, totalCount: holders.length });
+    } catch (err) { next(err); }
+});
 
 // ── Streak routes ────────────────────────────────────────────────────────────
 

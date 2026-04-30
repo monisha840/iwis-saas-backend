@@ -87,6 +87,7 @@ import auditLogRoutes from './routes/audit-logs.js';
 import webhooksRoutes from './routes/webhooks.js';
 // Ayurvedic Voice Health Coach (AYURVEDIC_VOICE_COACH feature)
 import voiceCoachRoutes from './routes/voice-coach.js';
+import painMapRoutes from './routes/painMap.js';
 
 import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from './config/swagger.js';
@@ -228,6 +229,10 @@ app.use('/api/queue', queueRoutes);
 // Consultation Room — single-shot patient history aggregate
 app.use('/api/patient', consultationContextRoutes);
 app.use('/api/visit-summary', visitSummaryRoutes);
+// Pain Map (clinician + patient self) — mounted at /api so it can serve both
+//   /api/patients/:patientId/pain-map  (clinician, scoped)
+//   /api/patient/pain/my-map           (patient, self-only)
+app.use('/api', painMapRoutes);
 
 // IWIS competitor feature additions
 app.use('/api/therapy-rooms', therapyRoomRoutes);

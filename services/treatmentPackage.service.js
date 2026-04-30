@@ -44,6 +44,39 @@ export class TreatmentPackageService {
         return prisma.treatmentPackage.update({ where: { id }, data: { isActive: false } });
     }
 
+    /**
+     * Smart-delete a package:
+     *   - If active enrolments exist → throw 409 (caller surfaces the
+     *     "patients are currently enrolled" message).
+     *   - If only past/completed enrolments exist → soft-delete (isActive=false)
+     *     so the package keeps showing in those enrolments' history.
+     *   - If zero enrolments ever existed → hard-delete the row.
+     *
+     * Active = endDate is null OR endDate >= today (i.e. not finished yet).
+     */
+    static async deleteOrFail(id) {
+        const now = new Date();
+        const activeCount = await prisma.packageEnrolment.count({
+            where: {
+                packageId: id,
+                OR: [{ endDate: null }, { endDate: { gte: now } }],
+            },
+        });
+        if (activeCount > 0) {
+            throw Object.assign(
+                new Error('Cannot delete: patients are currently enrolled in this package'),
+                { status: 409, code: 'ACTIVE_ENROLMENTS' },
+            );
+        }
+        const totalCount = await prisma.packageEnrolment.count({ where: { packageId: id } });
+        if (totalCount > 0) {
+            await prisma.treatmentPackage.update({ where: { id }, data: { isActive: false } });
+            return { mode: 'soft', pastEnrolments: totalCount };
+        }
+        await prisma.treatmentPackage.delete({ where: { id } });
+        return { mode: 'hard' };
+    }
+
     // Billing is disabled application-wide; enrolment no longer creates an
     // invoice. `invoiceId` on PackageEnrolment is left null.
     static async enrolPatient({ packageId, patientId, startDate, sessionsTotal, notes }) {
