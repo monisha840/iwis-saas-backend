@@ -203,7 +203,7 @@ router.get(
     async (req, res, next) => {
         try {
             const { branchId, status } = req.query;
-            res.json(await SelfExamService.listForReview({ branchId, status }));
+            res.json(await SelfExamService.listForReview({ branchId, status, user: req.user }));
         } catch (err) { next(err); }
     }
 );

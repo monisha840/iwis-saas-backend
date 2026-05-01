@@ -43,9 +43,10 @@ export class CommunicationController {
 
   static async updateAnnouncement(req, res, next) {
     try {
-      const result = await AnnouncementService.updateAnnouncement(req.params.id, req.body);
+      const result = await AnnouncementService.updateAnnouncement(req.params.id, req.body, req.user.id);
       res.json(result);
     } catch (err) {
+      if (err.status) return res.status(err.status).json({ error: err.message });
       next(err);
     }
   }
@@ -55,6 +56,7 @@ export class CommunicationController {
       const result = await AnnouncementService.deleteAnnouncement(req.params.id, req.user.id);
       res.json(result);
     } catch (err) {
+      if (err.status) return res.status(err.status).json({ error: err.message });
       next(err);
     }
   }

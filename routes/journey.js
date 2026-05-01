@@ -10,6 +10,37 @@ const router = express.Router();
 const CLINICAL_ROLES = ['DOCTOR', 'ADMIN_DOCTOR', 'THERAPIST', 'ADMIN'];
 const VIEW_ROLES = [...CLINICAL_ROLES, 'PATIENT'];
 
+// Therapists may not author MEDICATION tasks — that's a doctor-only authority.
+// Walks the request body in-place looking for any phases[].tasks[] (or a single
+// task on /tasks endpoints) whose type === 'MEDICATION'. Rejects with 403 and
+// the documented error code so the frontend can surface a clear message.
+function rejectTherapistMedicationTasks(req, res, next) {
+    if (req.user?.role !== 'THERAPIST') return next();
+    const tasks = [];
+    if (Array.isArray(req.body?.phases)) {
+        for (const p of req.body.phases) {
+            if (Array.isArray(p?.tasks)) tasks.push(...p.tasks);
+        }
+    }
+    if (Array.isArray(req.body?.tasks)) tasks.push(...req.body.tasks);
+    if (req.body?.type) tasks.push(req.body); // single-task POST shape
+    if (tasks.some((t) => t?.type === 'MEDICATION')) {
+        return res.status(403).json({ error: 'THERAPIST_MEDICATION_RESTRICTION' });
+    }
+    next();
+}
+
+// Force branchId off req.user for journey *creation*. Clinicians should never
+// be able to plant a journey in a branch they don't belong to. Patients are
+// not allowed to create journeys, so req.user.branchId is always a clinician's.
+function forceBranchFromUser(req, res, next) {
+    if (!req.user?.branchId) {
+        return res.status(400).json({ error: 'USER_HAS_NO_BRANCH' });
+    }
+    req.body.branchId = req.user.branchId;
+    next();
+}
+
 // A patient is allowed to view only their own journey.
 async function enforcePatientJourneyOwnership(req, res, next) {
   if (req.user.role !== 'PATIENT') return next();
@@ -35,10 +66,13 @@ async function enforcePatientIdMatch(req, res, next) {
   next();
 }
 
-// POST /api/journeys — Doctor creates a journey
+// POST /api/journeys — Doctor / Admin Doctor / Therapist creates a journey.
+// branchId on the body is ignored — the server derives it from req.user.branchId
+// (see forceBranchFromUser) so a clinician cannot plant a journey in another branch.
 const createJourneySchema = z.object({
     patientId: z.string(),
-    branchId: z.string(),
+    // Optional in the wire schema; overwritten server-side before reaching the service.
+    branchId: z.string().optional(),
     title: z.string().min(1).max(200),
     condition: z.string().min(1).max(200),
     targetDate: z.string().optional(),
@@ -65,6 +99,8 @@ router.post('/',
     authMiddleware,
     roleMiddleware(['DOCTOR', 'ADMIN_DOCTOR', 'THERAPIST']),
     validate({ body: createJourneySchema }),
+    forceBranchFromUser,
+    rejectTherapistMedicationTasks,
     async (req, res, next) => {
         try {
             const journey = await JourneyService.createJourney(
@@ -118,6 +154,7 @@ router.post('/:id/phases',
     authMiddleware,
     roleMiddleware(['DOCTOR', 'ADMIN_DOCTOR', 'THERAPIST']),
     validate({ body: addPhaseSchema }),
+    rejectTherapistMedicationTasks,
     async (req, res, next) => {
         try {
             const phase = await JourneyService.addPhase(req.params.id, req.body);
@@ -187,6 +224,7 @@ router.post('/:id/phases/:phaseId/tasks',
     authMiddleware,
     roleMiddleware(['DOCTOR', 'ADMIN_DOCTOR', 'THERAPIST']),
     validate({ body: addTaskSchema }),
+    rejectTherapistMedicationTasks,
     async (req, res, next) => {
         try {
             const task = await prisma.phaseTask.create({

@@ -50,7 +50,7 @@ export class TherapistSkillService {
                 const score = matched.reduce((s, ts) => s + (PROFICIENCY_WEIGHT[ts.proficiency] || 0), 0);
                 const coverage = matched.length / skills.length;
                 return {
-                    therapist: { id: t.id, fullName: t.fullName, specialization: t.specialization, qualification: t.qualification },
+                    therapist: { id: t.id, fullName: t.fullName, gender: t.gender, qualification: t.qualification },
                     matchedSkills: matched.map((s) => ({ skill: s.skill, proficiency: s.proficiency })),
                     missingSkills: skills.filter((s) => !matched.some((m) => m.skill === s)),
                     coverage,

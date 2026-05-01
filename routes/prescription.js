@@ -109,6 +109,40 @@ router.get('/patient/:id', authMiddleware, async (req, res, next) => {
   }
 });
 
+// Inline-journey payload validated alongside the prescription batch. The
+// service does the cross-row validation (e.g. THERAPIST_MEDICATION_RESTRICTION)
+// because zod can't see req.user.role here.
+const inlineJourneySchema = z.object({
+  title:         z.string().min(1).max(200),
+  condition:     z.string().min(1).max(200),
+  goal:          z.string().min(1).max(500),
+  targetEndDate: z.string().min(1),
+  phases:        z.array(z.object({
+    name:         z.string().min(1).max(120),
+    durationDays: z.number().int().min(1),
+    tasks:        z.array(z.object({
+      type:        z.enum(['MEDICATION', 'EXERCISE', 'DIET', 'THERAPY', 'LIFESTYLE']),
+      title:       z.string().min(1),
+      description: z.string().optional(),
+      frequency:   z.string().min(1),
+    })).default([]),
+  })).min(1),
+});
+
+// Optional home-therapy referral. The doctor toggles "therapy referral
+// required" inside the prescription form and specifies a per-session mode
+// (HOME / HOSPITAL) for each of the totalSessions sessions. Service does
+// the cross-row validation (length match, role gate, patient branch).
+const homeTherapySchema = z.object({
+  totalSessions: z.number().int().min(1).max(50),
+  sessionModes: z.array(z.enum(['HOME', 'HOSPITAL'])).min(1).max(50),
+  // Optional scheduling interval between sessions, in days.
+  // 1 = daily, 2 = every other day, 7 = weekly, etc. Null/undefined when
+  // the doctor has not specified an interval.
+  intervalDays: z.number().int().min(1).max(30).optional(),
+  notes: z.string().max(500).optional(),
+});
+
 const batchPrescriptionSchema = z.object({
   patientId: z.string(),
   // Optional treatment-package context shared across all medicines in
@@ -126,21 +160,52 @@ const batchPrescriptionSchema = z.object({
     videoUrl: z.string().url().optional().or(z.literal("")),
     sku: z.string().optional(),
   })),
+  // Optional inline-journey draft. When present, the service wraps the
+  // prescription rows + journey + phases + tasks in a single $transaction
+  // and emits `journey_assigned` to the patient socket after commit.
+  journey: inlineJourneySchema.optional(),
+  // Optional home-therapy referral — when present, the service creates a
+  // HomeTherapyRequest in PENDING_APPROVAL status inside the same tx.
+  homeTherapy: homeTherapySchema.optional(),
 });
 
-router.post('/batch-add', authMiddleware, roleMiddleware(['DOCTOR', 'THERAPIST', 'ADMIN', 'ADMIN_DOCTOR']), validate({ body: batchPrescriptionSchema }), auditAction('CREATE_PRESCRIPTION', 'Prescription', () => null), async (req, res, next) => {
+const handleBatchAdd = async (req, res, next) => {
   try {
     const prescriptions = await PrescriptionService.createBatchPrescriptions(
       req.user,
       req.body.patientId,
       req.body.medicines,
-      { packageId: req.body.packageId || null },
+      {
+        packageId:    req.body.packageId    || null,
+        journey:      req.body.journey      || null,
+        homeTherapy:  req.body.homeTherapy  || null,
+      },
     );
     res.status(201).json(prescriptions);
   } catch (err) {
+    if (err.status) return res.status(err.status).json({ error: err.message });
     next(err);
   }
-});
+};
+
+router.post('/batch-add',
+  authMiddleware,
+  roleMiddleware(['DOCTOR', 'THERAPIST', 'ADMIN', 'ADMIN_DOCTOR']),
+  validate({ body: batchPrescriptionSchema }),
+  auditAction('CREATE_PRESCRIPTION', 'Prescription', () => null),
+  handleBatchAdd,
+);
+
+// Spec alias — POST /api/prescriptions accepts the same { patientId, medicines,
+// journey?, packageId? } body as /batch-add. Kept as a sibling rather than a
+// rewrite so existing /batch-add callers stay green.
+router.post('/',
+  authMiddleware,
+  roleMiddleware(['DOCTOR', 'THERAPIST', 'ADMIN', 'ADMIN_DOCTOR']),
+  validate({ body: batchPrescriptionSchema }),
+  auditAction('CREATE_PRESCRIPTION', 'Prescription', () => null),
+  handleBatchAdd,
+);
 
 router.post('/add', authMiddleware, roleMiddleware(['DOCTOR', 'THERAPIST', 'ADMIN', 'ADMIN_DOCTOR']), upload.single('file'), validate({ body: addPrescriptionSchema }), auditAction('CREATE_PRESCRIPTION', 'Prescription', () => null), async (req, res, next) => {
   try {

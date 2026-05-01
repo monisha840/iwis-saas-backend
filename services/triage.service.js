@@ -613,7 +613,7 @@ async function autoHoldPrioritySlot({ branchId, userId, urgencyLevel }) {
     if (urgencyLevel !== 'URGENT' && urgencyLevel !== 'CRITICAL') return null;
     try {
         const adminDoctorUsers = await prisma.user.findMany({
-            where: { role: 'ADMIN_DOCTOR', ...(branchId ? { branchId } : {}) },
+            where: { role: 'ADMIN_DOCTOR', deletedAt: null, ...(branchId ? { branchId } : {}) },
             select: { id: true },
         });
         if (adminDoctorUsers.length === 0) return null;
@@ -1115,7 +1115,7 @@ export class TriageService {
     static async _notifyAdminDoctors(patientRecord, triageSession, triageResult, opts = {}) {
         const branchFilter = patientRecord.branchId ? { branchId: patientRecord.branchId } : {};
         const adminDoctors = await prisma.user.findMany({
-            where: { role: 'ADMIN_DOCTOR', ...branchFilter },
+            where: { role: 'ADMIN_DOCTOR', deletedAt: null, ...branchFilter },
             select: { id: true }
         });
         const prefix = opts.reTriaged ? 'Re-triage escalation' : 'High Priority Triage Escalation';

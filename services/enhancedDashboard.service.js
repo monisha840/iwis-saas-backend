@@ -908,6 +908,7 @@ export class EnhancedDashboardService {
           const doctors = await prisma.user.findMany({
             where: {
               role: { in: ['DOCTOR', 'ADMIN_DOCTOR'] },
+              deletedAt: null,
               ...(patientRow?.branchId ? { branchId: patientRow.branchId } : {}),
             },
             select: { id: true },

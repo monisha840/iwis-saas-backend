@@ -109,6 +109,17 @@ router.get(
           select: {
             id: true, severity: true, urgencyLevel: true, compositeScore: true,
             painRegions: true, responses: true, createdAt: true,
+            // Reports / scans the patient uploaded during the triage
+            // questionnaire — surface them so the reviewing doctor can
+            // pull up the lab work that prompted the booking without
+            // hunting through the patient profile.
+            documents: {
+              select: {
+                id: true, fileName: true, fileUrl: true, fileType: true,
+                fileSize: true, category: true, description: true, createdAt: true,
+              },
+              orderBy: { createdAt: 'desc' },
+            },
           },
         }),
 

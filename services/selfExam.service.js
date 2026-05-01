@@ -75,21 +75,17 @@ export const SelfExamService = {
         });
         if (!session) return null;
 
-        // Only high-acuity presentations get the pre-consultation kit.
-        // ROUTINE / MODERATE triages skip this entirely — a mild complaint
-        // shouldn't force the patient through 3-day observation logs.
-        const KIT_TRIGGER_LEVELS = new Set(['URGENT', 'CRITICAL']);
-        if (!KIT_TRIGGER_LEVELS.has(session.urgencyLevel)) {
-            logger.info(
-                `[SelfExam] Skipping init — urgencyLevel=${session.urgencyLevel ?? 'null'} below threshold (triage ${triageSessionId})`
-            );
-            return null;
-        }
-
+        // Pre-consultation kit is created whenever the patient marked at
+        // least one body region that maps to a canonical PainZone. The
+        // urgency level no longer gates this — even ROUTINE / MODERATE
+        // triages benefit from observation logs (tongue, stool, ROM, etc.)
+        // attached to the appointment, and the patient can always skip a
+        // test they don't want to do. Without a DRAFT here, the post-
+        // booking kit-intro screen has nothing to render.
         const zones = zonesFromPainRegions(session.painRegions);
         if (zones.length === 0) {
             logger.info(
-                `[SelfExam] Skipping init — no mappable zones on triage ${triageSessionId}`
+                `[SelfExam] Skipping init — no mappable zones on triage ${triageSessionId} (urgencyLevel=${session.urgencyLevel ?? 'null'})`
             );
             return null;
         }
@@ -226,15 +222,62 @@ export const SelfExamService = {
         });
     },
 
-    async listForReview({ branchId, status }) {
+    /**
+     * Role-scoped review queue.
+     *
+     *  - ADMIN / ADMIN_DOCTOR: every submission in their hospital. Optional
+     *    `branchId` narrows the result for ops use cases.
+     *  - DOCTOR: only submissions where the patient is currently ACTIVE-
+     *    assigned to this doctor, OR the submission is linked to one of
+     *    their appointments. Either path covers the realistic clinical
+     *    relationships without leaking unrelated patients across the branch.
+     *
+     * Without this scoping the endpoint returned every submission across
+     * every hospital — practically that meant doctors saw nothing relevant
+     * mixed in with cross-tenant noise (depending on session-stored branch
+     * filters), which is what surfaced as "self-exam not visible to the
+     * doctor".
+     */
+    async listForReview({ branchId, status, user }) {
+        const conditions = [];
+        conditions.push(status ? { status } : { status: 'SUBMITTED' });
+
+        if (user?.role === 'DOCTOR') {
+            const doctor = await prisma.doctor.findFirst({
+                where: { userId: user.id },
+                select: { id: true },
+            });
+            // No Doctor row → return empty rather than fall through to an
+            // unscoped query (which would otherwise leak the hospital list).
+            if (!doctor) return [];
+            conditions.push({
+                OR: [
+                    { patient: { patientAssignments: { some: { doctorId: doctor.id, status: 'ACTIVE' } } } },
+                    { appointment: { doctorId: doctor.id } },
+                ],
+            });
+        } else if (user?.role === 'ADMIN' || user?.role === 'ADMIN_DOCTOR') {
+            // Hospital-scope. ADMINs sometimes omit hospitalId on their JWT
+            // (super-admin context); leave the query unscoped in that case
+            // so the page degrades gracefully.
+            if (user.hospitalId) conditions.push({ hospitalId: user.hospitalId });
+            if (branchId)        conditions.push({ branchId });
+        } else if (branchId) {
+            conditions.push({ branchId });
+        }
+
         return prisma.selfExamSubmission.findMany({
-            where: {
-                ...(branchId ? { branchId } : {}),
-                ...(status ? { status } : { status: 'SUBMITTED' }),
-            },
+            where: conditions.length === 1 ? conditions[0] : { AND: conditions },
             include: {
                 ...FULL_INCLUDE,
-                patient: { select: { id: true, fullName: true } },
+                patient: {
+                    select: {
+                        id: true, fullName: true,
+                        branchId: true,
+                        branch: { select: { id: true, name: true } },
+                    },
+                },
+                branch: { select: { id: true, name: true } },
             },
             orderBy: { submittedAt: 'desc' },
         });

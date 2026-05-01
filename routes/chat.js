@@ -1,6 +1,8 @@
 import express from 'express';
+import { z } from 'zod';
 import { ChatService } from '../services/chat.service.js';
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
+import { validate } from '../middleware/validate.js';
 import prisma from '../lib/prisma.js';
 
 const router = express.Router();
@@ -9,6 +11,22 @@ const router = express.Router();
 const CHAT_ROLES = ['PATIENT', 'DOCTOR', 'ADMIN_DOCTOR', 'THERAPIST', 'PHARMACIST', 'ADMIN'];
 router.use(authMiddleware);
 router.use(roleMiddleware(CHAT_ROLES));
+
+const initiateSchema = z.object({
+  partnerId: z.string().min(1).max(64),
+});
+
+// At least one clinician id must be present. Patients are restricted to
+// their own patientId by `enforcePatientSelfOnConversation`.
+const conversationSchema = z.object({
+  patientId:    z.string().min(1).max(64).optional(),
+  doctorId:     z.string().min(1).max(64).optional(),
+  therapistId:  z.string().min(1).max(64).optional(),
+  pharmacistId: z.string().min(1).max(64).optional(),
+}).refine(
+  (b) => b.doctorId || b.therapistId || b.pharmacistId,
+  { message: 'one of doctorId / therapistId / pharmacistId is required' },
+);
 
 // When a PATIENT initiates a conversation via /conversation, they must match
 // their own patientId — clinicians can specify any patient they're allowed to see.
@@ -46,7 +64,7 @@ async function enforcePatientSelfOnConversation(req, res, next) {
  *     responses:
  *       200: { description: Conversation created or returned }
  */
-router.post('/initiate', async (req, res, next) => {
+router.post('/initiate', validate({ body: initiateSchema }), async (req, res, next) => {
     try {
         const { partnerId } = req.body;
         const conversation = await ChatService.initiateConversation(req.user.id, partnerId);
@@ -76,7 +94,7 @@ router.post('/initiate', async (req, res, next) => {
  *     responses:
  *       200: { description: Conversation returned }
  */
-router.post('/conversation', enforcePatientSelfOnConversation, async (req, res, next) => {
+router.post('/conversation', validate({ body: conversationSchema }), enforcePatientSelfOnConversation, async (req, res, next) => {
     try {
         const { patientId, doctorId, therapistId, pharmacistId } = req.body;
 

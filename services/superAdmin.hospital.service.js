@@ -203,7 +203,8 @@ export class SuperAdminHospitalService {
     });
 
     // Revoke all refresh tokens for users in this hospital (spec §8 step 2).
-    const users = await prisma.user.findMany({ where: { hospitalId: id }, select: { id: true } });
+    // Active users only — soft-deleted users have no live sessions to revoke.
+    const users = await prisma.user.findMany({ where: { hospitalId: id, deletedAt: null }, select: { id: true } });
     await Promise.all(users.map((u) => AuthService.logoutAll(u.id).catch(() => null)));
 
     invalidateHospitalStatusCache(id);

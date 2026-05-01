@@ -33,8 +33,8 @@ export class AnnouncementService {
       },
     });
 
-    // Pick who to notify
-    const userWhere = {};
+    // Pick who to notify — soft-deleted users never receive announcements.
+    const userWhere = { deletedAt: null };
     if (ids.length > 0) {
       userWhere.branchId = { in: ids };
     }
@@ -156,15 +156,23 @@ export class AnnouncementService {
   }
 
   /**
-   * Delete an announcement (only author or admin).
+   * Delete an announcement.
+   *
+   * Allowed when caller is:
+   *   - the original author (any role), OR
+   *   - ADMIN / ADMIN_DOCTOR.
+   * Anyone else gets a 403 (`status: 403`).
    */
   static async deleteAnnouncement(announcementId, userId) {
     const announcement = await prisma.announcement.findUnique({
       where: { id: announcementId },
+      select: { authorId: true },
     });
 
     if (!announcement) {
-      throw new Error('Announcement not found');
+      const err = new Error('Announcement not found');
+      err.status = 404;
+      throw err;
     }
 
     const user = await prisma.user.findUnique({
@@ -172,8 +180,12 @@ export class AnnouncementService {
       select: { role: true },
     });
 
-    if (announcement.authorId !== userId && user?.role !== 'ADMIN') {
-      throw new Error('Not authorized to delete this announcement');
+    const isAuthor = announcement.authorId === userId;
+    const isAdmin  = user?.role === 'ADMIN' || user?.role === 'ADMIN_DOCTOR';
+    if (!isAuthor && !isAdmin) {
+      const err = new Error('Not authorized to delete this announcement');
+      err.status = 403;
+      throw err;
     }
 
     await prisma.announcement.delete({
@@ -186,8 +198,36 @@ export class AnnouncementService {
   /**
    * Update an announcement's title, message, priority, pinned status, roles,
    * expiry, or branch targeting.
+   *
+   * Editing is reserved for the announcement's author. ADMIN / ADMIN_DOCTOR
+   * may also edit announcements they didn't author so they can correct an
+   * announcement after the author has left or moved branches.
    */
-  static async updateAnnouncement(announcementId, data) {
+  static async updateAnnouncement(announcementId, data, userId) {
+    const existing = await prisma.announcement.findUnique({
+      where: { id: announcementId },
+      select: { authorId: true },
+    });
+    if (!existing) {
+      const err = new Error('Announcement not found');
+      err.status = 404;
+      throw err;
+    }
+
+    if (userId) {
+      const user = await prisma.user.findUnique({
+        where: { id: userId },
+        select: { role: true },
+      });
+      const isAuthor = existing.authorId === userId;
+      const isAdmin  = user?.role === 'ADMIN' || user?.role === 'ADMIN_DOCTOR';
+      if (!isAuthor && !isAdmin) {
+        const err = new Error('Not authorized to edit this announcement');
+        err.status = 403;
+        throw err;
+      }
+    }
+
     const updateData = {};
     if (data.title !== undefined) updateData.title = data.title;
     if (data.message !== undefined) updateData.message = data.message;

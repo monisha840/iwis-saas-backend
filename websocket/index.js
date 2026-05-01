@@ -81,9 +81,19 @@ export async function initializeWebSocket(httpServer) {
                 }
 
                 socket.join(`conversation:${conversationId}`);
-                console.log(`[WebSocket] User ${socket.userId} joined conversation ${conversationId}`);
+                logger.debug('[WebSocket] joined conversation', {
+                    userId: socket.userId,
+                    role: socket.userRole,
+                    conversationId,
+                });
             } catch (err) {
-                console.error('[WebSocket] Error joining conversation:', err);
+                logger.error('[WebSocket] join_conversation failed', {
+                    userId: socket.userId,
+                    role: socket.userRole,
+                    conversationId,
+                    error: err?.message,
+                    stack: err?.stack,
+                });
                 socket.emit('error', { message: 'Failed to join conversation' });
             }
         });
@@ -228,21 +238,39 @@ export async function initializeWebSocket(httpServer) {
                                 io.to(`user:${userId}`).emit('notification', notification);
                             } catch (perUserErr) {
                                 // Non-critical per-recipient failure — log and continue
-                                console.error(
-                                    `[WebSocket] Message notification failed for user ${userId}:`,
-                                    perUserErr.message
-                                );
+                                logger.warn('[WebSocket] message notification failed', {
+                                    senderUserId: socket.userId,
+                                    recipientUserId: userId,
+                                    conversationId,
+                                    messageId: message.id,
+                                    error: perUserErr?.message,
+                                });
                             }
                         }));
                     }
                 } catch (notifErr) {
                     // Notification delivery is best-effort; message was already persisted and emitted
-                    console.error('[WebSocket] Failed to dispatch message notifications:', notifErr.message);
+                    logger.warn('[WebSocket] notification dispatch failed', {
+                        senderUserId: socket.userId,
+                        conversationId,
+                        messageId: message.id,
+                        error: notifErr?.message,
+                    });
                 }
 
-                console.log(`[WebSocket] Message sent in ${conversationId} by ${socket.userId}`);
+                logger.debug('[WebSocket] message sent', {
+                    senderUserId: socket.userId,
+                    conversationId,
+                    messageId: message.id,
+                });
             } catch (err) {
-                console.error('[WebSocket] Send message error:', err);
+                logger.error('[WebSocket] send_message failed', {
+                    userId: socket.userId,
+                    role: socket.userRole,
+                    conversationId,
+                    error: err?.message,
+                    stack: err?.stack,
+                });
                 socket.emit('error', { message: 'Failed to send message' });
             }
         });
@@ -298,7 +326,12 @@ export async function initializeWebSocket(httpServer) {
 
                 socket.join(`queue:doctor:${doctorId}:date:${dateKey}`);
             } catch (err) {
-                console.error('[WebSocket] Error joining doctor queue room:', err);
+                logger.error('[WebSocket] join_queue_doctor failed', {
+                    userId: socket.userId,
+                    role: socket.userRole,
+                    doctorId,
+                    error: err?.message,
+                });
             }
         });
 
@@ -326,7 +359,12 @@ export async function initializeWebSocket(httpServer) {
 
                 socket.join(`queue:branch:${branchId}:date:${dateKey}`);
             } catch (err) {
-                console.error('[WebSocket] Error joining branch queue room:', err);
+                logger.error('[WebSocket] join_queue_branch failed', {
+                    userId: socket.userId,
+                    role: socket.userRole,
+                    branchId,
+                    error: err?.message,
+                });
             }
         });
 
@@ -343,6 +381,84 @@ export async function initializeWebSocket(httpServer) {
         socket.on('disconnect', () => {
             console.log(`[WebSocket] User ${socket.userId} disconnected`);
         });
+    });
+
+    // ── Home-therapy namespace ─────────────────────────────────────────
+    // Dedicated namespace for high-frequency GPS pings during home-therapy
+    // sessions. Isolated from the default namespace so location traffic
+    // doesn't mix with chat / queue / notification events.
+    //
+    // Rooms:
+    //   session:<sessionId> — admins / branch-admins watching the live map
+    //   patient:<patientId> — patient's portal watching their therapist
+    //
+    // Auth: same JWT handshake as the default namespace. Clients call
+    // `socket.emit('join_session', { sessionId })` / `'join_patient'` after
+    // connecting; membership is gated by role (admin/branch_admin can join
+    // any session room; patient can only join their own).
+    const homeTherapyNs = io.of('/home-therapy');
+    homeTherapyNs.use((socket, next) => {
+        const token = socket.handshake.auth?.token;
+        if (!token) return next(new Error('Authentication error: No token provided'));
+        try {
+            const decoded = jwt.verify(token, config.jwt.secret);
+            socket.userId = decoded.id;
+            socket.userRole = decoded.role;
+            return next();
+        } catch (err) {
+            return next(new Error('Authentication error: Invalid token'));
+        }
+    });
+    homeTherapyNs.on('connection', (socket) => {
+        socket.join(`user:${socket.userId}`);
+        socket.join(`role:${socket.userRole}`);
+
+        socket.on('join_session', async ({ sessionId } = {}) => {
+            if (typeof sessionId !== 'string' || !sessionId.trim()) {
+                socket.emit('error', { message: 'Invalid sessionId' });
+                return;
+            }
+            // Admins / branch admins / admin doctors can watch any session.
+            // Therapist may join only their own; patient may join only their
+            // own. Defence-in-depth — broadcasters should already gate this.
+            if (['ADMIN', 'ADMIN_DOCTOR', 'BRANCH_ADMIN', 'SUPER_ADMIN'].includes(socket.userRole)) {
+                socket.join(`session:${sessionId}`);
+                return;
+            }
+            try {
+                const session = await prisma.homeTherapySession.findUnique({
+                    where: { id: sessionId },
+                    select: {
+                        therapist: { select: { userId: true } },
+                        patient:   { select: { userId: true } },
+                    },
+                });
+                if (!session) {
+                    socket.emit('error', { message: 'Session not found' });
+                    return;
+                }
+                if (socket.userRole === 'THERAPIST' && session.therapist?.userId !== socket.userId) {
+                    socket.emit('error', { message: 'Unauthorized: not your session' });
+                    return;
+                }
+                if (socket.userRole === 'PATIENT' && session.patient?.userId !== socket.userId) {
+                    socket.emit('error', { message: 'Unauthorized: not your session' });
+                    return;
+                }
+                socket.join(`session:${sessionId}`);
+            } catch (err) {
+                logger.warn?.('[WebSocket /home-therapy] join_session failed', { err: err?.message });
+                socket.emit('error', { message: 'Failed to join session' });
+            }
+        });
+
+        socket.on('leave_session', ({ sessionId } = {}) => {
+            if (typeof sessionId === 'string' && sessionId) {
+                socket.leave(`session:${sessionId}`);
+            }
+        });
+
+        socket.on('disconnect', () => { /* nothing to clean up beyond the room auto-leave */ });
     });
 
     console.log('[WebSocket] Server initialized');
@@ -396,6 +512,29 @@ export function emitToAll(event, data) {
 
     io.emit(event, data);
     console.log(`[WebSocket] Emitted ${event} to all clients`);
+}
+
+/**
+ * Emit on the dedicated /home-therapy namespace.
+ *
+ * Rooms used today:
+ *   - `session:<sessionId>` — admins watching the live map
+ *   - `patient:<patientId>` — patient's portal
+ *   - `user:<userId>` — fan-out to a specific user inside the namespace
+ *
+ * Best-effort: returns silently when the websocket layer hasn't been
+ * initialised (e.g. during certain test setups).
+ */
+export function emitToHomeTherapyRoom(room, event, data) {
+    if (!io) {
+        console.warn('[WebSocket] Socket.IO not initialized');
+        return;
+    }
+    try {
+        io.of('/home-therapy').to(room).emit(event, data);
+    } catch (err) {
+        console.warn(`[WebSocket /home-therapy] emit ${event} failed`, err?.message);
+    }
 }
 
 /**

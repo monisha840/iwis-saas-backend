@@ -110,6 +110,18 @@ const createUserSchema = z.object({
     previousDoctorDetails: z.string().nullable().optional(),
   }).optional(),
 
+  // ── Home Therapy: location & contact ───────────────────────────────────
+  // Used for the home-therapy live-map and route planning. All optional at
+  // intake; required only when the doctor flips a prescription's "therapy
+  // referral required" toggle. Geocoded server-side on save.
+  addressLine1:     z.string().trim().min(1).max(200).optional(),
+  addressLine2:     z.string().trim().max(200).optional(),
+  city:             z.string().trim().min(1).max(100).optional(),
+  state:            z.string().trim().min(1).max(100).optional(),
+  pincode:          z.string().trim().regex(/^[0-9]{6}$/, 'Pincode must be 6 digits').optional(),
+  primaryPhone:     phoneShape.optional(),
+  alternativePhone: phoneShape.optional(),
+
   // Clinician-only (DOCTOR / ADMIN_DOCTOR / THERAPIST / PHARMACIST)
   specialization:  z.string().min(1).optional(),
   qualification:   z.string().min(1).optional(),
@@ -162,8 +174,16 @@ const createUserSchema = z.object({
       staffCheck.error.issues.forEach((iss) => ctx.addIssue({ ...iss, path: ['password'] }));
     }
   }
-  if (val.role === 'DOCTOR' || val.role === 'ADMIN_DOCTOR' || val.role === 'THERAPIST') {
+  if (val.role === 'DOCTOR' || val.role === 'ADMIN_DOCTOR') {
     req('specialization');
+    req('qualification');
+    req('yearsExperience');
+    req('registrationNumber');
+  }
+  if (val.role === 'THERAPIST') {
+    // Therapists no longer carry specialization — gender (MALE / FEMALE) is
+    // the only categorical attribute. Skill matrix is seeded via initialSkills.
+    req('gender');
     req('qualification');
     req('yearsExperience');
     req('registrationNumber');
@@ -187,7 +207,8 @@ const updateDoctorSchema = z.object({
 const updateTherapistSchema = z.object({
   email: z.string().email().min(1, 'Email is required').optional(),
   fullName: z.string().min(2, 'Full name is required').optional(),
-  specialization: z.string().nullable().optional(),
+  // Specialization removed — therapists are categorized by gender only.
+  gender: z.enum(GENDERS).nullable().optional(),
   qualification: z.string().nullable().optional(),
   yearsExperience: z.number().int().nonnegative().nullable().optional(),
   clinic: z.string().nullable().optional(),
@@ -203,6 +224,15 @@ const updatePatientSchema = z.object({
   therapyType: z.string().nullable().optional(),
   patientId: z.string().nullable().optional(),
   branchId: z.string().min(1, 'Branch is required').optional(),
+
+  // Home Therapy address & contact — re-geocoded server-side on every save
+  addressLine1:     z.string().trim().max(200).nullable().optional(),
+  addressLine2:     z.string().trim().max(200).nullable().optional(),
+  city:             z.string().trim().max(100).nullable().optional(),
+  state:            z.string().trim().max(100).nullable().optional(),
+  pincode:          z.string().trim().regex(/^[0-9]{6}$/, 'Pincode must be 6 digits').nullable().optional(),
+  primaryPhone:     z.string().regex(/^\+?[0-9]{7,15}$/, 'Invalid phone format').nullable().optional(),
+  alternativePhone: z.string().regex(/^\+?[0-9]{7,15}$/, 'Invalid phone format').nullable().optional(),
 });
 
 const updatePharmacistSchema = z.object({
@@ -356,6 +386,14 @@ router.get('/features', authMiddleware, async (req, res, next) => {
 // those are identity/tenancy changes that must go through an admin.
 // phoneNumber / bio / languages apply to clinicians (DOCTOR / ADMIN_DOCTOR /
 // THERAPIST / PHARMACIST) and patients — the service layer picks the right row.
+//
+// addressLine1..pincode + primaryPhone/alternativePhone are PATIENT-only and
+// drive the Home Therapy geocoder. Empty strings are accepted for stringy
+// fields so the patient dashboard can clear a value; the regex-validated
+// fields (pincode, phones) accept either a valid value, empty string, or null.
+const optionalEmptyOrRegex = (re, message) =>
+  z.union([z.literal(''), z.string().regex(re, message)]).nullable().optional();
+
 const updateMeSchema = z.object({
   fullName: z.string().min(2).max(100).optional(),
   phoneNumber: z.string().regex(/^\+?[0-9]{7,15}$/).nullable().optional(),
@@ -366,6 +404,14 @@ const updateMeSchema = z.object({
   dob: dobShape.optional(),
   gender: z.enum(GENDERS).optional(),
   therapyType: z.string().max(100).nullable().optional(),
+
+  addressLine1:     z.string().trim().max(200).nullable().optional(),
+  addressLine2:     z.string().trim().max(200).nullable().optional(),
+  city:             z.string().trim().max(100).nullable().optional(),
+  state:            z.string().trim().max(100).nullable().optional(),
+  pincode:          optionalEmptyOrRegex(/^[0-9]{6}$/, 'Pincode must be 6 digits'),
+  primaryPhone:     optionalEmptyOrRegex(/^\+?[0-9]{7,15}$/, 'Invalid phone format'),
+  alternativePhone: optionalEmptyOrRegex(/^\+?[0-9]{7,15}$/, 'Invalid phone format'),
 });
 
 router.patch(
@@ -663,6 +709,17 @@ router.put('/therapist/:id', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOC
 });
 
 router.put('/patient/:id', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']), validate({ body: updatePatientSchema }), auditAction('UPDATE_USER', 'User', (req) => req.params.id), async (req, res, next) => {
+  try {
+    await UserService.updateProfile('patient', req.params.id, req.body);
+    res.json({ message: 'Patient updated successfully' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PATCH alias — the home-therapy spec uses PATCH for partial address edits.
+// Both verbs route to the same handler so callers can use either.
+router.patch('/patient/:id', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']), validate({ body: updatePatientSchema }), auditAction('UPDATE_USER', 'User', (req) => req.params.id), async (req, res, next) => {
   try {
     await UserService.updateProfile('patient', req.params.id, req.body);
     res.json({ message: 'Patient updated successfully' });

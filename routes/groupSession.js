@@ -29,8 +29,12 @@ router.post('/', authorizeRoles('ADMIN', 'ADMIN_DOCTOR', 'THERAPIST'), async (re
 
 router.get('/', async (req, res, next) => {
     try {
+        // hospitalId pinned from the JWT — without it a stale token could
+        // list group sessions across hospitals. branchId remains optional
+        // so admin "All Branches" view returns the hospital-wide list.
         res.json(await GroupSessionService.list({
-            branchId: req.query.branchId,
+            branchId: req.query.branchId || undefined,
+            hospitalId: req.user?.hospitalId ?? null,
             date: req.query.date,
             therapistId: req.query.therapistId,
         }));

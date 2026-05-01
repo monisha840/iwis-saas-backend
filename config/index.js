@@ -88,12 +88,6 @@ const config = {
     from: process.env.EMAIL_FROM || 'noreply@alshifa.health',
   },
 
-  sms: {
-    twilioAccountSid: process.env.TWILIO_ACCOUNT_SID,
-    twilioAuthToken: process.env.TWILIO_AUTH_TOKEN,
-    twilioFromNumber: process.env.TWILIO_FROM_NUMBER,
-  },
-
   webPush: {
     vapidPublicKey: process.env.VAPID_PUBLIC_KEY,
     vapidPrivateKey: process.env.VAPID_PRIVATE_KEY,

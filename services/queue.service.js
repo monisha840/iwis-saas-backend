@@ -7,6 +7,7 @@
 
 import config from '../config/index.js';
 import logger from '../lib/logger.js';
+import { getFeedbackRequestQueue } from '../jobs/feedbackRequest.job.js';
 
 // Parse Redis URL for connection object
 function parseRedisUrl(url) {
@@ -171,5 +172,8 @@ export async function enqueueReport({ format = 'pdf', type, filters, requestedBy
 
 // ── Bull Board Integration ──────────────────────────────────────────────────
 export function getBullBoardQueues() {
-  return [_notificationQueue, _auditQueue, _reportQueue].filter(Boolean);
+  // getFeedbackRequestQueue() returns null until the consultation-feedback-request
+  // queue has finished its lazy init (or returns null permanently if Redis is down).
+  const feedbackRequestQueue = getFeedbackRequestQueue();
+  return [_notificationQueue, _auditQueue, _reportQueue, feedbackRequestQueue].filter(Boolean);
 }

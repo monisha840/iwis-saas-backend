@@ -85,35 +85,47 @@ export class PatientQueueService {
     const missing = appts.filter((a) => !existingIds.has(a.id));
 
     if (missing.length > 0) {
-      // Determine starting queue position — keep existing positions and
-      // append new ones at the end so re-seeding mid-day doesn't reshuffle.
-      const max = await prisma.queueEntry.aggregate({
-        where: { doctorId, date: dayStart },
-        _max: { queuePosition: true },
-      });
-      let nextPos = (max._max.queuePosition || 0) + 1;
-
-      // Sort missing by scheduled time so positions reflect schedule order.
+      // Atomic seed: max-read + create + appointment-update inside one
+      // transaction so a crash mid-loop can't leave half-seeded queue
+      // entries (and the appointment row's queuePosition mirror is kept in
+      // sync). Two concurrent seeders are still possible — the
+      // `appointmentId @unique` constraint on QueueEntry prevents duplicate
+      // rows; position duplicates are aesthetic only and resolved on the
+      // next manual rerank.
       missing.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
 
-      for (const a of missing) {
-        if (!a.branchId) continue; // can't queue an appointment with no branch
-        await prisma.queueEntry.create({
-          data: {
-            appointmentId: a.id,
-            doctorId,
-            branchId: a.branchId,
-            date: dayStart,
-            queuePosition: nextPos,
-            arrivalStatus: ARRIVAL_STATUS.NOT_ARRIVED,
-          },
+      await prisma.$transaction(async (tx) => {
+        const max = await tx.queueEntry.aggregate({
+          where: { doctorId, date: dayStart },
+          _max: { queuePosition: true },
         });
-        await prisma.appointment.update({
-          where: { id: a.id },
-          data: { queuePosition: nextPos },
-        }).catch(() => null);
-        nextPos += 1;
-      }
+        let nextPos = (max._max.queuePosition || 0) + 1;
+
+        for (const a of missing) {
+          if (!a.branchId) continue;
+          try {
+            await tx.queueEntry.create({
+              data: {
+                appointmentId: a.id,
+                doctorId,
+                branchId: a.branchId,
+                date: dayStart,
+                queuePosition: nextPos,
+                arrivalStatus: ARRIVAL_STATUS.NOT_ARRIVED,
+              },
+            });
+            await tx.appointment.update({
+              where: { id: a.id },
+              data: { queuePosition: nextPos },
+            });
+            nextPos += 1;
+          } catch (err) {
+            // P2002 — another seeder beat us to creating this entry. Skip
+            // and continue; the next read will pick it up.
+            if (err?.code !== 'P2002') throw err;
+          }
+        }
+      });
     }
 
     return prisma.queueEntry.findMany({
@@ -299,7 +311,14 @@ export class PatientQueueService {
 
   // ── State transitions ───────────────────────────────────────────────────
 
-  /** Lazily fetch (or create) the QueueEntry for a single appointment. */
+  /**
+   * Lazily fetch (or create) the QueueEntry for a single appointment.
+   *
+   * The max-position read + create live inside a transaction so the row is
+   * stamped with a consistent position. The QueueEntry.appointmentId unique
+   * constraint serialises concurrent first-touches: a parallel caller
+   * collides with P2002, we retry the read, and return the row that won.
+   */
   static async ensureEntryForAppointment(appointmentId) {
     const existing = await prisma.queueEntry.findUnique({
       where: { appointmentId },
@@ -316,21 +335,35 @@ export class PatientQueueService {
     if (!appt.branchId) throw Object.assign(new Error('Appointment has no branch'), { status: 400 });
 
     const dayStart = startOfDay(appt.date);
-    const max = await prisma.queueEntry.aggregate({
-      where: { doctorId: appt.doctorId, date: dayStart },
-      _max: { queuePosition: true },
-    });
-    return prisma.queueEntry.create({
-      data: {
-        appointmentId: appt.id,
-        doctorId: appt.doctorId,
-        branchId: appt.branchId,
-        date: dayStart,
-        queuePosition: (max._max.queuePosition || 0) + 1,
-        arrivalStatus: ARRIVAL_STATUS.NOT_ARRIVED,
-      },
-      include: { appointment: { select: { branchId: true, doctorId: true, date: true } } },
-    });
+
+    try {
+      return await prisma.$transaction(async (tx) => {
+        const max = await tx.queueEntry.aggregate({
+          where: { doctorId: appt.doctorId, date: dayStart },
+          _max: { queuePosition: true },
+        });
+        return tx.queueEntry.create({
+          data: {
+            appointmentId: appt.id,
+            doctorId: appt.doctorId,
+            branchId: appt.branchId,
+            date: dayStart,
+            queuePosition: (max._max.queuePosition || 0) + 1,
+            arrivalStatus: ARRIVAL_STATUS.NOT_ARRIVED,
+          },
+          include: { appointment: { select: { branchId: true, doctorId: true, date: true } } },
+        });
+      });
+    } catch (err) {
+      // P2002 = another concurrent caller created the entry first. Re-fetch.
+      if (err?.code === 'P2002') {
+        return prisma.queueEntry.findUnique({
+          where: { appointmentId },
+          include: { appointment: { select: { branchId: true, doctorId: true, date: true } } },
+        });
+      }
+      throw err;
+    }
   }
 
   static async markArrived(appointmentId, { actorUserId } = {}) {

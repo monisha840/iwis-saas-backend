@@ -8,6 +8,18 @@ const RESPONSE_TIME_TARGET_MINS = 30;
 const MSS_IN_A_DAY = 24 * 60 * 60 * 1000;
 const DECAY_RATE = 0.05; // Exponential decay factor — recent days weighted higher
 
+// 2026-04-28: weights spec change — patient-feedback signal added at 0.15 and
+// the appointment-volume contribution reduced from 0.25 to 0.10 to keep the
+// total at 1.0. LeaderboardConfig in the DB still stores the legacy 0.25 for
+// back-compat with prior audit rows; these runtime constants are authoritative.
+const APPOINTMENT_WEIGHT_OVERRIDE = 0.10;
+const FEEDBACK_WEIGHT             = 0.15;
+// 2026-04-28: home-therapy completion rate is a better consistency proxy for
+// THERAPIST roles than activeDays, so for therapists we redirect the 0.10
+// consistency slot to the homeTherapyScore. Non-therapist roles keep the
+// legacy consistency weight.
+const HOME_THERAPY_WEIGHT          = 0.10;
+
 export class LeaderboardService {
     /**
      * Get the current leaderboard configuration or create default
@@ -115,6 +127,34 @@ export class LeaderboardService {
         const { consistency, activeDaysCount } = await this._calculateConsistencyScore(participantId, thirtyDaysAgo, prefetchedData);
         const consistencyScore = consistency;
 
+        // 6. Feedback score — average ConsultationFeedback rating × 20 (5★ → 100).
+        //    Looks up by clinicianId (User.id), so we resolve participantId
+        //    (Doctor.id / Therapist.id) → user.id once. Returns 0 when there
+        //    are no rated feedback rows in the period.
+        const userIdRow = role === 'THERAPIST'
+            ? await prisma.therapist.findUnique({ where: { id: participantId }, select: { userId: true } })
+            : await prisma.doctor.findUnique({    where: { id: participantId }, select: { userId: true } });
+        const clinicianUserId = userIdRow?.userId || null;
+
+        let feedbackScore = 0;
+        let feedbackCount = 0;
+        let avgFeedbackRating = 0;
+        if (clinicianUserId) {
+            const fb = await prisma.consultationFeedback.findMany({
+                where: {
+                    clinicianId: clinicianUserId,
+                    rating:      { not: null },
+                    createdAt:   { gte: thirtyDaysAgo },
+                },
+                select: { rating: true },
+            });
+            feedbackCount = fb.length;
+            if (feedbackCount > 0) {
+                avgFeedbackRating = fb.reduce((s, r) => s + (r.rating || 0), 0) / feedbackCount;
+                feedbackScore = Math.max(0, Math.min(100, avgFeedbackRating * 20));
+            }
+        }
+
         // Fetch streak multiplier (if clinician has an active streak)
         let streakMultiplier = 1.0;
         let currentStreak = 0;
@@ -128,12 +168,45 @@ export class LeaderboardService {
             }
         } catch { /* streak table may not exist yet */ }
 
+        // 7. Home-therapy metric (THERAPIST only). Field therapists earn this
+        //    in lieu of the legacy "consistency" signal — the completion rate
+        //    of HOME and HOSPITAL therapy sessions in the lookback window is a
+        //    cleaner consistency proxy than activeDays for therapists who do
+        //    most of their work outside the clinic.
+        let homeTherapyScore = 0;
+        let homeCompleted = 0;
+        let homeScheduled = 0;
+        if (role === 'THERAPIST') {
+            try {
+                const sessions = await prisma.homeTherapySession.findMany({
+                    where: {
+                        therapistId: participantId,
+                        scheduledDate: { gte: thirtyDaysAgo },
+                    },
+                    select: { status: true },
+                });
+                homeScheduled = sessions.length;
+                homeCompleted = sessions.filter((s) => s.status === 'COMPLETED').length;
+                homeTherapyScore = homeScheduled > 0
+                    ? Math.max(0, Math.min(100, (homeCompleted / homeScheduled) * 100))
+                    : 0;
+            } catch { /* table not migrated yet — treat as 0 */ }
+        }
+
+        // For THERAPIST roles redirect the 0.10 consistency weight to the
+        // home-therapy completion signal. Other roles keep the legacy weights.
+        const isTherapist = role === 'THERAPIST';
+        const effectiveConsistencyWeight = isTherapist ? 0.0 : config.consistencyWeight;
+        const effectiveHomeTherapyWeight = isTherapist ? HOME_THERAPY_WEIGHT : 0.0;
+
         const baseScore =
-            (appointmentScore * config.appointmentWeight) +
+            (appointmentScore * APPOINTMENT_WEIGHT_OVERRIDE) +
             (adherenceScore * config.adherenceWeight) +
             (responseTimeScore * config.responseTimeWeight) +
             (successScore * config.successRateWeight) +
-            (consistencyScore * config.consistencyWeight);
+            (consistencyScore * effectiveConsistencyWeight) +
+            (homeTherapyScore * effectiveHomeTherapyWeight) +
+            (feedbackScore * FEEDBACK_WEIGHT);
 
         // Apply streak multiplier (capped at 110% to prevent runaway scores)
         const finalScore = Math.round(Math.min(baseScore * streakMultiplier, 100));
@@ -143,7 +216,16 @@ export class LeaderboardService {
             adherence: { value: adherenceRate, score: adherenceScore, target: config.targetAdherence },
             responseTime: { value: avgMinutes, score: responseTimeScore, target: config.targetResponseTime },
             successRate: { value: successRate, score: successScore, target: config.targetSuccessRate },
-            consistency: { value: activeDaysCount, score: consistencyScore, target: 15 },
+            consistency: { value: activeDaysCount, score: consistencyScore, target: 15, weightApplied: effectiveConsistencyWeight },
+            homeTherapy: {
+                value: Math.round(homeTherapyScore),
+                score: homeTherapyScore,
+                completed: homeCompleted,
+                scheduled: homeScheduled,
+                target: 100,
+                weightApplied: effectiveHomeTherapyWeight,
+            },
+            feedback: { value: Math.round(avgFeedbackRating * 100) / 100, score: feedbackScore, count: feedbackCount, target: 5 },
             streak: { currentStreak, multiplier: streakMultiplier }
         };
 
@@ -161,12 +243,20 @@ export class LeaderboardService {
 
         const { score: finalScore, metrics } = result;
 
+        const isTherapist = role === 'THERAPIST';
         const weights = {
-            appointmentWeight: config.appointmentWeight,
-            adherenceWeight: config.adherenceWeight,
+            // 2026-04-28: appointmentWeight reduced 0.25 → 0.10 and a new
+            // feedbackWeight 0.15 added; the audit snapshot reflects the
+            // runtime constants, not the legacy DB config row. For THERAPIST
+            // roles the consistency slot (0.10) is redirected into the new
+            // homeTherapyWeight so the formula still totals 1.0.
+            appointmentWeight:  APPOINTMENT_WEIGHT_OVERRIDE,
+            adherenceWeight:    config.adherenceWeight,
             responseTimeWeight: config.responseTimeWeight,
-            successRateWeight: config.successRateWeight,
-            consistencyWeight: config.consistencyWeight
+            successRateWeight:  config.successRateWeight,
+            consistencyWeight:  isTherapist ? 0 : config.consistencyWeight,
+            homeTherapyWeight:  isTherapist ? HOME_THERAPY_WEIGHT : 0,
+            feedbackWeight:     FEEDBACK_WEIGHT,
         };
 
         const integrityHash = this._generateIntegrityHash({
@@ -220,7 +310,7 @@ export class LeaderboardService {
 
         const participants = [
             ...doctors.map(d => ({ id: d.id, fullName: d.fullName, role: 'DOCTOR', specialization: d.specialization, profilePhoto: d.profilePhoto })),
-            ...therapists.map(t => ({ id: t.id, fullName: t.fullName, role: 'THERAPIST', specialization: t.specialization, profilePhoto: t.profilePhoto }))
+            ...therapists.map(t => ({ id: t.id, fullName: t.fullName, role: 'THERAPIST', gender: t.gender, profilePhoto: t.profilePhoto }))
         ];
 
         if (participants.length === 0) {

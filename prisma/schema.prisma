@@ -104,6 +104,7 @@ model User {
   // Journey feedback (patient-side submissions + lead-doctor attribution)
   journeyFeedbackPatient     JourneyFeedback[]       @relation("JourneyFeedbackPatient")
   journeyFeedbackLeadDoctor  JourneyFeedback[]       @relation("JourneyFeedbackLeadDoctor")
+  journeyFeedbackPrimary     JourneyFeedback[]       @relation("JourneyFeedbackPrimaryClinician")
   thankYouCardsReceived      ThankYouCard[]          @relation("ThankYouCardRecipient")
   // Flattened export-friendly snapshot kept in sync with this user
   snapshot                   UserSnapshot?
@@ -222,6 +223,7 @@ model Branch {
   // Journey feedback scoped to this branch (for branch-filtered admin views)
   journeyFeedback     JourneyFeedback[]    @relation("JourneyFeedbackBranch")
   queueEntries        QueueEntry[]
+  homeTherapyRequests HomeTherapyRequest[]
 }
 
 // Live patient queue / arrival tracking. One row per appointment per day
@@ -309,6 +311,7 @@ model Doctor {
   patientAssignments PatientAssignment[]
   consultationFeedback ConsultationFeedback[]
   queueEntries       QueueEntry[]
+  homeTherapyRequests HomeTherapyRequest[]
 }
 
 // Canonical record of who's looking after a patient. Supersedes the old
@@ -390,7 +393,9 @@ model Therapist {
   fullName           String?
   profilePhoto       String?
   qualification      String?
-  specialization     String?
+  // Therapists are categorized by gender (MALE / FEMALE) only — no
+  // specialization field. Skill mix lives separately on TherapistSkill.
+  gender             String?
   yearsExperience    Int?
   // Certificate / registration number (e.g. AYUSH / state therapy board).
   // Nullable on the schema for back-compat; required at the form and route
@@ -412,6 +417,7 @@ model Therapist {
   therapistSkills    TherapistSkill[]
   groupSessions      GroupSession[]
   packageSessionLogs PackageSessionLog[] @relation("PackageSessionConductor")
+  homeTherapySessions HomeTherapySession[]
 }
 
 model Pharmacist {
@@ -502,6 +508,21 @@ model Patient {
   followUps           AppointmentFollowUp[]
   // Critical-journey flag (at most one active row per patient — upsert-based)
   criticalFlag        PatientCriticalFlag?
+
+  // ── Home Therapy: location & contact fields ──────────────────────────────
+  addressLine1        String?
+  addressLine2        String?
+  city                String?
+  state               String?
+  pincode             String?
+  latitude            Float?
+  longitude           Float?
+  primaryPhone        String?
+  alternativePhone    String?
+  locationVerified    Boolean             @default(false)
+
+  homeTherapyRequests HomeTherapyRequest[]
+  homeTherapySessions HomeTherapySession[]
 
   @@index([branchId]) // branch-scoped patient queries (listPatients, triage dispatch)
 }
@@ -633,6 +654,9 @@ model Appointment {
   queuePosition              Int?
   absentContactedAt          DateTime?
   queueEntry                 QueueEntry?
+  // Optional 1:1 link to a HomeTherapySession (when this Appointment was
+  // auto-created by the home-therapy approval flow).
+  homeTherapySession         HomeTherapySession?
 
   @@index([patientId])
   @@index([doctorId])
@@ -704,6 +728,12 @@ model Prescription {
   // package context without joining through PackageEnrolment.
   packageId         String?
   package           TreatmentPackage?  @relation(fields: [packageId], references: [id], onDelete: SetNull)
+  // Optional link to a TreatmentJourney created in the same atomic save.
+  // Populated by the prescription+journey transaction in prescription.service.js.
+  journeyId         String?
+  journey           TreatmentJourney?  @relation("JourneyPrescriptions", fields: [journeyId], references: [id], onDelete: SetNull)
+  // Home Therapy referrals authored alongside this prescription
+  homeTherapyRequests HomeTherapyRequest[]
 
   @@index([patientId])
   @@index([doctorId])
@@ -712,6 +742,7 @@ model Prescription {
   @@index([branchId])
   @@index([appointmentId])
   @@index([packageId])
+  @@index([journeyId])
   @@index([discontinuedAt, expectedEndDate])
 }
 
@@ -757,9 +788,9 @@ model Notification {
 model NotificationDelivery {
   id             String   @id @default(uuid())
   notificationId String
-  channel        String   // EMAIL, SMS, PUSH, WEBHOOK, IN_APP
+  channel        String   // PUSH, WEBHOOK, IN_APP, WHATSAPP
   status         String   @default("PENDING") // PENDING, SENT, FAILED, BOUNCED
-  externalId     String?  // Twilio SID, email messageId, etc.
+  externalId     String?  // provider message id (Evolution, web-push receipt, etc.)
   errorMessage   String?
   attemptCount   Int      @default(0)
   sentAt         DateTime?
@@ -1451,25 +1482,49 @@ enum FeedbackMcqOption {
   D
 }
 
+enum FeedbackSentiment {
+  POSITIVE
+  NEUTRAL
+  NEGATIVE
+}
+
 model ConsultationFeedback {
   id                    String             @id @default(cuid())
   appointmentId         String             @unique
   appointment           Appointment        @relation(fields: [appointmentId], references: [id])
   patientId             String
   patient               Patient            @relation(fields: [patientId], references: [id])
-  doctorId              String
-  doctor                Doctor             @relation(fields: [doctorId], references: [id])
+  doctorId              String?
+  doctor                Doctor?            @relation(fields: [doctorId], references: [id])
+  // Role-agnostic clinician reference for the new rating flow (DOCTOR/THERAPIST/ADMIN_DOCTOR).
+  // doctorId remains for the legacy MCQ flow back-compat.
+  clinicianId           String?
+  clinicianRole         Role?
   branchId              String?
   branch                Branch?            @relation(fields: [branchId], references: [id])
+  // Legacy MCQ flow fields (2026-04-24 release) — keep populated for old prompts.
   faceScaleEmotional    Int?               // 1–5
   faceScaleConfidence   Int?               // 1–5
   mcqListening          FeedbackMcqOption?
   mcqReturn             FeedbackMcqOption?
+  // New rating-based flow.
+  rating                Int?               // 1–5
+  sentiment             FeedbackSentiment?
+  categories            String[]           @default([])
+  feedbackText          String?
+  // Legacy MCQ-flow snapshot — total XP awarded by the 4-question flow (0..4).
+  // Untouched by the new rating flow; renaming it would break in-flight data.
   xpAwarded             Int                @default(0)
+  // New flag — has the rating-flow XP reward (75 XP for POSITIVE) been disbursed?
+  // Separate from `xpAwarded` so both flows can coexist without aliasing.
+  xpRewardClaimed       Boolean            @default(false)
+  acknowledgedById      String?
+  acknowledgedAt        DateTime?
   createdAt             DateTime           @default(now())
   completedAt           DateTime?
 
   @@index([doctorId])
+  @@index([clinicianId])
   @@index([patientId])
   @@index([branchId])
   @@index([createdAt])
@@ -1486,6 +1541,10 @@ model JourneyFeedback {
   patient                  User                @relation("JourneyFeedbackPatient", fields: [patientId], references: [id])
   leadDoctorId             String
   leadDoctor               User                @relation("JourneyFeedbackLeadDoctor", fields: [leadDoctorId], references: [id])
+  // Role-agnostic primary clinician for new rating flow. Mirrors leadDoctorId
+  // for DOCTOR-led journeys; can point to a THERAPIST user for therapist-led ones.
+  primaryClinicianId       String?
+  primaryClinician         User?               @relation("JourneyFeedbackPrimaryClinician", fields: [primaryClinicianId], references: [id])
   branchId                 String?
   branch                   Branch?             @relation("JourneyFeedbackBranch", fields: [branchId], references: [id])
 
@@ -1505,9 +1564,23 @@ model JourneyFeedback {
   thankYouCardPublic       Boolean             @default(false)
 
   photosViewed             Boolean             @default(false)
-  // Immutable snapshots — DO NOT update if grading rules change later.
+  // Legacy XP snapshot (sum of distributed XP for the MCQ flow).
+  // Untouched by the new rating flow.
   xpAwarded                Int                 @default(0)
   xpDistribution           Json                @default("{}")
+
+  // ── New rating-based flow ─────────────────────────────────────────
+  overallRating            Int?
+  outcomeRating            Int?
+  adherenceRating          Int?
+  sentiment                FeedbackSentiment?
+  highlights               String[]            @default([])
+  feedbackText             String?
+  wouldRecommend           Boolean?
+  // Has the rating-flow XP reward (150 XP for POSITIVE) been disbursed?
+  xpRewardClaimed          Boolean             @default(false)
+  acknowledgedById         String?
+  acknowledgedAt           DateTime?
 
   // Spec: feedback remains available 30 days; silently closes after that.
   expiresAt                DateTime
@@ -1520,6 +1593,7 @@ model JourneyFeedback {
   thankYouCard             ThankYouCard?
 
   @@index([leadDoctorId])
+  @@index([primaryClinicianId])
   @@index([patientId])
   @@index([branchId])
   @@index([completedAt])
@@ -1569,6 +1643,7 @@ model TreatmentJourney {
   clinicalPhotos  ClinicalPhoto[]
   appointments    Appointment[]     @relation("JourneyAppointments")
   feedback        JourneyFeedback?
+  prescriptions   Prescription[]    @relation("JourneyPrescriptions")
   wellnessScore   Float             @default(0)
   createdAt       DateTime          @default(now())
   updatedAt       DateTime          @updatedAt
@@ -1585,7 +1660,7 @@ model JourneyPhase {
   journey      TreatmentJourney @relation(fields: [journeyId], references: [id], onDelete: Cascade)
   name         String
   order        Int
-  durationDays Int
+  durationDays Int              @default(7)
   status       PhaseStatus      @default(UPCOMING)
   tasks        PhaseTask[]
   clinicalPhotos ClinicalPhoto[]
@@ -3554,4 +3629,136 @@ model PatientCriticalFlag {
   @@index([status, lastDetectedAt])
   @@index([branchId, status])
   @@index([severity, status])
+}
+
+// ── Home Therapy ─────────────────────────────────────────────────────────────
+// Doctor authors a HomeTherapyRequest during prescription. Admin / branch-admin
+// approves, assigns a therapist, and schedules N sessions. Each session is
+// either HOME (therapist visits patient's address — GPS-tracked) or HOSPITAL
+// (existing in-clinic flow). On approval, one Appointment per session is also
+// created so existing reminder / feedback / billing pipelines work unchanged.
+enum HomeTherapyStatus {
+  PENDING_APPROVAL
+  APPROVED
+  REJECTED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum SessionModeType {
+  HOME
+  HOSPITAL
+}
+
+enum HomeTherapySessionStatus {
+  SCHEDULED
+  THERAPIST_EN_ROUTE
+  THERAPIST_ARRIVED
+  IN_SESSION
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+model HomeTherapyRequest {
+  id                  String              @id @default(cuid())
+  prescriptionId      String
+  prescription        Prescription        @relation(fields: [prescriptionId], references: [id], onDelete: Cascade)
+  patientId           String
+  patient             Patient             @relation(fields: [patientId], references: [id])
+  requestingDoctorId  String
+  requestingDoctor    Doctor              @relation(fields: [requestingDoctorId], references: [id])
+  branchId            String
+  branch              Branch              @relation(fields: [branchId], references: [id])
+  totalSessions       Int
+  sessionMode         SessionModeType[]   @default([])
+  // Optional scheduling interval between sessions, in days. Set by the
+  // doctor on the prescription form when the protocol calls for spacing
+  // (e.g. 1 = daily, 2 = every other day, 7 = weekly). Null when no
+  // interval is specified — admin uses their judgement during approval.
+  intervalDays        Int?
+  notes               String?
+  status              HomeTherapyStatus   @default(PENDING_APPROVAL)
+  approvedById        String?
+  approvedByRole      Role?
+  approvedAt          DateTime?
+  rejectedReason      String?
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+
+  sessions            HomeTherapySession[]
+
+  @@index([patientId])
+  @@index([requestingDoctorId])
+  @@index([branchId, status])
+  @@index([status, createdAt])
+}
+
+model HomeTherapySession {
+  id                    String                   @id @default(cuid())
+  requestId             String
+  request               HomeTherapyRequest       @relation(fields: [requestId], references: [id], onDelete: Cascade)
+  therapistId           String
+  therapist             Therapist                @relation(fields: [therapistId], references: [id])
+  patientId             String
+  patient               Patient                  @relation(fields: [patientId], references: [id])
+  branchId              String
+  sessionNumber         Int
+  scheduledDate         DateTime
+  scheduledTime         String
+  mode                  SessionModeType
+  status                HomeTherapySessionStatus @default(SCHEDULED)
+  therapistDepartedAt   DateTime?
+  therapistArrivedAt    DateTime?
+  sessionStartedAt      DateTime?
+  sessionCompletedAt    DateTime?
+  therapistFeedbackId   String?                  @unique
+  patientFeedbackId     String?                  @unique
+  appointmentId         String?                  @unique
+  appointment           Appointment?             @relation(fields: [appointmentId], references: [id], onDelete: SetNull)
+  createdAt             DateTime                 @default(now())
+  updatedAt             DateTime                 @updatedAt
+
+  locationPings         TherapistLocationPing[]
+  therapistFeedback     HomeTherapyFeedback?     @relation("therapistFeedback", fields: [therapistFeedbackId], references: [id])
+  patientFeedback       HomeTherapyFeedback?     @relation("patientFeedback", fields: [patientFeedbackId], references: [id])
+
+  @@index([therapistId, scheduledDate])
+  @@index([patientId, scheduledDate])
+  @@index([branchId, scheduledDate])
+  @@index([status, scheduledDate])
+  @@index([requestId, sessionNumber])
+}
+
+model TherapistLocationPing {
+  id          String              @id @default(cuid())
+  sessionId   String
+  session     HomeTherapySession  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  therapistId String
+  latitude    Float
+  longitude   Float
+  accuracy    Float?
+  timestamp   DateTime            @default(now())
+
+  @@index([sessionId, timestamp])
+  @@index([therapistId, timestamp])
+}
+
+model HomeTherapyFeedback {
+  id          String              @id @default(cuid())
+  sessionId   String
+  authorRole  Role
+  rating      Int
+  sentiment   FeedbackSentiment
+  notes       String?
+  tags        String[]            @default([])
+  xpAwarded   Boolean             @default(false)
+  createdAt   DateTime            @default(now())
+
+  therapistSession HomeTherapySession? @relation("therapistFeedback")
+  patientSession   HomeTherapySession? @relation("patientFeedback")
+
+  @@index([sessionId])
+  @@index([authorRole, createdAt])
 }

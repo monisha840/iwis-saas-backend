@@ -21,7 +21,7 @@ import logger from '../lib/logger.js';
 import { DeliveryService } from './delivery.service.js';
 import { renderTemplate } from '../lib/templateRenderer.js';
 
-const DEFAULT_BODY = `Good morning {{patientName}}! This is a friendly reminder to complete your daily check-in on the Al-Shifa app. Logging your symptoms, sleep, and pain score helps your care team guide your treatment. {{checkInLink}}`;
+const DEFAULT_BODY = `Good morning {{patientName}}! This is a friendly reminder to complete your daily check-in on the IWIS app. Logging your symptoms, sleep, and pain score helps your care team guide your treatment. {{checkInLink}}`;
 
 /**
  * Scheduler entry point. Walks every hospital that has reminders enabled and

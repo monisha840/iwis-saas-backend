@@ -367,6 +367,7 @@ export class NotificationService {
             const staffToNotify = await prisma.user.findMany({
                 where: {
                     role: { in: ['PHARMACIST', 'ADMIN_DOCTOR'] },
+                    deletedAt: null,
                     ...(branchId ? { branchId } : {})
                 },
                 select: { id: true }

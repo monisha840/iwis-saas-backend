@@ -204,6 +204,22 @@ export class JourneyService {
         } catch (err) {
             logger.warn('[Journey] feedback invite notification failed', { journeyId, err: err.message });
         }
+
+        // Real-time prompt to the patient — fired immediately (no queue) since
+        // there's no transient state to wait out. The frontend modal listens
+        // for `journey_feedback_request` and pops the rating wizard.
+        try {
+            const { emitToUser } = await import('../websocket/index.js');
+            emitToUser(journey.patientId, 'journey_feedback_request', {
+                journeyId,
+                feedbackId:    feedback.id,
+                journeyTitle:  journey.title,
+                clinicianName: doctorName,
+                expiresAt:     feedback.expiresAt,
+            });
+        } catch (err) {
+            logger.warn('[Journey] journey_feedback_request emit failed', { journeyId, err: err.message });
+        }
     }
 
     /**

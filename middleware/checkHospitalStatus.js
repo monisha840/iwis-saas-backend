@@ -8,9 +8,14 @@
 import prisma from '../lib/prisma.js';
 
 // Small in-memory cache to avoid hitting Prisma on every request.
-// Keyed by hospitalId → { status, checkedAt }. TTL = 15s.
+// Keyed by hospitalId → { status, checkedAt }. TTL = 5 minutes.
+//
+// Suspension / reactivation paths in superAdmin.hospital.service.js call
+// `invalidateHospitalStatusCache` synchronously after the status change,
+// so a longer TTL doesn't delay enforcement — it just trims redundant DB
+// hits during the steady state where the status doesn't change.
 const cache = new Map();
-const TTL_MS = 15 * 1000;
+const TTL_MS = 5 * 60 * 1000;
 
 async function fetchStatus(hospitalId) {
   const cached = cache.get(hospitalId);

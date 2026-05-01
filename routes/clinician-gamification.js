@@ -84,6 +84,13 @@ router.post('/rewards/redeem/:rewardId', authMiddleware, ClinicianGamificationCo
 /** GET /api/clinician-gamification/rewards/mine — my redemptions */
 router.get('/rewards/mine', authMiddleware, ClinicianGamificationController.getMyRedemptions);
 
+/** GET /api/clinician-gamification/rewards/redemptions
+ *  Admin queue — paginated list of redemptions across all users (default
+ *  status=PENDING). Powers the Reward Store admin "Process Redemptions"
+ *  panel; previously the panel reused the caller's own redemptions, which
+ *  silently broke for ADMIN / ADMIN_DOCTOR (they don't redeem). */
+router.get('/rewards/redemptions', authMiddleware, roleMiddleware(ADMIN_ROLES), ClinicianGamificationController.listAllRedemptions);
+
 const processRedemptionSchema = z.object({
     status: z.enum(['APPROVED', 'FULFILLED', 'REJECTED']),
 });

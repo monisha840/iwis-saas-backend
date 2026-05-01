@@ -110,6 +110,14 @@ export class StaffActivityService {
         const tokenMap = {};
         for (const t of latestRefreshTokens) tokenMap[t.userId] = t;
 
+        // Anyone with a signal newer than this is treated as ONLINE unless a
+        // sticky non-ONLINE status (BREAK / IN_CONSULTATION / OFFLINE from an
+        // explicit logout) is even more recent. This catches users who have
+        // an active session but haven't pinged the activity endpoint yet —
+        // previously every such user defaulted to OFFLINE.
+        const PRESENCE_WINDOW_MS = 15 * 60 * 1000;
+        const now = Date.now();
+
         return users.map((user) => {
             const profile = user.doctor || user.therapist || user.pharmacist;
             const activity = activityMap[user.id];
@@ -133,11 +141,32 @@ export class StaffActivityService {
             const currentActivity = activity?.activityType
                 || (audit ? `${audit.action.replace(/_/g, ' ').toLowerCase()}` : null);
 
+            // ── Status derivation ─────────────────────────────────────────
+            // 1. If the latest StaffActivity row is a LOGOUT, respect it.
+            // 2. If the latest StaffActivity row carries a sticky non-ONLINE
+            //    status (BREAK / IN_CONSULTATION) AND that row is the
+            //    freshest signal, use it.
+            // 3. Otherwise, if any signal is within the presence window,
+            //    the user is ONLINE.
+            // 4. Else OFFLINE.
+            let status = 'OFFLINE';
+            const activityIsFreshest =
+                activity?.startedAt && freshest && activity.startedAt.getTime() === freshest.getTime();
+
+            if (activity?.activityType === 'LOGOUT' && activityIsFreshest) {
+                status = 'OFFLINE';
+            } else if (activity?.status && activity.status !== 'ONLINE' && activity.status !== 'OFFLINE' && activityIsFreshest) {
+                // Honour BREAK / IN_CONSULTATION when it's the most recent signal.
+                status = activity.status;
+            } else if (freshest && now - freshest.getTime() <= PRESENCE_WINDOW_MS) {
+                status = 'ONLINE';
+            }
+
             return {
                 userId: user.id,
                 fullName: profile?.fullName || user.email,
                 role: user.role,
-                status: activity?.status || 'OFFLINE',
+                status,
                 currentActivity,
                 branchName: user.branch?.name || 'Unassigned',
                 lastSeen: freshest ? freshest.toISOString() : null,

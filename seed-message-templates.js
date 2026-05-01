@@ -26,7 +26,7 @@ Kindly arrive at least 10–15 minutes prior to your scheduled time to complete 
 Should you require any assistance, rescheduling, or further clarification, please do not hesitate to contact the hospital administration.
 
 Sincerely,
-Al-Shifa Group of Hospitals`;
+IWIS`;
 
 const ONLINE_BODY = `Dear {{patientName}},
 
@@ -40,7 +40,7 @@ Your meeting link: {{meetingLink}}
 Should you require any assistance, rescheduling, or further clarification, please do not hesitate to contact the hospital administration.
 
 Sincerely,
-Al-Shifa Group of Hospitals`;
+IWIS`;
 
 async function main() {
     const hospital = await prisma.hospital.findFirst({

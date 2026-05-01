@@ -6,11 +6,29 @@ import prisma from '../lib/prisma.js';
  * a single invoice line and tracks session consumption separately.
  */
 export class TreatmentPackageService {
-    static async list(branchId) {
+    /**
+     * List packages, scoped by either a single branch or the user's
+     * hospital (admin "All Branches" view). The branch relation is
+     * included so the cross-branch UI can label packages with their
+     * owning branch.
+     */
+    static async list({ branchId, hospitalId } = {}) {
+        if (!branchId && !hospitalId) {
+            throw Object.assign(
+                new Error('list requires branchId or hospitalId'),
+                { status: 400 },
+            );
+        }
+        const where = { isActive: true };
+        if (branchId) where.branchId = branchId;
+        else where.branch = { hospitalId };
         return prisma.treatmentPackage.findMany({
-            where: { branchId, isActive: true },
+            where,
             orderBy: { createdAt: 'desc' },
-            include: { _count: { select: { enrolments: true } } },
+            include: {
+                _count: { select: { enrolments: true } },
+                branch: { select: { id: true, name: true } },
+            },
         });
     }
 

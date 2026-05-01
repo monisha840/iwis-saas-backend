@@ -136,6 +136,33 @@ class CacheService {
         }
     }
 
+    /**
+     * Atomic SET-IF-ABSENT with TTL (`SET key val EX ttl NX`).
+     *
+     * Returns:
+     *   `true`  — key was set (we acquired the slot — caller may proceed)
+     *   `false` — key already exists (rate-limited / locked out — caller must skip)
+     *   `null`  — Redis unavailable / circuit open (caller decides whether to fail-open or fail-closed)
+     *
+     * Used by the home-therapy location-ping endpoint to throttle each
+     * therapist to one ping every 10 seconds.
+     */
+    async setIfAbsent(key, value, ttlSeconds) {
+        if (!this._available || this._checkCircuitBreaker()) return null;
+        try {
+            await this.connect();
+            if (!this._available) return null;
+            // node-redis v4 string form: returns 'OK' on success, null on existing key.
+            const reply = await this.client.set(key, String(value), { EX: ttlSeconds, NX: true });
+            this._recordSuccess();
+            return reply === 'OK';
+        } catch (err) {
+            this._recordFailure();
+            logger.error(`Cache setIfAbsent Error [${key}]`, err);
+            return null;
+        }
+    }
+
     async flush() {
         if (!this._available || this._checkCircuitBreaker()) return false;
         try {

@@ -68,6 +68,7 @@ import clinicalPhotoRoutes from './routes/clinicalPhoto.js';
 import therapistSkillRoutes from './routes/therapistSkill.js';
 import treatmentPackageRoutes from './routes/treatmentPackage.js';
 import groupSessionRoutes from './routes/groupSession.js';
+import homeTherapyRoutes from './routes/homeTherapy.js';
 // Billing disabled application-wide — invoice routes intentionally unmounted.
 // import invoiceRoutes from './routes/invoices.js';
 // Dashboard refactor
@@ -234,6 +235,8 @@ app.use('/api/clinical-photos', clinicalPhotoRoutes);
 app.use('/api/therapists', therapistSkillRoutes);
 app.use('/api/packages', treatmentPackageRoutes);
 app.use('/api/group-sessions', groupSessionRoutes);
+// Home Therapy — doctor-authored referral, admin-approved, GPS-tracked sessions.
+app.use('/api/home-therapy', homeTherapyRoutes);
 // app.use('/api/invoices', invoiceRoutes); // billing disabled
 
 // Dashboard refactor

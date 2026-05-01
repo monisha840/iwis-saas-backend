@@ -6,11 +6,34 @@ import logger from '../lib/logger.js';
  * Models rooms as a first-class bookable resource alongside therapists.
  */
 export class TherapyRoomService {
-    static async listRooms(branchId) {
+    /**
+     * List therapy rooms.
+     *
+     * Caller passes either `branchId` (single-branch view) or `hospitalId`
+     * (cross-branch view, used when an admin picks "All Branches" from the
+     * navbar scope switcher). At least one must be supplied — without
+     * either, we'd return rooms across the whole platform.
+     *
+     * The `branch` relation is included so the cross-branch UI can label
+     * rooms by their owning branch.
+     */
+    static async listRooms({ branchId, hospitalId } = {}) {
+        if (!branchId && !hospitalId) {
+            throw Object.assign(
+                new Error('listRooms requires branchId or hospitalId'),
+                { status: 400 },
+            );
+        }
+        const where = { isActive: true };
+        if (branchId) where.branchId = branchId;
+        else where.branch = { hospitalId };
         return prisma.therapyRoom.findMany({
-            where: { branchId, isActive: true },
+            where,
             orderBy: [{ type: 'asc' }, { name: 'asc' }],
-            include: { _count: { select: { bookings: true } } },
+            include: {
+                _count: { select: { bookings: true } },
+                branch: { select: { id: true, name: true } },
+            },
         });
     }
 

@@ -103,6 +103,18 @@ export class ClinicianGamificationController {
         } catch (err) { next(err); }
     }
 
+    static async listAllRedemptions(req, res, next) {
+        try {
+            const { status = 'PENDING', page = 1, limit = 50 } = req.query;
+            const result = await RewardStoreService.listAllRedemptions({
+                status: String(status).toUpperCase(),
+                page: parseInt(page, 10) || 1,
+                limit: parseInt(limit, 10) || 50,
+            });
+            res.json(result);
+        } catch (err) { next(err); }
+    }
+
     static async createReward(req, res, next) {
         try {
             const reward = await RewardStoreService.createReward(req.body);

@@ -1,6 +1,7 @@
 import prisma from '../lib/prisma.js';
 import bcrypt from 'bcrypt';
 import logger from '../lib/logger.js';
+import { geocodePatientAddress } from './geocoding.service.js';
 
 // AyurvedicSkill enum values — used to seed TherapistSkill rows when a
 // therapist is created. Kept in sync with the Prisma enum (schema.prisma).
@@ -109,7 +110,7 @@ export class UserService {
             return therapists.map((ther) => ({
                 id: ther.id,
                 fullName: ther.fullName,
-                specialization: ther.specialization,
+                gender: ther.gender,
                 profilePhoto: ther.profilePhoto,
                 yearsExperience: ther.yearsExperience,
                 qualification: ther.qualification,
@@ -165,7 +166,11 @@ export class UserService {
             return {
                 id: clinician.id,
                 fullName: clinician.fullName,
+                // specialization is only set on Doctor; gender is only set
+                // on Therapist after the schema split. Each role drops the
+                // other field naturally because Prisma returns undefined.
                 specialization: clinician.specialization,
+                gender: clinician.gender,
                 profilePhoto: clinician.profilePhoto,
                 email: clinician.user?.email,
                 role: clinician.user?.role,
@@ -433,8 +438,14 @@ export class UserService {
             fullName, phoneNumber, profilePhoto, clinic,
             bio, languages,
             dob, gender: rawGender, therapyType,
+            addressLine1, addressLine2, city, state, pincode,
+            primaryPhone, alternativePhone,
         } = data || {};
         const gender = rawGender !== undefined ? normaliseGender(rawGender) : undefined;
+        // Empty-string → null so the DB never holds a string like "" that fails
+        // the next geocode round-trip. Only converts when the field is *being*
+        // updated; untouched fields pass through as `undefined`.
+        const emptyToNull = (v) => (v === '' ? null : v);
 
         // Phone shape check — mirrors the appointment contact-details rule.
         if (phoneNumber && !/^\+?[0-9]{7,15}$/.test(phoneNumber.replace(/[\s-]/g, ''))) {
@@ -492,6 +503,27 @@ export class UserService {
                 const age = dobDate
                     ? Math.floor((Date.now() - dobDate.getTime()) / (365.25 * 24 * 60 * 60 * 1000))
                     : undefined;
+
+                // If any of the five address pieces is being updated, re-geocode
+                // using the merged (incoming ?? existing) address so we never
+                // miss a hit just because the patient cleared one optional line.
+                const addressTouched = [addressLine1, addressLine2, city, state, pincode]
+                    .some((v) => v !== undefined);
+                let geo = null;
+                if (addressTouched) {
+                    const merged = {
+                        addressLine1: addressLine1 !== undefined ? emptyToNull(addressLine1) : user.patient.addressLine1,
+                        addressLine2: addressLine2 !== undefined ? emptyToNull(addressLine2) : user.patient.addressLine2,
+                        city:         city         !== undefined ? emptyToNull(city)         : user.patient.city,
+                        state:        state        !== undefined ? emptyToNull(state)        : user.patient.state,
+                        pincode:      pincode      !== undefined ? emptyToNull(pincode)      : user.patient.pincode,
+                    };
+                    geo = await geocodePatientAddress(merged);
+                    if (!geo.locationVerified) {
+                        logger?.warn?.(`[updateMe] geocoding failed for patient ${user.patient.id} — locationVerified=false`);
+                    }
+                }
+
                 await tx.patient.update({
                     where: { id: user.patient.id },
                     data: {
@@ -502,6 +534,19 @@ export class UserService {
                         ...(age !== undefined && { age }),
                         ...(gender !== undefined && { gender: gender || null }),
                         ...(therapyType !== undefined && { therapyType: therapyType || null }),
+
+                        ...(addressLine1     !== undefined && { addressLine1:     emptyToNull(addressLine1) }),
+                        ...(addressLine2     !== undefined && { addressLine2:     emptyToNull(addressLine2) }),
+                        ...(city             !== undefined && { city:             emptyToNull(city) }),
+                        ...(state            !== undefined && { state:            emptyToNull(state) }),
+                        ...(pincode          !== undefined && { pincode:          emptyToNull(pincode) }),
+                        ...(primaryPhone     !== undefined && { primaryPhone:     emptyToNull(primaryPhone) }),
+                        ...(alternativePhone !== undefined && { alternativePhone: emptyToNull(alternativePhone) }),
+                        ...(geo && {
+                            latitude:         geo.latitude,
+                            longitude:        geo.longitude,
+                            locationVerified: geo.locationVerified,
+                        }),
                     },
                 });
             }
@@ -683,6 +728,9 @@ export class UserService {
             initialSkills,
             patientId,
             medicalHistory,
+            // Home Therapy: location & contact (PATIENT only)
+            addressLine1, addressLine2, city, state, pincode,
+            primaryPhone, alternativePhone,
         } = data;
         // Canonicalise gender to uppercase so downstream checks (e.g. pregnancy toggle)
         // don't have to worry about mixed-case history (Female / female / FEMALE).
@@ -723,6 +771,18 @@ export class UserService {
         // rounds=12 to match AuthService.BCRYPT_ROUNDS (password reset flow).
         // Previously 10 — weaker than reset-initiated hashes. Unified here.
         const hashed = await bcrypt.hash(password, 12);
+        // Geocode the patient's home address up-front so the live-map +
+        // distance computations have coordinates immediately. Geocoding can
+        // fail (no key in dev, transient network error, address not found);
+        // we still persist the typed address with locationVerified = false
+        // so the admin can re-trigger geocoding via PUT /patient/:id later.
+        let geo = { latitude: null, longitude: null, locationVerified: false };
+        if (role === 'PATIENT' && (addressLine1 || addressLine2 || city || state || pincode)) {
+            geo = await geocodePatientAddress({ addressLine1, addressLine2, city, state, pincode });
+            if (!geo.locationVerified) {
+                logger?.warn?.(`[createUser] geocoding failed for patient ${email} — saving address with locationVerified=false`);
+            }
+        }
         return prisma.$transaction(async (tx) => {
             const newUser = await tx.user.create({
                 data: { email, password: hashed, role, branchId, hospitalId },
@@ -747,19 +807,20 @@ export class UserService {
                     data: {
                         userId: newUser.id,
                         fullName,
-                        specialization,
+                        // Therapists are categorized only by gender (MALE /
+                        // FEMALE). The specialization column was dropped in
+                        // 20260428120000_therapist_gender_drop_specialization.
+                        gender: gender || null,
                         qualification,
                         yearsExperience,
                         clinic: clinic || null,
                         registrationNumber: registrationNumber || null,
                     },
                 });
-                // Seed the therapist's skill matrix. Each `initialSkills`
-                // entry is either a bare enum string (legacy clients —
-                // defaults to EXPERIENCED) or `{ skill, proficiency }` from
-                // the new Create User form. Primary specialization always
-                // wins as CERTIFIED so a therapist's main skill never gets
-                // downgraded by a stray entry.
+                // Seed the therapist's skill matrix from the admin-supplied
+                // initialSkills array. Each entry is either a bare enum
+                // string (legacy clients — defaults to EXPERIENCED) or
+                // `{ skill, proficiency }` from the Create User form.
                 const skillSet = new Map();
                 if (Array.isArray(initialSkills)) {
                     for (const entry of initialSkills) {
@@ -769,9 +830,6 @@ export class UserService {
                             skillSet.set(entry.skill, entry.proficiency || 'EXPERIENCED');
                         }
                     }
-                }
-                if (specialization && THERAPIST_SKILLS.has(specialization)) {
-                    skillSet.set(specialization, 'CERTIFIED');
                 }
                 if (skillSet.size > 0) {
                     await tx.therapistSkill.createMany({
@@ -830,6 +888,17 @@ export class UserService {
                                 capturedAt: new Date().toISOString(),
                             }
                             : undefined,
+                        // Home Therapy address & contact (server-geocoded above)
+                        addressLine1:     addressLine1 || null,
+                        addressLine2:     addressLine2 || null,
+                        city:             city || null,
+                        state:            state || null,
+                        pincode:          pincode || null,
+                        primaryPhone:     primaryPhone || null,
+                        alternativePhone: alternativePhone || null,
+                        latitude:         geo.latitude,
+                        longitude:        geo.longitude,
+                        locationVerified: geo.locationVerified,
                     },
                 });
             } else if (role === 'PHARMACIST') {
@@ -1150,6 +1219,31 @@ export class UserService {
         // Validate branchId if provided
         if (branchId) {
             await this._validateBranchId(branchId);
+        }
+
+        // Patient address change → re-geocode and stamp locationVerified.
+        // We re-geocode whenever any address component is in the payload
+        // (even if unchanged) so admins can use the "Re-verify Location"
+        // button to retry a failed geocode without editing the address.
+        if (type === 'patient') {
+            const ADDRESS_KEYS = ['addressLine1', 'addressLine2', 'city', 'state', 'pincode'];
+            const hasAddressEdit = ADDRESS_KEYS.some((k) => Object.prototype.hasOwnProperty.call(profileData, k));
+            if (hasAddressEdit) {
+                const merged = {
+                    addressLine1: profileData.addressLine1 ?? profile.addressLine1,
+                    addressLine2: profileData.addressLine2 ?? profile.addressLine2,
+                    city:         profileData.city         ?? profile.city,
+                    state:        profileData.state        ?? profile.state,
+                    pincode:      profileData.pincode      ?? profile.pincode,
+                };
+                const geo = await geocodePatientAddress(merged);
+                profileData.latitude         = geo.latitude;
+                profileData.longitude        = geo.longitude;
+                profileData.locationVerified = geo.locationVerified;
+                if (!geo.locationVerified) {
+                    logger?.warn?.(`[updateProfile] geocoding failed for patient ${id} — locationVerified=false`);
+                }
+            }
         }
 
         return prisma.$transaction(async (tx) => {

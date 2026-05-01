@@ -48,6 +48,22 @@ export class AuthService {
 
     // ── 1.1 Login ────────────────────────────────────────────────────────────────
 
+    /**
+     * Stamp the staff-activity feed so the user flips to ONLINE on the
+     * admin dashboard the moment they authenticate. Best-effort — patients
+     * are excluded (the feed only renders staff roles), and failures must
+     * never block the login flow.
+     */
+    static async _recordLoginActivity(user) {
+        if (!user || user.role === 'PATIENT') return;
+        try {
+            const { StaffActivityService } = await import('./staffActivity.service.js');
+            await StaffActivityService.recordActivity(user.id, 'LOGIN', user.branchId || null);
+        } catch (err) {
+            logger.warn('[auth] failed to record LOGIN staff activity', { userId: user.id, err: err.message });
+        }
+    }
+
     static async login({ email, password }, { ip, userAgent } = {}) {
         const user = await prisma.user.findUnique({ where: { email } });
 
@@ -83,7 +99,9 @@ export class AuthService {
         }
 
         await this._bumpPatientStreakOnLogin(user);
-        return this._issueTokens(user, { ip, userAgent });
+        const tokens = await this._issueTokens(user, { ip, userAgent });
+        await this._recordLoginActivity(user);
+        return tokens;
     }
 
     // ── 1.1 Refresh Token Rotation ───────────────────────────────────────────────
@@ -168,10 +186,13 @@ export class AuthService {
             });
         }
 
-        // Blacklist the access token JTI
+        // Capture userId off the access token so we can stamp the staff
+        // activity feed below. JTI blacklisting reuses the same decode.
+        let userId = null;
         if (accessToken) {
             try {
                 const decoded = jwt.decode(accessToken);
+                if (decoded?.id) userId = decoded.id;
                 if (decoded?.jti) {
                     const ttl = decoded.exp - Math.floor(Date.now() / 1000);
                     if (ttl > 0) {
@@ -180,6 +201,23 @@ export class AuthService {
                 }
             } catch {
                 // Best effort — don't fail logout
+            }
+        }
+
+        // Stamp the staff activity feed so the user flips to OFFLINE
+        // immediately on the admin dashboard. Best-effort.
+        if (userId) {
+            try {
+                const u = await prisma.user.findUnique({
+                    where: { id: userId },
+                    select: { role: true, branchId: true },
+                });
+                if (u && u.role !== 'PATIENT') {
+                    const { StaffActivityService } = await import('./staffActivity.service.js');
+                    await StaffActivityService.recordActivity(userId, 'LOGOUT', u.branchId || null);
+                }
+            } catch (err) {
+                logger.warn('[auth] failed to record LOGOUT staff activity', { userId, err: err.message });
             }
         }
     }
@@ -437,7 +475,9 @@ export class AuthService {
         }
 
         await this._bumpPatientStreakOnLogin(user);
-        return this._issueTokens(user, { ip, userAgent });
+        const tokens = await this._issueTokens(user, { ip, userAgent });
+        await this._recordLoginActivity(user);
+        return tokens;
     }
 
     static async mfaDisable(userId, password) {

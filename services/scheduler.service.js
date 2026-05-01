@@ -13,142 +13,59 @@ class SchedulerService {
     }
 
     /**
+     * Wrap a job handler so a thrown / rejected error is logged (with the
+     * job name) instead of bubbling up to node-cron as an unhandled
+     * rejection — which historically could crash the worker.
+     */
+    _safeJob(name, fn) {
+        return async () => {
+            const startedAt = Date.now();
+            try {
+                await fn.call(this);
+                logger.info(`[SchedulerService] job ok`, { name, ms: Date.now() - startedAt });
+            } catch (err) {
+                logger.error(`[SchedulerService] job failed`, {
+                    name,
+                    ms: Date.now() - startedAt,
+                    error: err?.message,
+                    stack: err?.stack,
+                });
+            }
+        };
+    }
+
+    /**
      * Initialize all scheduled jobs
      */
     init() {
         logger.info('[SchedulerService] Initializing scheduled jobs...');
 
-        // Check for 24-hour reminders every hour
-        this.jobs.push(
-            cron.schedule('0 * * * *', () => {
-                this.sendDayBeforeReminders();
-            })
-        );
-
-        // Check for 1-hour reminders every 15 minutes
-        this.jobs.push(
-            cron.schedule('*/15 * * * *', () => {
-                this.sendOneHourReminders();
-            })
-        );
-
-        // Clean up old notifications (older than 30 days) - runs daily at midnight
-        this.jobs.push(
-            cron.schedule('0 0 * * *', () => {
-                this.cleanupOldNotifications();
-            })
-        );
-
-        // Post-session follow-up nudges — runs daily at 9am
-        this.jobs.push(
-            cron.schedule('0 9 * * *', () => {
-                this.sendPostSessionFollowUps();
-            })
-        );
-
-        // Care-gap detection — runs every Monday at 8am
-        this.jobs.push(
-            cron.schedule('0 8 * * 1', () => {
-                this.sendCareGapAlerts();
-            })
-        );
-
-        // Medication adherence reminders — runs daily at 8pm
-        this.jobs.push(
-            cron.schedule('0 20 * * *', () => {
-                this.sendMedicationAdherenceReminders();
-            })
-        );
-
-        // Medication refill forecast — runs daily at 9am
-        this.jobs.push(
-            cron.schedule('0 9 * * *', () => {
-                this.runMedicationRefillForecast();
-            })
-        );
-
-        // Prescription expiry alerts — runs daily at 8am
-        this.jobs.push(
-            cron.schedule('0 8 * * *', () => {
-                this.checkExpiringPrescriptions();
-            })
-        );
-
-        // No-show detection — every 15 minutes
-        this.jobs.push(
-            cron.schedule('*/15 * * * *', () => {
-                this.detectNoShows();
-            })
-        );
-
-        // Post-appointment CSAT survey — every 15 minutes
-        this.jobs.push(
-            cron.schedule('*/15 * * * *', () => {
-                this.sendCSATSurveys();
-            })
-        );
-
-        // Consultation-feedback 24h reminder push — hourly sweep over the
-        // 24–48h window. No separate expiry job: the 48h cutoff is applied at
-        // read time by ConsultationFeedbackService.getPending.
-        this.jobs.push(
-            cron.schedule('30 * * * *', () => {
-                this.sendConsultationFeedbackReminders();
-            })
-        );
-
-        // Journey-feedback 72h reminder push — hourly sweep. Pending feedback
-        // rows older than 72h with no reminderSentAt get one notification.
-        // Expiry (30 days) is applied at read time, no separate cleanup job.
-        this.jobs.push(
-            cron.schedule('45 * * * *', () => {
-                this.sendJourneyFeedbackReminders();
-            })
-        );
-
-        // Advanced care gap detection — daily at 7am
-        this.jobs.push(
-            cron.schedule('0 7 * * *', () => {
-                this.runCareGapDetection();
-            })
-        );
+        // Each callback is wrapped via _safeJob so a single buggy run can't
+        // take down the cron worker — failures are logged with the job name.
+        this.jobs.push(cron.schedule('0 * * * *',    this._safeJob('sendDayBeforeReminders',         this.sendDayBeforeReminders)));
+        this.jobs.push(cron.schedule('*/15 * * * *', this._safeJob('sendOneHourReminders',           this.sendOneHourReminders)));
+        this.jobs.push(cron.schedule('0 0 * * *',    this._safeJob('cleanupOldNotifications',       this.cleanupOldNotifications)));
+        this.jobs.push(cron.schedule('0 9 * * *',    this._safeJob('sendPostSessionFollowUps',      this.sendPostSessionFollowUps)));
+        this.jobs.push(cron.schedule('0 8 * * 1',    this._safeJob('sendCareGapAlerts',             this.sendCareGapAlerts)));
+        this.jobs.push(cron.schedule('0 20 * * *',   this._safeJob('sendMedicationAdherenceReminders', this.sendMedicationAdherenceReminders)));
+        this.jobs.push(cron.schedule('0 9 * * *',    this._safeJob('runMedicationRefillForecast',   this.runMedicationRefillForecast)));
+        this.jobs.push(cron.schedule('0 8 * * *',    this._safeJob('checkExpiringPrescriptions',    this.checkExpiringPrescriptions)));
+        this.jobs.push(cron.schedule('*/15 * * * *', this._safeJob('detectNoShows',                 this.detectNoShows)));
+        this.jobs.push(cron.schedule('*/15 * * * *', this._safeJob('sendCSATSurveys',               this.sendCSATSurveys)));
+        // Consultation-feedback 24h reminder push — hourly sweep over the 24–48h window.
+        // No separate expiry job: the 48h cutoff is applied at read time.
+        this.jobs.push(cron.schedule('30 * * * *',   this._safeJob('sendConsultationFeedbackReminders', this.sendConsultationFeedbackReminders)));
+        // Journey-feedback 72h reminder push — hourly sweep. Pending rows older than 72h
+        // with no reminderSentAt get one notification. Expiry (30 days) is read-time only.
+        this.jobs.push(cron.schedule('45 * * * *',   this._safeJob('sendJourneyFeedbackReminders',  this.sendJourneyFeedbackReminders)));
+        this.jobs.push(cron.schedule('0 7 * * *',    this._safeJob('runCareGapDetection',           this.runCareGapDetection)));
 
         // ── Gamification jobs ─────────────────────────────────────────────────
-
-        // Daily leaderboard recalculation + badge checking — runs at 2am
-        this.jobs.push(
-            cron.schedule('0 2 * * *', () => {
-                this.runGamificationRecalculation();
-            })
-        );
-
-        // Clinician streak updates — runs at 11:55pm daily
-        this.jobs.push(
-            cron.schedule('55 23 * * *', () => {
-                this.updateClinicianStreaks();
-            })
-        );
-
-        // Branch competition recalculation — runs daily at 3am
-        this.jobs.push(
-            cron.schedule('0 3 * * *', () => {
-                this.recalculateBranchCompetitions();
-            })
-        );
-
-        // Weekly gamification digest — runs every Monday at 9am
-        this.jobs.push(
-            cron.schedule('0 9 * * 1', () => {
-                this.sendWeeklyGamificationDigest();
-            })
-        );
-
-        // Streak-at-risk notifications — runs daily at 8pm
-        this.jobs.push(
-            cron.schedule('0 20 * * *', () => {
-                this.sendStreakAtRiskNotifications();
-            })
-        );
+        this.jobs.push(cron.schedule('0 2 * * *',    this._safeJob('runGamificationRecalculation',  this.runGamificationRecalculation)));
+        this.jobs.push(cron.schedule('55 23 * * *',  this._safeJob('updateClinicianStreaks',        this.updateClinicianStreaks)));
+        this.jobs.push(cron.schedule('0 3 * * *',    this._safeJob('recalculateBranchCompetitions', this.recalculateBranchCompetitions)));
+        this.jobs.push(cron.schedule('0 9 * * 1',    this._safeJob('sendWeeklyGamificationDigest',  this.sendWeeklyGamificationDigest)));
+        this.jobs.push(cron.schedule('0 20 * * *',   this._safeJob('sendStreakAtRiskNotifications', this.sendStreakAtRiskNotifications)));
 
         // Seed badge definitions on startup
         this.seedBadges();
@@ -892,7 +809,7 @@ class SchedulerService {
                 if (appt.branchId) {
                     try {
                         const branchAdmins = await prisma.user.findMany({
-                            where: { branchId: appt.branchId, role: 'BRANCH_ADMIN' },
+                            where: { branchId: appt.branchId, role: 'BRANCH_ADMIN', deletedAt: null },
                             select: { id: true },
                         });
                         await Promise.all(branchAdmins.map((admin) =>

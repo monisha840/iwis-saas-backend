@@ -29,9 +29,17 @@ const bookSchema = z.object({
 
 router.get('/', async (req, res, next) => {
     try {
-        const branchId = req.query.branchId;
-        if (!branchId) return res.status(400).json({ error: 'branchId is required' });
-        const rooms = await TherapyRoomService.listRooms(branchId);
+        // branchId is optional now — admins (ADMIN, ADMIN_DOCTOR) can pick
+        // "All Branches" in the navbar scope, in which case we fan out
+        // across every branch in their hospital. The hospital filter is
+        // always enforced via req.user.hospitalId so a stale token can't
+        // leak rooms across hospitals.
+        const branchId = req.query.branchId || undefined;
+        const hospitalId = req.user?.hospitalId ?? null;
+        if (!branchId && !hospitalId) {
+            return res.status(400).json({ error: 'branchId or hospital scope is required' });
+        }
+        const rooms = await TherapyRoomService.listRooms({ branchId, hospitalId });
         res.json(rooms);
     } catch (err) { next(err); }
 });

@@ -828,26 +828,38 @@ export class DashboardSummaryService {
         ]);
         const criticalSeverityMap = Object.fromEntries(criticalBySeverity.map(s => [s.severity, s._count._all]));
 
-        // Branch health summary
-        const branchHealth = [];
-        for (const b of branches) {
-            const [apptsToday, staffToday] = await Promise.all([
-                prisma.appointment.count({ where: { branchId: b.id, date: { gte: today, lte: tomorrow } } }),
-                prisma.staffAttendance.count({
-                    where: { branchId: b.id, date: { gte: today, lte: tomorrow }, clockIn: { not: null } },
-                }).catch(() => 0),
-            ]);
-            branchHealth.push({
-                id: b.id,
-                name: b.name,
-                isActive: b.isActive,
-                activePatients: b._count.patients,
-                staffOnDuty: staffToday,
-                appointmentsToday: apptsToday,
-                bedsAvailable: b.availableBeds ?? null,
-                bedsTotal: b.totalBeds ?? null,
-            });
-        }
+        // Branch health summary — was 2*N queries (one count per branch); now
+        // two groupBys total. Latency stays flat as branch count grows.
+        const branchIds = branches.map((b) => b.id);
+        const [apptCounts, attendanceCounts] = await Promise.all([
+            branchIds.length === 0 ? [] : prisma.appointment.groupBy({
+                by: ['branchId'],
+                where: { branchId: { in: branchIds }, date: { gte: today, lte: tomorrow } },
+                _count: { _all: true },
+            }),
+            branchIds.length === 0 ? [] : prisma.staffAttendance.groupBy({
+                by: ['branchId'],
+                where: {
+                    branchId: { in: branchIds },
+                    date: { gte: today, lte: tomorrow },
+                    clockIn: { not: null },
+                },
+                _count: { _all: true },
+            }).catch(() => []),
+        ]);
+        const apptByBranch = new Map(apptCounts.map((r) => [r.branchId, r._count._all]));
+        const attendanceByBranch = new Map(attendanceCounts.map((r) => [r.branchId, r._count._all]));
+
+        const branchHealth = branches.map((b) => ({
+            id: b.id,
+            name: b.name,
+            isActive: b.isActive,
+            activePatients: b._count.patients,
+            staffOnDuty: attendanceByBranch.get(b.id) ?? 0,
+            appointmentsToday: apptByBranch.get(b.id) ?? 0,
+            bedsAvailable: b.availableBeds ?? null,
+            bedsTotal: b.totalBeds ?? null,
+        }));
 
         return {
             greeting: {

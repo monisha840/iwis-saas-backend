@@ -35,7 +35,20 @@ const includeDetails = {
     doctor: { include: { user: { select: { email: true } } } },
     therapist: { include: { user: { select: { email: true } } } },
     patient: { include: { user: { select: { email: true } } } },
-    triageSession: true,
+    // Pull the uploaded reports along with the triage session so the
+    // doctor's review surface (appointment-list expand, modal) can
+    // render them without an extra round-trip.
+    triageSession: {
+        include: {
+            documents: {
+                select: {
+                    id: true, fileName: true, fileUrl: true, fileType: true,
+                    fileSize: true, category: true, description: true, createdAt: true,
+                },
+                orderBy: { createdAt: 'desc' },
+            },
+        },
+    },
     branch: { select: { id: true, name: true, address: true } },
 };
 
@@ -369,7 +382,7 @@ export class AppointmentService {
                 if (Array.isArray(customReminderChannels)) {
                     const channels = customReminderChannels.map((c) => String(c).toUpperCase());
                     for (const c of channels) {
-                        if (!['WHATSAPP', 'SMS', 'EMAIL', 'IN_APP'].includes(c)) {
+                        if (!['WHATSAPP', 'IN_APP'].includes(c)) {
                             const err = new Error(`Unsupported channel: ${c}`); err.status = 400; throw err;
                         }
                     }
@@ -407,6 +420,30 @@ export class AppointmentService {
                 journeyIdToPersist = journey.id;
             }
 
+            // Resolve the initial status once so we can derive the matching
+            // approval flags. Staff-created appointments default to CONFIRMED;
+            // patient-created go to PENDING and require explicit approval.
+            const resolvedStatus = (() => {
+                const s = user.role === 'PATIENT' ? 'PENDING' : (status || 'CONFIRMED');
+                assertValidAppointmentStatus(s);
+                return s;
+            })();
+
+            // When staff creates the appointment as CONFIRMED / ACCEPTED, the
+            // approval workflow has been bypassed — treat the booking itself
+            // as implicit approval so the confirmation notification fires
+            // (sendAppointmentConfirmation gates on doctorApproved /
+            // therapistApproved via checkFinalApprovalState). Only mark the
+            // flag for the side that actually exists on this consultation.
+            const isImplicitApproval =
+                user.role !== 'PATIENT'
+                && (resolvedStatus === 'CONFIRMED' || resolvedStatus === 'ACCEPTED');
+            const ct = consultationType || 'DOCTOR';
+            const doctorApproved =
+                isImplicitApproval && (ct === 'DOCTOR' || ct === 'COMBINED') && !!doctorId;
+            const therapistApproved =
+                isImplicitApproval && (ct === 'THERAPIST' || ct === 'COMBINED') && !!therapistId;
+
             const created = await tx.appointment.create({
                 data: {
                     patientId: actualPatientId,
@@ -414,11 +451,9 @@ export class AppointmentService {
                     therapistId: (consultationType === 'DOCTOR' || !therapistId) ? null : therapistId,
                     date: appointmentDate,
                     therapistDate: (consultationType === 'COMBINED' || consultationType === 'THERAPIST') ? actualTherapistDate : null,
-                    status: (() => {
-                        const s = user.role === 'PATIENT' ? 'PENDING' : (status || 'CONFIRMED');
-                        assertValidAppointmentStatus(s);
-                        return s;
-                    })(),
+                    status: resolvedStatus,
+                    doctorApproved,
+                    therapistApproved,
                     notes,
                     triageSessionId: triageSessionId || null,
                     consultationType: consultationType || 'DOCTOR',
@@ -468,7 +503,13 @@ export class AppointmentService {
 
         // Acknowledge to the patient that their booking was received —
         // previously patients only learned about it by checking the dashboard.
-        if (appointment.patient?.userId) {
+        // For staff-created bookings that are already CONFIRMED / ACCEPTED we
+        // skip the receipt-only message and fall through to the proper
+        // confirmation send below, so the patient doesn't get a misleading
+        // "you'll be notified once it's confirmed" message right before the
+        // actual confirmation.
+        const isAlreadyConfirmed = appointment.status === 'CONFIRMED' || appointment.status === 'ACCEPTED';
+        if (appointment.patient?.userId && !isAlreadyConfirmed) {
             const clinicianName =
                 appointment.doctor?.fullName ||
                 appointment.therapist?.fullName ||
@@ -488,6 +529,21 @@ export class AppointmentService {
                 });
             } catch (err) {
                 // Non-fatal — don't roll back the booking
+            }
+        }
+
+        // Staff-created bookings short-circuit the approval workflow. Fire
+        // the proper APPOINTMENT_CONFIRMATION (WhatsApp + in-app via the
+        // template pipeline) so the patient gets the same confirmation a
+        // doctor-approved booking would generate. Idempotency-safe — the
+        // service no-ops if `notificationSent` is already true.
+        if (isAlreadyConfirmed) {
+            try {
+                await notificationService.sendAppointmentConfirmation(appointment, 'AUTO_CONFIRM');
+            } catch (err) {
+                logger.warn('[AppointmentService] confirmation send failed for staff-created booking', {
+                    appointmentId: appointment.id, err: err.message,
+                });
             }
         }
 
@@ -546,7 +602,7 @@ export class AppointmentService {
             if (!Array.isArray(data.channels)) { const err = new Error('channels must be an array'); err.status = 400; throw err; }
             const channels = data.channels.map((c) => String(c).toUpperCase());
             for (const c of channels) {
-                if (!['WHATSAPP', 'SMS', 'EMAIL', 'IN_APP'].includes(c)) {
+                if (!['WHATSAPP', 'IN_APP'].includes(c)) {
                     const err = new Error(`Unsupported channel: ${c}`); err.status = 400; throw err;
                 }
             }
@@ -654,6 +710,34 @@ export class AppointmentService {
                 await HandoffNoteService._autoDraftFromAppointment(appointment, user);
             } catch (err) {
                 logger.warn(`[handoff] auto-draft failed for appt ${appointment.id}: ${err.message}`);
+            }
+
+            // Schedule the rating-flow feedback prompt 30s after completion.
+            // Best-effort — Redis outage degrades to a no-op (the legacy 24h
+            // reminder still fires from ConsultationFeedbackService).
+            try {
+                const detail = await prisma.appointment.findUnique({
+                    where: { id: appointment.id },
+                    select: {
+                        id: true,
+                        patient:   { select: { userId: true } },
+                        doctor:    { select: { userId: true, fullName: true } },
+                        therapist: { select: { userId: true, fullName: true } },
+                    },
+                });
+                const clinician = detail?.doctor || detail?.therapist;
+                if (detail?.patient?.userId && clinician?.userId) {
+                    const { enqueueFeedbackRequest } = await import('../jobs/feedbackRequest.job.js');
+                    await enqueueFeedbackRequest({
+                        appointmentId: appointment.id,
+                        patientUserId: detail.patient.userId,
+                        clinicianId:   clinician.userId,
+                        clinicianName: clinician.fullName || 'your clinician',
+                        clinicianRole: detail.doctor ? 'DOCTOR' : 'THERAPIST',
+                    }, { delay: 30_000 });
+                }
+            } catch (err) {
+                logger.warn(`[feedback] enqueue feedback_request failed for appt ${appointment.id}: ${err.message}`);
             }
         }
 

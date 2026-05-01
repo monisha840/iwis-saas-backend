@@ -46,7 +46,7 @@ export class UserRepository extends BaseRepository {
         where,
         include: {
           doctor: { select: { id: true, fullName: true, specialization: true } },
-          therapist: { select: { id: true, fullName: true, specialization: true } },
+          therapist: { select: { id: true, fullName: true, gender: true } },
           patient: { select: { id: true, fullName: true, patientId: true } },
           pharmacist: { select: { id: true, fullName: true } },
           branch: { select: { id: true, name: true } },

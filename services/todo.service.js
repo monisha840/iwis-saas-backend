@@ -153,18 +153,12 @@ export class TodoService {
             data: { todoId: todo.id, priority },
         });
 
-        // URGENT → SMS best-effort
-        if (priority === 'URGENT') {
-            try {
-                const { smsService } = await import('./sms.service.js');
-                const phone = await this._userPhone(assignee.id);
-                if (phone && smsService?.send) {
-                    await smsService.send(phone, `URGENT task: ${todo.title} — assigned by ${creatorName}`);
-                }
-            } catch (err) {
-                logger.warn(`[Todo] URGENT SMS failed: ${err.message}`);
-            }
-        }
+        // URGENT priority used to trigger an SMS via Twilio. SMS support has
+        // been removed — URGENT now relies on the in-app notification above
+        // plus the WhatsApp / IN_APP fan-out done by DeliveryService for
+        // higher-priority kinds. If a louder channel is needed in future,
+        // route through DeliveryService rather than reintroducing a direct
+        // provider client here.
 
         logger.info(`[Todo] ${actor.id} assigned ${todo.id} to ${assignee.id} (${priority}, ${xpReward} XP)`);
         return todo;
@@ -710,11 +704,4 @@ export class TodoService {
         return u?.doctor?.fullName || u?.therapist?.fullName || u?.email || 'A colleague';
     }
 
-    static async _userPhone(userId) {
-        const patient = await prisma.patient.findUnique({
-            where: { userId },
-            select: { phoneNumber: true },
-        });
-        return patient?.phoneNumber || null;
-    }
 }

@@ -2,6 +2,8 @@ import prisma from '../lib/prisma.js';
 import logger from '../lib/logger.js';
 import PDFDocument from 'pdfkit';
 import { inventoryService } from './inventory.service.js';
+import { emitToUser } from '../websocket/index.js';
+import HomeTherapyService from './homeTherapy.service.js';
 
 const includeDetails = {
     doctor: { include: { user: true } },
@@ -91,10 +93,17 @@ export class PrescriptionService {
 
         const patient = await prisma.patient.findUnique({ where: { id: patientId } });
         if (!patient) throw new Error('Patient not found');
-        // branchId may be null for patients who haven't completed onboarding —
-        // we still allow the prescription, but log it so admins can backfill.
+        // Patient.branchId may be null for patients who haven't completed
+        // onboarding. Fall back to the prescriber's branch so the row is
+        // never silently "unbranched" — otherwise the pharmacist's
+        // branch-scoped query at /api/prescriptions/search would never
+        // surface it.
+        const effectiveBranchId = patient.branchId || user.branchId || null;
         if (!patient.branchId) {
-            logger.warn('[PrescriptionService] Patient has no branchId; prescription will be unbranched', { patientId });
+            logger.warn('[PrescriptionService] Patient has no branchId; using prescriber branch', {
+                patientId,
+                fallbackBranchId: effectiveBranchId,
+            });
         }
 
         const prescription = await prisma.prescription.create({
@@ -111,7 +120,7 @@ export class PrescriptionService {
                 notes,
                 videoUrl,
                 sku: data.sku,
-                branchId: patient.branchId,
+                branchId: effectiveBranchId,
                 lowStockThreshold: data.lowStockThreshold ? parseInt(data.lowStockThreshold) : 5,
                 appointmentId: appointmentId || null,
             }
@@ -135,7 +144,7 @@ export class PrescriptionService {
         };
     }
 
-    static async createBatchPrescriptions(user, patientId, medicines, { packageId = null } = {}) {
+    static async createBatchPrescriptions(user, patientId, medicines, { packageId = null, journey = null, homeTherapy = null } = {}) {
         let doctorId = null, therapistId = null;
         let allowed = false;
 
@@ -171,7 +180,10 @@ export class PrescriptionService {
             throw error;
         }
 
-        const patient = await prisma.patient.findUnique({ where: { id: patientId } });
+        const patient = await prisma.patient.findUnique({
+            where: { id: patientId },
+            select: { id: true, branchId: true, userId: true },
+        });
         if (!patient) throw new Error('Patient not found');
 
         // Sanity-check the package: must exist, belong to the same branch
@@ -189,12 +201,94 @@ export class PrescriptionService {
             }
         }
 
-        const created = await prisma.$transaction(async (tx) =>
-            Promise.all(medicines.map(med => {
+        // Validate the home-therapy fragment BEFORE opening the transaction
+        // so a malformed payload short-circuits with a 400 instead of
+        // rolling back a half-built prescription save. Only DOCTOR and
+        // ADMIN_DOCTOR may author a request — the form is hidden for
+        // others, so this is a defence-in-depth check.
+        if (homeTherapy) {
+            if (!['DOCTOR', 'ADMIN_DOCTOR'].includes(user.role)) {
+                const err = new Error('Only doctors can author a home-therapy request');
+                err.status = 403;
+                throw err;
+            }
+            HomeTherapyService.validateHomeTherapyPayload(homeTherapy);
+            // Doctor.id is required to attribute the request — DOCTOR will
+            // already have one from the assignment lookup above; ADMIN_DOCTOR
+            // gets it from the same Doctor.findUnique-by-userId call.
+            if (!doctorId) {
+                const err = new Error('Could not resolve requesting doctor for home-therapy request');
+                err.status = 400;
+                throw err;
+            }
+            if (!patient.branchId) {
+                const err = new Error('Patient has no branch — cannot create home-therapy request');
+                err.status = 400;
+                throw err;
+            }
+        }
+
+        // Validate the journey payload (if any) BEFORE opening the transaction.
+        // Phase durationDays must be ≥ 1 — a 0-day phase is an off-by-one bug
+        // that would silently make the journey "complete" the moment it activates.
+        if (journey) {
+            if (!journey.title || !journey.condition || !journey.goal) {
+                const err = new Error('journey.title, journey.condition, and journey.goal are required');
+                err.status = 400;
+                throw err;
+            }
+            if (!Array.isArray(journey.phases) || journey.phases.length === 0) {
+                const err = new Error('journey.phases must contain at least one phase');
+                err.status = 400;
+                throw err;
+            }
+            for (const phase of journey.phases) {
+                if (!phase.name || !Number.isFinite(phase.durationDays) || phase.durationDays < 1) {
+                    const err = new Error('Each phase requires a name and durationDays >= 1');
+                    err.status = 400;
+                    throw err;
+                }
+                if (!Array.isArray(phase.tasks)) continue;
+                for (const t of phase.tasks) {
+                    if (!t.title || !t.frequency || !t.type) {
+                        const err = new Error('Each task requires type, title, and frequency');
+                        err.status = 400;
+                        throw err;
+                    }
+                    if (!['MEDICATION', 'EXERCISE', 'DIET', 'THERAPY', 'LIFESTYLE'].includes(t.type)) {
+                        const err = new Error(`Invalid task type: ${t.type}`);
+                        err.status = 400;
+                        throw err;
+                    }
+                    // Therapists may not author MEDICATION tasks (mirrors the journey-route guard).
+                    if (user.role === 'THERAPIST' && t.type === 'MEDICATION') {
+                        const err = new Error('THERAPIST_MEDICATION_RESTRICTION');
+                        err.status = 403;
+                        throw err;
+                    }
+                }
+            }
+        }
+
+        // ── Atomic save: prescriptions + (optional) journey ──────────────
+        // Order:
+        //   1. prescription.create (one per medicine)
+        //   2. treatmentJourney.create (status: ACTIVE, startDate: now)
+        //   3. journeyPhase.create (loop, with durationDays)
+        //   4. phaseTask.create (loop)
+        //   5. prescription.update — backfill journeyId on all created rxes
+        // Any throw rolls back everything.
+        // Patient.branchId can be null when onboarding is incomplete. Fall
+        // back to the prescriber's branch so the prescription always lands
+        // in some branch's pharmacy queue — otherwise pharmacists would
+        // never see it (their search filters by user.branchId).
+        const effectiveBranchId = patient.branchId || user.branchId || null;
+        const result = await prisma.$transaction(async (tx) => {
+            const createdRxes = await Promise.all(medicines.map((med) => {
                 const extendedNotes = [
                     med.notes,
                     med.timing ? `Timing: ${med.timing}` : null,
-                    med.vehicle ? `Anupana (Vehicle): ${med.vehicle}` : null
+                    med.vehicle ? `Anupana (Vehicle): ${med.vehicle}` : null,
                 ].filter(Boolean).join(' | ');
 
                 return tx.prescription.create({
@@ -210,15 +304,119 @@ export class PrescriptionService {
                         notes: extendedNotes,
                         videoUrl: med.videoUrl,
                         sku: med.sku,
-                        branchId: patient.branchId,
+                        branchId: effectiveBranchId,
                         lowStockThreshold: med.lowStockThreshold || 5,
                         packageId: resolvedPackageId,
-                    }
+                    },
                 });
-            }))
-        );
+            }));
 
-        return created;
+            // Home-therapy referral. Linked to the FIRST prescription in
+            // this batch — same patient + branch context, and a single
+            // approval queue entry per save.
+            let homeTherapyRequest = null;
+            if (homeTherapy) {
+                homeTherapyRequest = await HomeTherapyService.createRequestInTx(tx, {
+                    prescriptionId: createdRxes[0].id,
+                    patientId,
+                    requestingDoctorId: doctorId,
+                    branchId: patient.branchId,
+                    payload: homeTherapy,
+                });
+            }
+
+            if (!journey) return { prescriptions: createdRxes, journey: null, homeTherapyRequest };
+
+            // TreatmentJourney requires a User.id for doctorId. The patient's
+            // User.id is patient.userId; the clinician's User.id is user.id.
+            const journeyRow = await tx.treatmentJourney.create({
+                data: {
+                    patientId: patient.userId,
+                    doctorId:  user.id,
+                    branchId:  patient.branchId || (await tx.user.findUnique({
+                        where: { id: user.id }, select: { branchId: true },
+                    }))?.branchId,
+                    title:     journey.title,
+                    condition: journey.condition,
+                    targetDate: journey.targetEndDate ? new Date(journey.targetEndDate) : null,
+                    status:    'ACTIVE',
+                    startDate: new Date(),
+                },
+            });
+
+            // Phases — first phase auto-activates so the journey starts immediately.
+            for (let i = 0; i < journey.phases.length; i++) {
+                const phase = journey.phases[i];
+                const phaseRow = await tx.journeyPhase.create({
+                    data: {
+                        journeyId:    journeyRow.id,
+                        name:         phase.name,
+                        order:        i,
+                        durationDays: phase.durationDays,
+                        status:       i === 0 ? 'ACTIVE' : 'UPCOMING',
+                        startedAt:    i === 0 ? new Date() : null,
+                    },
+                });
+                if (Array.isArray(phase.tasks)) {
+                    for (const task of phase.tasks) {
+                        await tx.phaseTask.create({
+                            data: {
+                                phaseId:     phaseRow.id,
+                                type:        task.type,
+                                title:       task.title,
+                                description: task.description || null,
+                                frequency:   task.frequency,
+                            },
+                        });
+                    }
+                }
+            }
+
+            // Backfill journeyId on every prescription in this batch.
+            await tx.prescription.updateMany({
+                where: { id: { in: createdRxes.map((r) => r.id) } },
+                data:  { journeyId: journeyRow.id },
+            });
+
+            const totalDays = journey.phases.reduce((s, p) => s + p.durationDays, 0);
+            return {
+                prescriptions: createdRxes.map((r) => ({ ...r, journeyId: journeyRow.id })),
+                journey: { id: journeyRow.id, title: journeyRow.title, totalDays },
+                homeTherapyRequest,
+            };
+        });
+
+        // Post-commit side effects: real-time fanout to the patient socket.
+        if (result.journey && patient.userId) {
+            try {
+                emitToUser(patient.userId, 'journey_assigned', {
+                    journeyId: result.journey.id,
+                    title:     result.journey.title,
+                    totalDays: result.journey.totalDays,
+                });
+            } catch (err) {
+                logger.warn('[PrescriptionService] journey_assigned emit failed', { err: err.message });
+            }
+        }
+
+        // Home-therapy approval queue: notify admins / admin-doctors / branch
+        // admins so the dashboard surfaces a "New" badge in real time.
+        if (result.homeTherapyRequest) {
+            HomeTherapyService.emitRequestCreated(result.homeTherapyRequest);
+        }
+
+        // Existing callers consume the prescriptions array directly. The
+        // homeTherapyRequest is attached as a non-array property so old
+        // call sites (which expect an array) keep working: arrays accept
+        // arbitrary properties without breaking iteration.
+        const out = result.prescriptions;
+        if (result.homeTherapyRequest) {
+            Object.defineProperty(out, 'homeTherapyRequest', {
+                value: result.homeTherapyRequest,
+                enumerable: true,
+            });
+        }
+        return out;
     }
 
     static async viewAnyPatientPrescriptions(patientId) {
@@ -497,7 +695,8 @@ export class PrescriptionService {
             throw err;
         }
 
-        // RBAC
+        // RBAC — anchor row's prescriber/patient gates the whole visit, since
+        // every sibling in the visit group shares both.
         let allowed = false;
         if (['ADMIN', 'ADMIN_DOCTOR'].includes(user.role)) {
             allowed = true;
@@ -526,6 +725,49 @@ export class PrescriptionService {
             throw err;
         }
 
+        // ─── Resolve the visit grouping ────────────────────────────────────
+        // A single visit can produce multiple Prescription rows (one per
+        // medicine). We render them as one document so the patient gets the
+        // full prescription, not a per-medicine slip.
+        //
+        // Grouping rule:
+        //   1. If the anchor row has appointmentId → all rows tied to that
+        //      appointment.
+        //   2. Otherwise (ad-hoc prescription) → same patient + same
+        //      prescriber + same calendar day as the anchor row.
+        //
+        // The same prescriber filter keeps unrelated rows out (e.g. another
+        // doctor wrote a prescription for the same patient on the same day).
+        let visitWhere;
+        if (rx.appointmentId) {
+            visitWhere = { appointmentId: rx.appointmentId };
+        } else {
+            const dayStart = new Date(rx.createdAt);
+            dayStart.setHours(0, 0, 0, 0);
+            const dayEnd = new Date(dayStart);
+            dayEnd.setDate(dayEnd.getDate() + 1);
+            visitWhere = {
+                patientId: rx.patientId,
+                doctorId: rx.doctorId,
+                therapistId: rx.therapistId,
+                createdAt: { gte: dayStart, lt: dayEnd },
+            };
+        }
+
+        const siblings = await prisma.prescription.findMany({
+            where: visitWhere,
+            orderBy: { createdAt: 'asc' },
+        });
+        // Always include the anchor — guards against grouping edge cases.
+        const seen = new Set();
+        const items = [];
+        for (const row of [rx, ...siblings]) {
+            if (seen.has(row.id)) continue;
+            seen.add(row.id);
+            items.push(row);
+        }
+        items.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+
         const prescriber = rx.doctor || rx.therapist;
         const prescriberRole = rx.doctor ? 'Doctor' : (rx.therapist ? 'Therapist' : 'Clinician');
         const prescriberName = prescriber?.fullName || prescriber?.user?.email || 'Unknown';
@@ -536,11 +778,17 @@ export class PrescriptionService {
         const headerName = `${namePrefix} ${prescriberName}`.trim();
         const patientName = rx.patient?.fullName || rx.patient?.user?.email || 'Patient';
         const patientCode = rx.patient?.patientId || null;
-        const hospitalName = rx.branch?.hospital?.name || 'Al-Shifa Group of Hospitals';
+        const hospitalName = rx.branch?.hospital?.name || 'IWIS';
         const branchName = rx.branch?.name || null;
+        const visitDate = new Date(rx.createdAt).toLocaleDateString('en-GB', {
+            day: '2-digit', month: 'short', year: 'numeric',
+        });
 
         // ─── Stream the PDF ─────────────────────────────────────────────────
-        const filename = `prescription-${rx.id.slice(0, 8)}.pdf`;
+        const dateSlug = new Date(rx.createdAt).toISOString().slice(0, 10);
+        const filename = items.length > 1
+            ? `prescription-visit-${dateSlug}-${rx.id.slice(0, 8)}.pdf`
+            : `prescription-${rx.id.slice(0, 8)}.pdf`;
         res.setHeader('Content-Type', 'application/pdf');
         res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
 
@@ -577,15 +825,15 @@ export class PrescriptionService {
         if (patientCode) doc.fontSize(9).fillColor('#777').text(`Patient ID: ${patientCode}`);
         doc.fillColor('black').moveDown(0.3);
 
-        doc.fontSize(9).fillColor('#777').text(`Date: ${new Date(rx.createdAt).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })}`);
+        doc.fontSize(9).fillColor('#777').text(`Date: ${visitDate}`);
+        if (items.length > 1) {
+            doc.fontSize(9).fillColor('#777')
+                .text(`Medications on this visit: ${items.length}`);
+        }
         doc.fillColor('black').moveDown(0.8);
 
         doc.moveTo(50, doc.y).lineTo(545, doc.y).strokeColor('#cccccc').stroke();
         doc.moveDown(0.6);
-
-        // Medication block
-        doc.fontSize(13).font('Helvetica-Bold').text(rx.medicationName);
-        doc.moveDown(0.4);
 
         const row = (label, value) => {
             if (!value) return;
@@ -593,24 +841,42 @@ export class PrescriptionService {
                 .text(`${label}: `, { continued: true });
             doc.font('Helvetica').fillColor('black').text(String(value));
         };
-        row('Dosage', rx.dosage);
-        row('Frequency', rx.frequency);
-        row('Duration', rx.duration);
-        if (rx.notes) {
-            doc.moveDown(0.3);
-            doc.font('Helvetica-Bold').fontSize(10).fillColor('#444').text('Notes');
-            doc.font('Helvetica').fillColor('black').fontSize(10).text(rx.notes, { align: 'left' });
-        }
 
-        if (rx.discontinuedAt) {
-            doc.moveDown(0.6);
-            doc.font('Helvetica-Bold').fontSize(10).fillColor('#b91c1c')
-                .text(`Discontinued on ${new Date(rx.discontinuedAt).toLocaleDateString('en-GB')}`);
-            if (rx.discontinuedReason) {
-                doc.font('Helvetica').fontSize(9).text(`Reason: ${rx.discontinuedReason}`);
+        // Medication blocks — one per Prescription row in the visit.
+        items.forEach((med, idx) => {
+            // Inserts a separator between meds, but not before the first.
+            if (idx > 0) {
+                doc.moveDown(0.6);
+                doc.moveTo(50, doc.y).lineTo(545, doc.y)
+                    .strokeColor('#e5e5e5').dash(2, { space: 2 }).stroke().undash();
+                doc.moveDown(0.6);
             }
-            doc.fillColor('black');
-        }
+
+            const heading = items.length > 1
+                ? `${idx + 1}. ${med.medicationName}`
+                : med.medicationName;
+            doc.fontSize(13).font('Helvetica-Bold').fillColor('black').text(heading);
+            doc.moveDown(0.4);
+
+            row('Dosage', med.dosage);
+            row('Frequency', med.frequency);
+            row('Duration', med.duration);
+            if (med.notes) {
+                doc.moveDown(0.3);
+                doc.font('Helvetica-Bold').fontSize(10).fillColor('#444').text('Notes');
+                doc.font('Helvetica').fillColor('black').fontSize(10).text(med.notes, { align: 'left' });
+            }
+
+            if (med.discontinuedAt) {
+                doc.moveDown(0.4);
+                doc.font('Helvetica-Bold').fontSize(10).fillColor('#b91c1c')
+                    .text(`Discontinued on ${new Date(med.discontinuedAt).toLocaleDateString('en-GB')}`);
+                if (med.discontinuedReason) {
+                    doc.font('Helvetica').fontSize(9).text(`Reason: ${med.discontinuedReason}`);
+                }
+                doc.fillColor('black');
+            }
+        });
 
         doc.moveDown(2);
         doc.moveTo(380, doc.y).lineTo(545, doc.y).strokeColor('#999').stroke();
@@ -622,7 +888,7 @@ export class PrescriptionService {
 
         doc.moveDown(2);
         doc.fontSize(8).fillColor('#999')
-            .text('This prescription was generated electronically by the Al-Shifa healthcare management system.', 50, doc.y, { align: 'center' });
+            .text('This prescription was generated electronically by the IWIS healthcare management system.', 50, doc.y, { align: 'center' });
 
         doc.end();
     }

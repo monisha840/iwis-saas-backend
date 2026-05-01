@@ -1,6 +1,8 @@
 import express from 'express';
+import { z } from 'zod';
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
 import { requireFeature } from '../utils/featureGate.js';
+import { validate } from '../middleware/validate.js';
 import { CommunicationController } from '../controllers/communication.controller.js';
 
 const router = express.Router();
@@ -9,10 +11,31 @@ const router = express.Router();
 router.use(authMiddleware);
 router.use(requireFeature('ANNOUNCEMENTS'));
 
+// Allowed values mirror those accepted by the service. Keep in sync with
+// AnnouncementService.createAnnouncement when fields are added.
+const ANNOUNCEMENT_PRIORITIES = ['LOW', 'NORMAL', 'HIGH', 'URGENT'];
+const TARGETABLE_ROLES = [
+  'ADMIN', 'ADMIN_DOCTOR', 'BRANCH_ADMIN',
+  'DOCTOR', 'THERAPIST', 'PHARMACIST', 'PATIENT',
+];
+
+const createAnnouncementSchema = z.object({
+  title:       z.string().trim().min(2).max(150),
+  message:     z.string().trim().min(2).max(4000),
+  priority:    z.enum(ANNOUNCEMENT_PRIORITIES).optional(),
+  branchIds:   z.array(z.string().min(1)).max(100).optional(),
+  targetRoles: z.array(z.enum(TARGETABLE_ROLES)).max(10).optional(),
+  isPinned:    z.boolean().optional(),
+  expiresAt:   z.string().datetime().optional().nullable(),
+});
+
+const updateAnnouncementSchema = createAnnouncementSchema.partial();
+
 // POST / — create announcement (ADMIN, ADMIN_DOCTOR)
 router.post(
   '/',
   roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']),
+  validate({ body: createAnnouncementSchema }),
   CommunicationController.createAnnouncement,
 );
 
@@ -28,17 +51,22 @@ router.patch(
   CommunicationController.markAnnouncementRead,
 );
 
-// PUT /:id — update announcement (ADMIN, ADMIN_DOCTOR)
+// PUT /:id — update announcement.
+// Route is open to any authenticated user; the service enforces "author OR
+// ADMIN / ADMIN_DOCTOR" so the original creator can edit their own post even
+// if their role isn't on the create allowlist.
 router.put(
   '/:id',
-  roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']),
+  validate({ body: updateAnnouncementSchema }),
   CommunicationController.updateAnnouncement,
 );
 
-// DELETE /:id — delete announcement (ADMIN, ADMIN_DOCTOR)
+// DELETE /:id — delete announcement.
+// Allowed for: original author (any role), ADMIN, ADMIN_DOCTOR. Service
+// enforces; route stays open to authenticated users so the 403 message is
+// consistent across roles instead of a generic "Forbidden" from the role gate.
 router.delete(
   '/:id',
-  roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']),
   CommunicationController.deleteAnnouncement,
 );
 

@@ -157,8 +157,12 @@ router.get('/available-slots', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_D
     if (!clinicianId || !date) {
       return res.status(400).json({ error: 'clinicianId and date are required' });
     }
-    const slots = await AppointmentService.getAvailableSlots(clinicianId, date);
-    res.json(slots);
+    // The service returns { slots, cacheStatus }. The booking flow expects a
+    // bare array — keep the cacheStatus reachable as a response header for
+    // ops + future client-side degraded-mode handling.
+    const result = await AppointmentService.getAvailableSlots(clinicianId, date);
+    if (result?.cacheStatus) res.set('X-Slot-Cache-Status', result.cacheStatus);
+    res.json(result?.slots ?? []);
   } catch (err) {
     next(err);
   }
@@ -255,12 +259,15 @@ const slotsQuerySchema = z.object({
 
 router.get('/slots', authMiddleware, async (req, res, next) => {
   try {
-    const slots = await AppointmentService.getAvailableSlots(
+    // Same shape as /available-slots: unwrap the array so callers don't
+    // need to know about the internal { slots, cacheStatus } envelope.
+    const result = await AppointmentService.getAvailableSlots(
       req.query.clinicianId,
       req.query.date,
       req.query.branchId
     );
-    res.json(slots);
+    if (result?.cacheStatus) res.set('X-Slot-Cache-Status', result.cacheStatus);
+    res.json(result?.slots ?? []);
   } catch (err) {
     next(err);
   }

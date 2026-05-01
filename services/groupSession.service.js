@@ -11,8 +11,10 @@ export class GroupSessionService {
         return prisma.groupSession.create({ data });
     }
 
-    static async list({ branchId, date, therapistId }) {
-        const where = { ...(branchId ? { branchId } : {}), ...(therapistId ? { therapistId } : {}) };
+    static async list({ branchId, hospitalId, date, therapistId } = {}) {
+        const where = { ...(therapistId ? { therapistId } : {}) };
+        if (branchId) where.branchId = branchId;
+        else if (hospitalId) where.branch = { hospitalId };
         if (date) {
             const start = new Date(date); start.setHours(0,0,0,0);
             const end   = new Date(date); end.setHours(23,59,59,999);
@@ -23,6 +25,7 @@ export class GroupSessionService {
             include: {
                 therapist: { select: { fullName: true } },
                 room: { select: { id: true, name: true, type: true } },
+                branch: { select: { id: true, name: true } },
                 _count: { select: { appointments: true } },
             },
             orderBy: [{ date: 'asc' }, { startTime: 'asc' }],

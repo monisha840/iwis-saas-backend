@@ -42,8 +42,15 @@ const logSchema = z.object({
 
 router.get('/', authorizeRoles('ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST'), async (req, res, next) => {
     try {
-        if (!req.query.branchId) return res.status(400).json({ error: 'branchId is required' });
-        res.json(await TreatmentPackageService.list(req.query.branchId));
+        // branchId is optional — admins picking "All Branches" in the
+        // navbar scope get every branch in their hospital. Non-admin
+        // roles always send their home branchId from the frontend.
+        const branchId = req.query.branchId || undefined;
+        const hospitalId = req.user?.hospitalId ?? null;
+        if (!branchId && !hospitalId) {
+            return res.status(400).json({ error: 'branchId or hospital scope is required' });
+        }
+        res.json(await TreatmentPackageService.list({ branchId, hospitalId }));
     } catch (err) { next(err); }
 });
 

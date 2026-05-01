@@ -54,6 +54,10 @@ const JOB_DEFINITIONS = [
     // no-show shifts from the prior day into attendance rows. Runs at
     // 23:30 local time so the shift window has fully closed.
     { name: 'attendance-reconcile', cron: '30 23 * * *', handler: 'attendanceReconcile' },
+    // Home Therapy daily brief — runs every 5 minutes; the handler matches
+    // the current local time against each branch's tz (target 07:00) and
+    // dedupes so each branch fires once per local day.
+    { name: 'home-therapy-daily-brief', cron: '*/5 * * * *', handler: 'homeTherapyDailyBrief' },
 ];
 
 async function processJob(job) {
@@ -107,6 +111,10 @@ async function processJob(job) {
         attendanceReconcile: async () => {
             const { StaffAttendanceService } = await import('./staffAttendance.service.js');
             return StaffAttendanceService.runNightlyReconciliation();
+        },
+        homeTherapyDailyBrief: async () => {
+            const mod = await import('../jobs/homeTherapyReminder.job.js');
+            return mod.runHomeTherapyDailyBrief();
         },
     };
 
