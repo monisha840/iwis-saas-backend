@@ -67,6 +67,16 @@ class SchedulerService {
         // journeys to upload a DURING photo for their current phase if none
         // has been captured in the last 7 days. Cooldown: 3 days.
         this.jobs.push(cron.schedule('0 9 * * *',    this._safeJob('runPhotoReminderCheck',         this.runPhotoReminderCheck)));
+        // Diet adherence sweep (Feature 5): 9:15 AM daily — scans active
+        // diet prescriptions and creates a MEDIUM-priority follow-up task
+        // for the assigned doctor when 7-day adherence drops below 60%.
+        // Idempotent on (DIET_ADHERENCE_LOW, prescriptionId) so re-runs are
+        // safe; offset 15 minutes to spread load away from other 9 AM jobs.
+        this.jobs.push(cron.schedule('15 9 * * *',   this._safeJob('runDietAdherenceCheck',         this.runDietAdherenceCheck)));
+        // Workflow automation engine (Feature 3): hourly sweep over every
+        // active branch-admin authored rule. Per-rule cooldowns prevent
+        // duplicate firings against the same patient.
+        this.jobs.push(cron.schedule('0 * * * *',    this._safeJob('runWorkflowEngine',             this.runWorkflowEngine)));
 
         // ── Gamification jobs ─────────────────────────────────────────────────
         this.jobs.push(cron.schedule('0 2 * * *',    this._safeJob('runGamificationRecalculation',  this.runGamificationRecalculation)));
@@ -1141,6 +1151,26 @@ class SchedulerService {
     /** Shared helper — also called from JourneyService on phase activation
      *  (no cooldown there: a fresh phase is the most clinically relevant
      *  moment to capture a baseline photo). */
+
+    /**
+     * Daily diet adherence sweep (Feature 5). Delegates to
+     * followUpTask.service.runDietAdherenceCheck — kept as a thin shim so the
+     * cron registration in init() stays aligned with the other jobs.
+     */
+    async runDietAdherenceCheck() {
+        const { runDietAdherenceCheck } = await import('./followUpTask.service.js');
+        return runDietAdherenceCheck();
+    }
+
+    /**
+     * Workflow automation engine sweep (Feature 3). Delegates to
+     * workflowEngine.service.evaluateAllRules — same shim pattern as above.
+     */
+    async runWorkflowEngine() {
+        const { evaluateAllRules } = await import('./workflowEngine.service.js');
+        return evaluateAllRules();
+    }
+
     async _sendPhotoReminder(userId, phaseName, journeyId, phaseId) {
         await notificationService.createNotification({
             userId,

@@ -58,6 +58,11 @@ const JOB_DEFINITIONS = [
     // the current local time against each branch's tz (target 07:00) and
     // dedupes so each branch fires once per local day.
     { name: 'home-therapy-daily-brief', cron: '*/5 * * * *', handler: 'homeTherapyDailyBrief' },
+    // Workflow automation engine (Feature 3) — branch-admin authored rules.
+    // Runs hourly; per-rule cooldowns prevent the same patient from being
+    // messaged on consecutive sweeps. PHASE_COMPLETED triggers are skipped
+    // here (event-based, fired from the journey routes).
+    { name: 'workflow-engine-evaluation', cron: '0 * * * *', handler: 'workflowEngineEvaluation' },
 ];
 
 async function processJob(job) {
@@ -115,6 +120,10 @@ async function processJob(job) {
         homeTherapyDailyBrief: async () => {
             const mod = await import('../jobs/homeTherapyReminder.job.js');
             return mod.runHomeTherapyDailyBrief();
+        },
+        workflowEngineEvaluation: async () => {
+            const { evaluateAllRules } = await import('./workflowEngine.service.js');
+            return evaluateAllRules();
         },
     };
 

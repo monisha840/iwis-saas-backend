@@ -177,6 +177,21 @@ router.get('/available-staff', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_D
   }
 });
 
+// GET /api/appointments/:id — single appointment fetch used by the
+// Consultation Room (and any other surface that needs the full row).
+// Was missing despite AppointmentsController.getById existing in the
+// controllers file — that's why ConsultationRoom showed "Failed to
+// fetch appointment details". Same role allowlist as the PUT below.
+router.get('/:id', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST', 'PATIENT']), async (req, res, next) => {
+  try {
+    const appointment = await AppointmentService.getAppointmentById(req.params.id);
+    if (!appointment) return res.status(404).json({ error: 'Appointment not found' });
+    res.json(appointment);
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.put('/:id', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST', 'PATIENT']), validate({ body: updateAppointmentSchema }), auditAction('UPDATE_APPOINTMENT', 'Appointment', (req) => req.params.id), async (req, res, next) => {
   try {
     // Validate status transition if a new status is provided
@@ -193,6 +208,14 @@ router.put('/:id', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOC
     }
     const appointment = await AppointmentService.updateAppointment(req.params.id, req.user, req.body);
     res.json(appointment);
+    // Feature 5 — fire-and-forget follow-up task when this update flipped
+    // the appointment to COMPLETED. Service inspects the patient's most
+    // recent PAIN vital and only creates a task if value > 7.
+    if (req.body.status === 'COMPLETED') {
+      import('../services/followUpTask.service.js').then(({ fireFollowUpFromAppointmentCompletion }) => {
+        fireFollowUpFromAppointmentCompletion(req.params.id);
+      }).catch(() => { /* swallow — never block appointment update */ });
+    }
   } catch (err) {
     next(err);
   }

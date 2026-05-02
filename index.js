@@ -264,6 +264,43 @@ app.use('/api/audit-logs', auditLogRoutes);
 // Ayurvedic Voice Health Coach — patient-facing 24/7 coach (feature-gated)
 app.use('/api/voice-coach', voiceCoachRoutes);
 
+// Voice-Note dictation helper — clinician-side dictation → OpenAI structuring
+// → 7 visit-summary fields auto-filled into the consultation form. No audio
+// leaves the browser; only the live STT transcript is sent to the backend.
+import voiceNoteRefineRoutes from './services/voiceNote/refine.route.js';
+import { authMiddleware as voiceNoteAuthMw, roleMiddleware as voiceNoteRoleMw } from './middleware/auth.js';
+app.use(
+  '/api/voice-note',
+  voiceNoteAuthMw,
+  voiceNoteRoleMw(['DOCTOR', 'ADMIN_DOCTOR']),
+  voiceNoteRefineRoutes,
+);
+
+// Ayurvedic Food Database + Recipe Library (Feature 1) — branch-scoped
+// catalogue + recipe library + DietMeal ↔ Food links. Per-route role
+// gating lives inside ayurvedicFood.js; only authMiddleware runs here.
+import ayurvedicFoodRoutes from './routes/ayurvedicFood.js';
+import { authMiddleware as ayurAuthMw } from './middleware/auth.js';
+app.use('/api/ayurvedic-foods', ayurAuthMw, ayurvedicFoodRoutes);
+
+// Branded PDF Health Report + WhatsApp delivery (Feature 2). Per-route
+// role gating lives inside healthReports.js; only authMiddleware runs here.
+import healthReportsRoutes from './routes/healthReports.js';
+import { authMiddleware as healthReportsAuthMw } from './middleware/auth.js';
+app.use('/api/health-reports', healthReportsAuthMw, healthReportsRoutes);
+
+// Auto-generated Follow-Up Tasks (Feature 5). Per-route role gating lives
+// inside followUpTasks.js; only authMiddleware runs here.
+import followUpTasksRoutes from './routes/followUpTasks.js';
+import { authMiddleware as followUpAuthMw } from './middleware/auth.js';
+app.use('/api/follow-up-tasks', followUpAuthMw, followUpTasksRoutes);
+
+// Workflow Automation Rules Engine (Feature 3). Branch-scoped no-code
+// automation; per-route role gating lives inside workflowRules.js.
+import workflowRulesRoutes from './routes/workflowRules.js';
+import { authMiddleware as workflowAuthMw } from './middleware/auth.js';
+app.use('/api/workflow-rules', workflowAuthMw, workflowRulesRoutes);
+
 // Inbound webhooks (Daily.co room-ended → auto-complete appointment, etc.)
 // Route uses express.raw() internally for HMAC verification — scoped local
 // to the /daily handler so the global JSON parser doesn't reach it.

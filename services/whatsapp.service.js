@@ -109,6 +109,82 @@ export class WhatsAppService {
         const externalId = json?.key?.id || json?.messageId || json?.id || null;
         return { status: 'SENT', externalId };
     }
+
+    /**
+     * Send a WhatsApp document (PDF, etc.) via Evolution API's sendMedia
+     * endpoint. Uses the same retry policy as sendText.
+     *
+     * @param {Object}  args
+     * @param {string}  args.phone      - E.164-ish digits (no plus/dashes).
+     * @param {string}  args.document   - Base64-encoded document body.
+     * @param {string}  args.filename   - File name shown to recipient (e.g. "report.pdf").
+     * @param {string} [args.caption]   - Optional caption shown under the doc.
+     * @param {string} [args.mimeType]  - Defaults to "application/pdf".
+     * @returns {Promise<{status: 'SENT'|'SKIPPED'|'FAILED', externalId?: string, error?: string}>}
+     */
+    static async sendDocument({ phone, document, filename, caption, mimeType }) {
+        if (!this.enabled) {
+            logger.warn('[WhatsAppService] Evolution API not configured — skipping document send');
+            return { status: 'SKIPPED' };
+        }
+        if (!phone || !document || !filename) {
+            return { status: 'FAILED', error: 'phone, document, and filename are required' };
+        }
+
+        let lastError = null;
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            try {
+                return await this._sendDocumentOnce({ phone, document, filename, caption, mimeType });
+            } catch (err) {
+                lastError = err;
+                const status = _parseStatusFromError(err);
+                const retryable = status == null || isRetryableStatus(status);
+                if (!retryable || attempt === MAX_ATTEMPTS) {
+                    logger.warn('[WhatsAppService] sendDocument failed (no more retries)', {
+                        attempt, status, error: err.message,
+                    });
+                    throw err;
+                }
+                const wait = BACKOFF_MS[Math.min(attempt - 1, BACKOFF_MS.length - 1)];
+                logger.info('[WhatsAppService] sendDocument transient failure — retrying', {
+                    attempt, status, waitMs: wait,
+                });
+                await sleep(wait);
+            }
+        }
+        throw lastError || new Error('WhatsAppService.sendDocument exhausted retries');
+    }
+
+    /** Single-shot Evolution sendMedia call for documents. */
+    static async _sendDocumentOnce({ phone, document, filename, caption, mimeType }) {
+        const url = `${config.whatsapp.baseUrl.replace(/\/$/, '')}/message/sendMedia/${encodeURIComponent(config.whatsapp.instance)}`;
+        const payload = {
+            number: phone,
+            mediatype: 'document',
+            mimetype: mimeType || 'application/pdf',
+            media: document,
+            fileName: filename,
+        };
+        if (caption) payload.caption = caption;
+
+        const response = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                apikey: config.whatsapp.apiKey,
+            },
+            body: JSON.stringify(payload),
+        });
+
+        if (!response.ok) {
+            const body = await response.text().catch(() => '');
+            throw new Error(`Evolution sendMedia failed (${response.status}): ${body}`);
+        }
+
+        const json = await response.json().catch(() => ({}));
+        const externalId = json?.key?.id || json?.messageId || json?.id || null;
+        return { status: 'SENT', externalId };
+    }
 }
 
 export const whatsappService = WhatsAppService;

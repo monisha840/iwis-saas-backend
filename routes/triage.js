@@ -98,6 +98,11 @@ router.post('/', authMiddleware, validate({ body: submitSchema }), async (req, r
     try {
         const triageSession = await TriageService.submitTriage(req.user.id, req.body);
         res.status(201).json(triageSession);
+        // Feature 5 — fire-and-forget follow-up task creation. Runs after the
+        // response so the patient never waits on it; errors only land in the log.
+        import('../services/followUpTask.service.js').then(({ fireFollowUpFromTriage }) => {
+            fireFollowUpFromTriage(triageSession);
+        }).catch(() => { /* swallow — never block triage submission */ });
     } catch (err) { next(err); }
 });
 
@@ -106,6 +111,10 @@ router.post('/submit', authMiddleware, validate({ body: submitSchema }), async (
     try {
         const triageSession = await TriageService.submitTriage(req.user.id, req.body);
         res.status(201).json(triageSession);
+        // Feature 5 — same fire-and-forget hook as POST '/' above.
+        import('../services/followUpTask.service.js').then(({ fireFollowUpFromTriage }) => {
+            fireFollowUpFromTriage(triageSession);
+        }).catch(() => { /* swallow — never block triage submission */ });
     } catch (err) { next(err); }
 });
 

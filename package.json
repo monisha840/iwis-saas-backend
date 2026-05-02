@@ -60,6 +60,7 @@
     "swagger-ui-express": "^5.0.1",
     "web-push": "^3.6.7",
     "winston-daily-rotate-file": "^5.0.0",
+    "xlsx": "^0.18.5",
     "zod": "^3.22.4"
   },
   "devDependencies": {
