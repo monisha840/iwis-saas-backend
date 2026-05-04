@@ -280,6 +280,9 @@ app.use('/api/dashboards', dashboardSummaryRoutes);
 app.use('/api/self-exam', selfExamRoutes);
 // Sheizen-inspired daily tracking (water / measurements / activity / meal photos)
 app.use('/api/daily-tracking', dailyTrackingRoutes);
+// Ayurvedic Food Database
+import ayurvedicFoodRoutes from './routes/ayurvedicFood.js';
+app.use('/api/ayurvedic-foods', ayurvedicFoodRoutes);
 // Daily Ayurvedic Motivation Card
 app.use('/api/motivation', motivationRoutes);
 // Care Gap Dashboard
@@ -383,3 +386,4 @@ httpServer.listen(PORT, async () => {
     logger.warn('[Redis] state check failed:', err.message);
   }
 });
+
