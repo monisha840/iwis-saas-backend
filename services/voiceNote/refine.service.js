@@ -278,8 +278,90 @@ Return JSON matching exactly this shape (no extra keys, no markdown fences):
   "exercisePlan": "<exercise / activity guidance such as 'walk 30 minutes daily', 'avoid heavy lifting', 'yoga twice a week'; empty string if not stated>",
   "dietaryAdvice": "<food guidance or empty string>",
   "nextSteps": "<follow-up actions, labs, lifestyle changes or empty string>",
-  "followUpDate": "<YYYY-MM-DD or empty string>"
+  "followUpDate": "<YYYY-MM-DD or empty string>",
+  "homeTherapy": {
+    "requested": <true ONLY when the doctor explicitly asks for therapist sessions / panchakarma / abhyangam / massage / physiotherapy / home-visit therapy; otherwise false>,
+    "totalSessions": <integer, 0 when not stated>,
+    "sessionModes": [<"HOME" or "HOSPITAL" per session; length must equal totalSessions; if only one mode is stated, repeat it that many times>],
+    "intervalDays": <integer, 0 when not stated. 1=daily, 2=every other day, 3=every 3 days, 7=weekly, 14=fortnightly>,
+    "instructionsForTherapist": "<extra notes the therapist should follow, or empty string>"
+  }
 }
+
+THERAPIST / HOME-THERAPY EXTRACTION RULES:
+
+- Set "homeTherapy.requested" to true ONLY when the doctor clearly mentions sending the patient to a THERAPIST or scheduling THERAPY SESSIONS (Panchakarma, Abhyangam, Shirodhara, Pizhichil, Kati Vasti, Nasya, massage, physiotherapy, home-visit therapy, "send for therapy", "refer to therapist", "schedule N sessions", etc.). Casual mention of exercise or stretching does NOT count — those go in exercisePlan.
+
+- "totalSessions" — extract the integer count. Phrases: "10 sessions", "5 sittings", "8 sessions of abhyangam", "5 amarvugal" (Tamil), "ஐந்து சிகிச்சைகள்" (Tamil "five treatments"). Cap to 50.
+
+- "sessionModes" — fill the array with one entry per session:
+    · "send a therapist home" / "home therapy" / "வீட்டில்" / "veetil" → "HOME"
+    · "at the hospital" / "in clinic" / "in-house" / "மருத்துவமனையில்" / "maruthuvamanai" → "HOSPITAL"
+    · Mixed: "first 3 at hospital, rest at home" → ["HOSPITAL","HOSPITAL","HOSPITAL","HOME","HOME",...]
+    · Default to "HOME" when therapy is requested but mode is unstated (home-visit is the most common Ayurvedic therapy referral).
+  IMPORTANT: sessionModes.length MUST equal totalSessions. If sessions = 7 and only "home" is mentioned, return ["HOME","HOME","HOME","HOME","HOME","HOME","HOME"].
+
+- "intervalDays" — translate cadence words to a number of days:
+    · "daily" / "every day" / "தினமும்" / "தினசரி" → 1
+    · "every other day" / "alternate days" / "ஒன்று விட்டு ஒரு நாள்" → 2
+    · "every 3 days" / "twice a week" → 3
+    · "weekly" / "once a week" / "வாரம் ஒருமுறை" → 7
+    · "fortnightly" / "every 2 weeks" / "இரண்டு வாரத்திற்கு ஒருமுறை" → 14
+    · Custom-day phrases ("every 4 days", "every 5 days") → that integer.
+    · Not stated → 0.
+
+- "instructionsForTherapist" — capture any extra detail the therapist should follow that isn't a session count, mode, or interval. Examples:
+    · "focus on the lower back and shoulders"
+    · "use Mahanarayana oil for the abhyangam"
+    · "avoid pressure on the right knee — recent injury"
+    · "patient is elderly, go gently"
+  When the doctor names a specific therapist ("send Therapist Lakshmi"), prepend "For: <name>." to instructionsForTherapist. Do NOT invent a therapist row in some other field — the host app handles assignment separately; the doctor's spoken name only goes into this notes string for the admin's reference.
+
+EXAMPLES:
+
+Input (English): "Patient needs 10 abhyangam sessions, send a therapist home, every other day, use Mahanarayana oil, focus on lower back."
+homeTherapy:
+{
+  "requested": true,
+  "totalSessions": 10,
+  "sessionModes": ["HOME","HOME","HOME","HOME","HOME","HOME","HOME","HOME","HOME","HOME"],
+  "intervalDays": 2,
+  "instructionsForTherapist": "Use Mahanarayana oil. Focus on lower back."
+}
+
+Input (English): "Schedule 5 panchakarma sittings at the hospital, weekly, with therapist Lakshmi, gentle pressure please."
+homeTherapy:
+{
+  "requested": true,
+  "totalSessions": 5,
+  "sessionModes": ["HOSPITAL","HOSPITAL","HOSPITAL","HOSPITAL","HOSPITAL"],
+  "intervalDays": 7,
+  "instructionsForTherapist": "For: Lakshmi. Gentle pressure please."
+}
+
+Input (Tanglish): "Patient ku 7 abhyangam amarvugal vendum, mudhal moonu hospitalla, meedhi veetil, alternate days la, kaal mutti pakkam soft ah."
+homeTherapy:
+{
+  "requested": true,
+  "totalSessions": 7,
+  "sessionModes": ["HOSPITAL","HOSPITAL","HOSPITAL","HOME","HOME","HOME","HOME"],
+  "intervalDays": 2,
+  "instructionsForTherapist": "Soft pressure around the knee."
+}
+
+Input (English): "Paracetamol 500mg twice daily for 3 days." (no therapy mentioned)
+homeTherapy:
+{
+  "requested": false,
+  "totalSessions": 0,
+  "sessionModes": [],
+  "intervalDays": 0,
+  "instructionsForTherapist": ""
+}
+
+MEDICATION-CATALOG MATCHING (REINFORCEMENT):
+
+When you populate medications[].name, you MUST use the exact catalog spelling listed in the CLINIC MEDICINE CATALOG section below if a catalog entry is a clear match for what the doctor said — including across speech-recognition spelling errors and Tamil/English transliteration. The host app does an EXACT-NAME (case-insensitive) lookup against this same catalog after receiving your response, and a 1-character mismatch ("Ashwagandha" vs "Aswagandha") will silently fail to link the row to the inventory record. If the doctor mentions a medicine that is NOT in the catalog (one-off Siddha herb, custom preparation), still extract it but use a clean canonical spelling — the row will simply stay "Unlinked" in the host UI, which is correct behaviour.
 
 CRITICAL FIELD-PLACEMENT RULES:
 
@@ -445,12 +527,45 @@ function normalizeStructured(raw) {
     dietaryAdvice: typeof raw?.dietaryAdvice === 'string' ? raw.dietaryAdvice : '',
     nextSteps: typeof raw?.nextSteps === 'string' ? raw.nextSteps : '',
     followUpDate: typeof raw?.followUpDate === 'string' ? raw.followUpDate : '',
+    homeTherapy: normalizeHomeTherapy(raw?.homeTherapy),
   };
   // Reject obviously wrong followUpDate values (model hallucinations).
   if (out.followUpDate && !/^\d{4}-\d{2}-\d{2}$/.test(out.followUpDate)) {
     out.followUpDate = '';
   }
   return out;
+}
+
+// Defensive coercion for the homeTherapy block. The frontend's
+// HomeTherapyDraft enforces sessionModes.length === totalSessions, so we
+// reconcile any drift the model produced (e.g. 5 sessions but only 3 modes
+// → pad with HOME; 5 sessions but 7 modes → truncate to 5). Returns the
+// "no referral" shape when requested is false, so the host can rely on
+// `homeTherapy.requested === false` as the gate.
+function normalizeHomeTherapy(raw) {
+  const empty = { requested: false, totalSessions: 0, sessionModes: [], intervalDays: 0, instructionsForTherapist: '' };
+  if (!raw || typeof raw !== 'object') return empty;
+  const requested = raw.requested === true;
+  if (!requested) return empty;
+
+  const totalSessions = Number.isFinite(raw.totalSessions) ? Math.max(0, Math.min(50, Math.floor(raw.totalSessions))) : 0;
+  const validModes = new Set(['HOME', 'HOSPITAL']);
+  const rawModes = Array.isArray(raw.sessionModes)
+    ? raw.sessionModes.filter((m) => validModes.has(m))
+    : [];
+  // Reconcile length to totalSessions. Pad with the most-common mode in
+  // rawModes (or HOME when empty) so the host doesn't have to guess.
+  const padMode = rawModes.length > 0
+    ? (rawModes.filter((m) => m === 'HOSPITAL').length > rawModes.filter((m) => m === 'HOME').length ? 'HOSPITAL' : 'HOME')
+    : 'HOME';
+  const sessionModes = totalSessions === 0
+    ? []
+    : Array.from({ length: totalSessions }, (_, i) => rawModes[i] || padMode);
+
+  const intervalDays = Number.isFinite(raw.intervalDays) ? Math.max(0, Math.min(30, Math.floor(raw.intervalDays))) : 0;
+  const instructionsForTherapist = typeof raw.instructionsForTherapist === 'string' ? raw.instructionsForTherapist : '';
+
+  return { requested, totalSessions, sessionModes, intervalDays, instructionsForTherapist };
 }
 
 function lightTextRefine(transcript) {
@@ -479,6 +594,9 @@ function parseTranscriptRegex(transcript) {
     dietaryAdvice: '',
     nextSteps: '',
     followUpDate: '',
+    // Regex fallback can't reliably parse therapy referrals — return the
+    // empty/disabled shape so callers stay on a single contract.
+    homeTherapy: { requested: false, totalSessions: 0, sessionModes: [], intervalDays: 0, instructionsForTherapist: '' },
   };
   if (!transcript) return result;
 
