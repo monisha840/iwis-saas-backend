@@ -29,6 +29,7 @@ export class HandoffNoteService {
   static async createHandoffNote(fromClinicianId, {
     patientId, toClinicianId, toBranchId, summary,
     currentMedications, activeConditions, nextSteps, urgency,
+    handoffDate,
     status = 'SENT',
   }) {
     logger.info(`Creating handoff note`, { fromClinicianId, patientId, toClinicianId, status });
@@ -42,6 +43,26 @@ export class HandoffNoteService {
       throw new Error('Clinician not found');
     }
 
+    // DD/MM/YYYY → ISO. Route-level Zod has already validated the regex, so
+    // a malformed value can only mean the route was bypassed — guard anyway.
+    let handoffDateIso = null;
+    if (handoffDate) {
+      const m = /^(\d{2})\/(\d{2})\/(\d{4})$/.exec(handoffDate);
+      if (!m) {
+        const e = new Error('handoffDate must be DD/MM/YYYY');
+        e.status = 400;
+        throw e;
+      }
+      const [, dd, mm, yyyy] = m;
+      const d = new Date(`${yyyy}-${mm}-${dd}T00:00:00.000Z`);
+      if (Number.isNaN(d.getTime())) {
+        const e = new Error('handoffDate is not a valid date');
+        e.status = 400;
+        throw e;
+      }
+      handoffDateIso = d;
+    }
+
     const handoff = await prisma.handoffNote.create({
       data: {
         patientId,
@@ -53,6 +74,7 @@ export class HandoffNoteService {
         activeConditions: activeConditions || [],
         nextSteps: nextSteps || null,
         urgency: urgency || 'NORMAL',
+        handoffDate: handoffDateIso,
         status,
         sentAt: status === 'SENT' ? new Date() : null,
       },
@@ -76,13 +98,27 @@ export class HandoffNoteService {
   static async _emitHandoffNotification(handoff) {
     if (!handoff.toClinicianId) return;
     emitToUser(handoff.toClinicianId, 'handoff_received', handoff);
+
+    const senderName = handoff.fromClinician?.name || 'A clinician';
+    const senderLabel = senderName.startsWith('Dr.') ? senderName : `Dr. ${senderName}`;
+    const patientName = handoff.patient?.fullName || 'Unknown';
+    let dateSuffix = '';
+    if (handoff.handoffDate) {
+      const d = new Date(handoff.handoffDate);
+      // DD/MM/YYYY for the recipient — matches the input format used in the form.
+      const dd = String(d.getUTCDate()).padStart(2, '0');
+      const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+      const yyyy = d.getUTCFullYear();
+      dateSuffix = ` scheduled for ${dd}/${mm}/${yyyy}`;
+    }
+
     await notificationService.createNotification({
       userId: handoff.toClinicianId,
-      type: 'HANDOFF_NOTE',
-      title: 'New Handoff Note Received',
-      message: `${handoff.fromClinician?.name || 'A clinician'} has sent you a handoff note for patient ${handoff.patient?.fullName || 'Unknown'}`,
+      type: 'HANDOFF_ASSIGNED',
+      title: 'New Handoff Note Assigned',
+      message: `${senderLabel} has assigned a handoff note for patient ${patientName}${dateSuffix}`,
       priority: handoff.urgency === 'CRITICAL' ? 'HIGH' : 'INFO',
-      data: { handoffId: handoff.id, patientId: handoff.patientId },
+      data: { handoffId: handoff.id, patientId: handoff.patientId, handoffDate: handoff.handoffDate || null },
     });
   }
 

@@ -38,6 +38,13 @@ router.post('/', authorizeRoles('DOCTOR', 'ADMIN_DOCTOR'), async (req, res, next
 
 router.get('/', async (req, res, next) => {
     try {
+        // The Diet Plans search bar calls this without a patientId. When
+        // `search` is provided we dispatch to the role-scoped cross-patient
+        // search; otherwise the per-patient list still requires patientId.
+        const search = typeof req.query.search === 'string' ? req.query.search.trim() : '';
+        if (search) {
+            return res.json(await DietPrescriptionService.search({ search, user: req.user }));
+        }
         if (!req.query.patientId) return res.status(400).json({ error: 'patientId is required' });
         res.json(await DietPrescriptionService.listForPatient(req.query.patientId));
     } catch (err) { next(err); }

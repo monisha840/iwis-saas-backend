@@ -562,7 +562,9 @@ class AnalyticsService {
 
         const totalExpected = logs.length;
         const totalTaken = logs.filter(l => l.taken).length;
-        const overallRate = totalExpected > 0 ? Math.round((totalTaken / totalExpected) * 100) : 100;
+        // No expected doses → no adherence to report. Returning 100 here was
+        // misleading the doctor's progress card (showed a full bar against 0/0).
+        const overallRate = totalExpected > 0 ? Math.round((totalTaken / totalExpected) * 100) : 0;
 
         return {
             patientId,

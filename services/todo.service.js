@@ -360,16 +360,23 @@ export class TodoService {
     }
 
     /**
-     * Revoke (delete) a pending assigned todo. Only creator may revoke.
+     * Permanently delete an assigned todo. The creator may delete their own
+     * todo at any status, and ADMIN_DOCTOR (oversight role) may delete any
+     * todo regardless of creator. Used by both:
+     *   - Revoke button (PENDING tasks the creator wants to take back)
+     *   - Hover trash on the "Tasks I've Assigned" panel (any status)
      */
     static async revoke(actor, todoId) {
         const todo = await prisma.todo.findUnique({ where: { id: todoId } });
         if (!todo) throw httpErr(404, 'Todo not found');
-        if (todo.createdById !== actor.id) throw httpErr(403, 'Only the creator can revoke this todo');
-        if (todo.status !== 'PENDING') throw httpErr(400, 'Only PENDING todos can be revoked');
+        const isCreator = todo.createdById === actor.id;
+        const isAdminDoctor = actor.role === 'ADMIN_DOCTOR';
+        if (!isCreator && !isAdminDoctor) {
+            throw httpErr(403, 'Only the creator or an admin doctor can delete this task');
+        }
 
         await prisma.todo.delete({ where: { id: todoId } });
-        logger.info(`[Todo] ${actor.id} revoked ${todoId}`);
+        logger.info(`[Todo] ${actor.id} deleted ${todoId} (status=${todo.status})`);
         return { ok: true };
     }
 

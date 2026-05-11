@@ -1,6 +1,12 @@
+// Load .env BEFORE any other import. ESM hoists imports and runs each
+// imported module's top-level body in source order, so any module further
+// down (e.g. ./config/index.js) reads process.env immediately on load. If
+// dotenv.config() is called from a later top-level statement, those reads
+// happen against an empty environment and the empty values get cached.
+// 'dotenv/config' invokes config() as a side effect at module-load time,
+// which is the only place early enough to be safe.
+import 'dotenv/config';
 import { initSentry, Sentry } from './lib/sentry.js';
-import dotenv from 'dotenv';
-dotenv.config();
 initSentry();
 
 import express from 'express';
@@ -40,6 +46,8 @@ import adherenceRoutes from './routes/adherence.js';
 import leaderboardRoutes from './routes/leaderboard.js';
 import gamificationRoutes from './routes/gamification.js';
 import timelineRoutes from './routes/timeline.js';
+import patientsRoutes from './routes/patients.js';
+import patientHistoryRoutes from './routes/patientHistory.js';
 import refillRoutes from './routes/refill.js';
 import featureFlagRoutes from './routes/feature-flags.js';
 import referralRoutes from './routes/referrals.js';
@@ -68,6 +76,7 @@ import clinicalPhotoRoutes from './routes/clinicalPhoto.js';
 import therapistSkillRoutes from './routes/therapistSkill.js';
 import treatmentPackageRoutes from './routes/treatmentPackage.js';
 import groupSessionRoutes from './routes/groupSession.js';
+import therapySessionRoutes from './routes/therapySessions.js';
 import homeTherapyRoutes from './routes/homeTherapy.js';
 // Billing disabled application-wide — invoice routes intentionally unmounted.
 // import invoiceRoutes from './routes/invoices.js';
@@ -76,6 +85,14 @@ import todoRoutes from './routes/todos.js';
 import dashboardSummaryRoutes from './routes/dashboard-summary.js';
 // Self-Examination Protocol (IWIS pre-consultation)
 import selfExamRoutes from './routes/self-exam.js';
+// Sheizen-inspired daily tracking (water / measurements / activity / meal photos)
+import dailyTrackingRoutes from './routes/dailyTracking.js';
+// Daily Ayurvedic Motivation Card (per-patient prakriti+season tip + Zen Points)
+import motivationRoutes from './routes/motivation.js';
+// Care Gap Dashboard (admin/admin-doctor list view of at-risk patients)
+import careGapsRoutes from './routes/careGaps.js';
+// Revenue Today dashboard (admin / admin-doctor financial snapshot)
+import revenueRoutes from './routes/revenue.js';
 // Messaging templates + configurable daily reminder
 import messageTemplateRoutes from './routes/message-templates.js';
 import reminderSettingRoutes from './routes/reminder-settings.js';
@@ -144,6 +161,12 @@ app.use('/api/', globalLimiter);
 app.use(express.json({ limit: '1mb' }));
 app.use(morgan('dev'));
 
+// Serve uploaded files (Clinical Photos and the like) from disk when
+// Supabase storage isn't configured — without this the disk-fallback path
+// in middleware/upload.js (`/uploads/<filename>`) returns 404. CORS is
+// already wired above so the browser can pull the image cross-origin.
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
 // Structured request/response logger (after body parsers, before routes)
 app.use(requestLogger);
 
@@ -206,7 +229,12 @@ app.use('/api/availability', availabilityRoutes);
 app.use('/api/adherence', adherenceRoutes);
 app.use('/api/leaderboard', leaderboardRoutes);
 app.use('/api/gamification', gamificationRoutes);
+// Walk-in guest patient creation must mount BEFORE timelineRoutes so its
+// POST /guest handler matches before the timeline router gets a chance to
+// fall through to a 404. Both share the /api/patients prefix.
+app.use('/api/patients', patientsRoutes);
 app.use('/api/patients', timelineRoutes);
+app.use('/api/patient-history', patientHistoryRoutes);
 app.use('/api/refills', refillRoutes);
 app.use('/api/feature-flags', featureFlagRoutes);
 app.use('/api/referrals', referralRoutes);
@@ -237,6 +265,9 @@ app.use('/api/clinical-photos', clinicalPhotoRoutes);
 app.use('/api/therapists', therapistSkillRoutes);
 app.use('/api/packages', treatmentPackageRoutes);
 app.use('/api/group-sessions', groupSessionRoutes);
+// Therapist Session Workspace (Phase A) — minimal in-clinic session with
+// notes + timer. Therapist-only ownership; ADMIN/ADMIN_DOCTOR override.
+app.use('/api/therapy-sessions', therapySessionRoutes);
 // Home Therapy — doctor-authored referral, admin-approved, GPS-tracked sessions.
 app.use('/api/home-therapy', homeTherapyRoutes);
 // app.use('/api/invoices', invoiceRoutes); // billing disabled
@@ -247,6 +278,14 @@ app.use('/api/dashboards', dashboardSummaryRoutes);
 
 // Self-Examination Protocol (IWIS pre-consultation)
 app.use('/api/self-exam', selfExamRoutes);
+// Sheizen-inspired daily tracking (water / measurements / activity / meal photos)
+app.use('/api/daily-tracking', dailyTrackingRoutes);
+// Daily Ayurvedic Motivation Card
+app.use('/api/motivation', motivationRoutes);
+// Care Gap Dashboard
+app.use('/api/care-gaps', careGapsRoutes);
+// Revenue dashboard
+app.use('/api/revenue', revenueRoutes);
 app.use('/api/message-templates', messageTemplateRoutes);
 app.use('/api/reminder-settings', reminderSettingRoutes);
 

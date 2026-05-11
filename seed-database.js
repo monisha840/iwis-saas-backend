@@ -65,7 +65,7 @@ async function main() {
                     gender: 'Male',
                     age: 35,
                     phoneNumber: '+91-9876543210',
-                    therapyType: 'Physical'
+                    therapyTypes: ['Physical']
                 }
             }
         }

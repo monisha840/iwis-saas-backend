@@ -8,7 +8,24 @@ import prisma from '../lib/prisma.js';
  */
 export class GroupSessionService {
     static async create(data) {
-        return prisma.groupSession.create({ data });
+        // Pull patientIds out of the create payload — they belong on
+        // Appointment rows (the join model), not GroupSession itself.
+        const { patientIds = [], ...sessionData } = data;
+        const session = await prisma.groupSession.create({ data: sessionData });
+        if (Array.isArray(patientIds) && patientIds.length > 0) {
+            const unique = Array.from(new Set(patientIds.filter(Boolean)));
+            const capped = unique.slice(0, session.maxCapacity);
+            for (const patientId of capped) {
+                try {
+                    await this.join({ groupSessionId: session.id, patientId });
+                } catch {
+                    // Per-patient failures (already-enrolled, full, etc.) must
+                    // not abort the rest of the bulk enrol — the session still
+                    // exists, the rest of the chips still go through.
+                }
+            }
+        }
+        return session;
     }
 
     static async list({ branchId, hospitalId, date, therapistId } = {}) {

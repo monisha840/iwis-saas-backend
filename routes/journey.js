@@ -30,15 +30,36 @@ function rejectTherapistMedicationTasks(req, res, next) {
     next();
 }
 
-// Force branchId off req.user for journey *creation*. Clinicians should never
-// be able to plant a journey in a branch they don't belong to. Patients are
-// not allowed to create journeys, so req.user.branchId is always a clinician's.
-function forceBranchFromUser(req, res, next) {
-    if (!req.user?.branchId) {
+// Resolve branchId for journey creation:
+//   DOCTOR / THERAPIST → forced to their JWT branch (so they can't plant a
+//                        journey in a branch they don't belong to).
+//   ADMIN_DOCTOR        → JWT has no branchId (hospital-scoped). We honour
+//                        req.body.branchId when supplied, otherwise fall back
+//                        to the selected patient's branchId so the form does
+//                        not have to demand a branch picker.
+async function forceBranchFromUser(req, res, next) {
+    try {
+        if (req.user?.branchId) {
+            req.body.branchId = req.user.branchId;
+            return next();
+        }
+        if (req.user?.role === 'ADMIN_DOCTOR') {
+            if (req.body?.branchId) return next();
+            if (req.body?.patientId) {
+                const patient = await prisma.patient.findFirst({
+                    where: { OR: [{ id: req.body.patientId }, { userId: req.body.patientId }] },
+                    select: { branchId: true, user: { select: { branchId: true } } },
+                });
+                const resolved = patient?.branchId ?? patient?.user?.branchId ?? null;
+                if (resolved) {
+                    req.body.branchId = resolved;
+                    return next();
+                }
+            }
+            return res.status(400).json({ error: 'BRANCH_REQUIRED', message: 'Pick a patient or specify a branch — admin doctors are not pinned to a branch.' });
+        }
         return res.status(400).json({ error: 'USER_HAS_NO_BRANCH' });
-    }
-    req.body.branchId = req.user.branchId;
-    next();
+    } catch (err) { next(err); }
 }
 
 // A patient is allowed to view only their own journey.
@@ -70,8 +91,11 @@ async function enforcePatientIdMatch(req, res, next) {
 // branchId on the body is ignored — the server derives it from req.user.branchId
 // (see forceBranchFromUser) so a clinician cannot plant a journey in another branch.
 const createJourneySchema = z.object({
-    patientId: z.string(),
-    // Optional in the wire schema; overwritten server-side before reaching the service.
+    // Both optional at the wire level so the form can submit a partially-built
+    // draft. The route handler still 400s before hitting the service if either
+    // is missing — DB columns are required and the resolution attempt above
+    // (forceBranchFromUser) covers the ADMIN_DOCTOR-no-JWT-branch case.
+    patientId: z.string().optional(),
     branchId: z.string().optional(),
     title: z.string().min(1).max(200),
     condition: z.string().min(1).max(200),
@@ -103,10 +127,30 @@ router.post('/',
     rejectTherapistMedicationTasks,
     async (req, res, next) => {
         try {
+            // patientId is optional in Zod for draft-flow flexibility, but the
+            // DB column is required. Surface a clean 400 instead of letting
+            // Prisma throw an opaque foreign-key error.
+            if (!req.body.patientId) {
+                return res.status(400).json({ error: 'PATIENT_REQUIRED', message: 'Select a patient before saving the journey.' });
+            }
             const journey = await JourneyService.createJourney(
                 req.user.id, req.body.patientId, req.body.branchId, req.body
             );
             res.status(201).json(journey);
+        } catch (err) { next(err); }
+    }
+);
+
+// GET /api/journeys/mine — every journey owned by the calling clinician.
+// Drives the "Existing Journeys" panel inside the Journey Builder page.
+// Registered BEFORE /:id so the literal "mine" doesn't get matched as an id.
+router.get('/mine',
+    authMiddleware,
+    roleMiddleware(['DOCTOR', 'ADMIN_DOCTOR', 'THERAPIST']),
+    async (req, res, next) => {
+        try {
+            const journeys = await JourneyService.getDoctorJourneys(req.user.id);
+            res.json(journeys);
         } catch (err) { next(err); }
     }
 );

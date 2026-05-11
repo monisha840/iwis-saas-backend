@@ -108,9 +108,15 @@ export class AppointmentService {
                 where.therapistId = therapistRecord.id;
             }
 
-            // 2. Branch Locking (Except for Admin Doctor)
+            // 2. Branch Locking (Except for Admin Doctor and Patient)
+            // PATIENT is excluded so a patient who registered under one branch
+            // but booked at another (e.g. switched clinics, or branch changed
+            // after registration) still sees all of their own appointments.
+            // The patientId filter above already scopes the result to the
+            // patient's own rows, so the branch lock would only hide rows
+            // they're entitled to see.
             const user = await prisma.user.findUnique({ where: { id }, select: { branchId: true } });
-            if (user?.branchId && role !== 'ADMIN_DOCTOR') {
+            if (user?.branchId && role !== 'ADMIN_DOCTOR' && role !== 'PATIENT') {
                 where.branchId = user.branchId;
             }
 
@@ -953,7 +959,16 @@ export class AppointmentService {
     }
 
     static async getAppointmentById(id) {
-        return prisma.appointment.findUnique({ where: { id }, select: { id: true, status: true } });
+        // Return the same include shape as the list endpoint so callers
+        // (Consultation Room, internal status-transition checks) get a
+        // complete row. The previous select={id,status} stripped patient,
+        // doctor, and date — which made ConsultationRoom render "Session
+        // with Patient · Scheduled for —" because the fields it reads
+        // were silently absent from the response.
+        return prisma.appointment.findUnique({
+            where: { id },
+            include: includeDetails,
+        });
     }
 
     static async getAvailableSlots(clinicianId, date, branchId) {

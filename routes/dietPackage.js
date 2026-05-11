@@ -78,35 +78,18 @@ router.put('/:id', authorizeRoles('DOCTOR', 'THERAPIST', 'ADMIN_DOCTOR', 'ADMIN'
     } catch (err) { next(err); }
 });
 
-// Approval workflow — admins only.
-const approveSchema = z.object({
-    xpAmount: z.coerce.number().int().min(0).max(500).optional(),
-    notes:    z.string().trim().max(1000).optional(),
+// Approval workflow retired — diet packages publish immediately on create.
+// Endpoints kept around as 410 Gone so any stale frontend bundle that still
+// hits them gets a clear, actionable error instead of a silent failure.
+// Schema columns (status / approvedById / rejectionReason / xpAwarded /
+// approvalNotes / approvedAt) are intentionally left in place so historical
+// rows remain readable; no Prisma migration needed.
+const approvalRetired = (req, res) => res.status(410).json({
+    error: 'Diet package approval workflow has been retired. Packages are published on create — assign directly from the package list.',
 });
-
-router.post('/:id/approve', authorizeRoles('ADMIN', 'ADMIN_DOCTOR'), async (req, res, next) => {
-    try {
-        const data = approveSchema.parse(req.body ?? {});
-        res.json(await DietPackageService.approve({ id: req.params.id, user: req.user, data }));
-    } catch (err) { next(err); }
-});
-
-const rejectSchema = z.object({
-    reason: z.string().trim().min(5, 'Provide a rejection reason (at least 5 characters) so the creator can fix it'),
-});
-
-router.post('/:id/reject', authorizeRoles('ADMIN', 'ADMIN_DOCTOR'), async (req, res, next) => {
-    try {
-        const { reason } = rejectSchema.parse(req.body);
-        res.json(await DietPackageService.reject({ id: req.params.id, user: req.user, reason }));
-    } catch (err) { next(err); }
-});
-
-router.post('/:id/archive', authorizeRoles('ADMIN', 'ADMIN_DOCTOR'), async (req, res, next) => {
-    try {
-        res.json(await DietPackageService.archive({ id: req.params.id, user: req.user }));
-    } catch (err) { next(err); }
-});
+router.post('/:id/approve', authorizeRoles('ADMIN', 'ADMIN_DOCTOR'), approvalRetired);
+router.post('/:id/reject',  authorizeRoles('ADMIN', 'ADMIN_DOCTOR'), approvalRetired);
+router.post('/:id/archive', authorizeRoles('ADMIN', 'ADMIN_DOCTOR'), approvalRetired);
 
 // Assign to patient — any clinician who can create a DietPrescription.
 router.post('/:id/assign', authorizeRoles('DOCTOR', 'ADMIN_DOCTOR'), async (req, res, next) => {

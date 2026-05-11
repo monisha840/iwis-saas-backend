@@ -5,6 +5,9 @@ import { FollowUpService, FOLLOWUP_INTERVALS } from '../services/followUp.servic
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
 import { auditAction, auditDelete } from '../middleware/auditLog.js';
+import prisma from '../lib/prisma.js';
+import { notificationService } from '../services/notification.service.js';
+import { WhatsAppService } from '../services/whatsapp.service.js';
 
 // Valid transitions: from → allowed next statuses
 const VALID_STATUS_TRANSITIONS = {
@@ -135,6 +138,203 @@ router.get('/', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR
  *       201: { description: Appointment created }
  *       400: { description: Validation error or slot unavailable }
  */
+// ── Walk-In Appointment Booking (admin front-desk flow) ─────────────────────
+//
+// POST /api/appointments/walk-in — ADMIN / ADMIN_DOCTOR books a CONFIRMED
+// appointment for a patient who arrived at the clinic. Bypasses the
+// PENDING → APPROVED workflow used by patient-initiated bookings.
+//
+// Key behaviours that differ from the standard POST /:
+//   - Status lands directly at CONFIRMED (not PENDING/PENDING_*_APPROVAL)
+//   - doctorApproved / therapistApproved pre-set to true (no notification fan-out
+//     to the clinician for approval — they get an in-app "booked for you" note)
+//   - isWalkIn flag persisted for later reporting
+//   - 409 with requiresOverride: true on conflict; client can resubmit with
+//     overrideReason to force-book (the override reason is captured in notes
+//     and the audit log)
+//   - Past-time bookings are allowed (walk-in IS "right now")
+
+const walkInSchema = z.object({
+    patientId: z.string().optional(),
+    guestPatientId: z.string().optional(),
+    doctorId: z.string().min(1),
+    therapistId: z.string().optional().nullable(),
+    consultationType: z.enum(['DOCTOR', 'THERAPIST', 'COMBINED']).default('DOCTOR'),
+    date: z.string().min(1),
+    time: z.string().regex(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/, 'Invalid time format HH:mm'),
+    notes: z.string().max(2000).optional(),
+    overrideReason: z.string().max(500).optional(),
+}).refine((d) => d.patientId || d.guestPatientId, {
+    message: 'patientId or guestPatientId is required',
+});
+
+router.post(
+    '/walk-in',
+    authMiddleware,
+    roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']),
+    validate({ body: walkInSchema }),
+    async (req, res, next) => {
+        try {
+            const {
+                patientId, guestPatientId, doctorId, therapistId,
+                consultationType, date, time, notes, overrideReason,
+            } = req.body;
+
+            const resolvedPatientId = patientId || guestPatientId;
+
+            // Build the appointment datetime from date + HH:mm.
+            const [hours, minutes] = time.split(':').map(Number);
+            const appointmentDate = new Date(date);
+            appointmentDate.setHours(hours, minutes, 0, 0);
+
+            // Conflict scan: any non-cancelled appointment within a ±15-minute
+            // window for the same doctor (or therapist if specified). We use
+            // the wider negative side (15 min before) because a 30-min slot
+            // overlapping the start of an existing 1-hr appt is a real clash.
+            const windowStart = new Date(appointmentDate.getTime() - 15 * 60 * 1000);
+            const windowEnd = new Date(appointmentDate.getTime() + 30 * 60 * 1000);
+            const conflict = await prisma.appointment.findFirst({
+                where: {
+                    OR: [
+                        { doctorId },
+                        ...(therapistId ? [{ therapistId }] : []),
+                    ],
+                    date: { gte: windowStart, lte: windowEnd },
+                    status: { notIn: ['CANCELLED', 'REJECTED'] },
+                },
+                select: { id: true, status: true, date: true },
+            });
+
+            if (conflict && !overrideReason) {
+                return res.status(409).json({
+                    error: 'This slot is already booked',
+                    conflictingAppointment: { id: conflict.id, status: conflict.status },
+                    requiresOverride: true,
+                });
+            }
+
+            // Branch resolution: prefer admin's branch; fall back to the
+            // patient's branch so out-of-branch admins booking on behalf of a
+            // patient still land in the right branch context.
+            let branchIdToUse = req.user.branchId;
+            if (!branchIdToUse) {
+                const patientRow = await prisma.patient.findUnique({
+                    where: { id: resolvedPatientId },
+                    select: { branchId: true },
+                });
+                branchIdToUse = patientRow?.branchId || null;
+            }
+            if (!branchIdToUse) {
+                return res.status(400).json({ error: 'No branch context available for this booking' });
+            }
+
+            const compiledNotes = overrideReason
+                ? `Walk-in booking. Override reason: ${overrideReason}`
+                : 'Walk-in booking by admin';
+
+            const appointment = await prisma.appointment.create({
+                data: {
+                    patientId: resolvedPatientId,
+                    doctorId,
+                    therapistId: therapistId || null,
+                    branchId: branchIdToUse,
+                    date: appointmentDate,
+                    status: 'CONFIRMED',
+                    consultationType,
+                    consultationMode: 'OFFLINE',
+                    isWalkIn: true,
+                    walkInNotes: notes || null,
+                    doctorApproved: true,
+                    therapistApproved: therapistId ? true : false,
+                    notes: compiledNotes,
+                },
+                include: {
+                    patient: {
+                        select: {
+                            id: true, fullName: true, phoneNumber: true,
+                            user: { select: { id: true, email: true } },
+                        },
+                    },
+                    doctor: { select: { id: true, userId: true, fullName: true } },
+                    therapist: { select: { id: true, userId: true, fullName: true } },
+                },
+            });
+
+            const patientName = appointment.patient?.fullName
+                || appointment.patient?.user?.email
+                || 'Walk-in patient';
+            const dateLabel = appointmentDate.toLocaleDateString('en-IN', {
+                day: 'numeric', month: 'short', year: 'numeric',
+            });
+
+            // In-app notification → assigned doctor (best-effort).
+            try {
+                if (appointment.doctor?.userId) {
+                    await notificationService.createNotification({
+                        userId: appointment.doctor.userId,
+                        type: 'CLINICAL',
+                        title: 'Walk-In Appointment Booked',
+                        message: `${patientName} has been booked as a walk-in for ${time} on ${dateLabel} by admin.`,
+                        priority: 'INFO',
+                        relatedId: appointment.id,
+                        data: { appointmentId: appointment.id, isWalkIn: true },
+                    });
+                }
+                if (therapistId && appointment.therapist?.userId) {
+                    await notificationService.createNotification({
+                        userId: appointment.therapist.userId,
+                        type: 'CLINICAL',
+                        title: 'Walk-In Appointment Booked',
+                        message: `${patientName} has been booked as a walk-in for ${time} on ${dateLabel} by admin.`,
+                        priority: 'INFO',
+                        relatedId: appointment.id,
+                        data: { appointmentId: appointment.id, isWalkIn: true },
+                    });
+                }
+            } catch (notifyErr) {
+                console.warn('[walk-in] clinician notification skipped:', notifyErr.message);
+            }
+
+            // WhatsApp confirmation to patient (best-effort).
+            try {
+                const phone = appointment.patient?.phoneNumber;
+                if (phone) {
+                    await WhatsAppService.sendText(
+                        phone,
+                        `Hello ${patientName}! Your appointment at Al-Shifa has been confirmed for ${dateLabel} at ${time}. Please arrive 10 minutes early. Thank you!`,
+                    );
+                }
+            } catch (smsErr) {
+                console.warn('[walk-in] WhatsApp confirmation skipped:', smsErr.message);
+            }
+
+            // Audit log — best-effort.
+            try {
+                await prisma.auditLog.create({
+                    data: {
+                        userId: req.user.id,
+                        action: 'WALK_IN_APPOINTMENT_CREATED',
+                        entityType: 'Appointment',
+                        entityId: appointment.id,
+                        newData: {
+                            patientId: resolvedPatientId,
+                            doctorId,
+                            therapistId: therapistId || null,
+                            date: appointmentDate.toISOString(),
+                            isWalkIn: true,
+                            overrideReason: overrideReason || null,
+                        },
+                    },
+                });
+            } catch (auditErr) {
+                console.warn('[walk-in] audit log skipped:', auditErr.message);
+            }
+
+            return res.status(201).json({ appointment });
+        } catch (err) { next(err); }
+    },
+);
+
 router.post('/', authMiddleware, roleMiddleware(['PATIENT', 'ADMIN', 'ADMIN_DOCTOR']), validate({ body: appointmentSchema }), auditAction('CREATE_APPOINTMENT', 'Appointment', () => null), async (req, res, next) => {
   try {
     // Strict control for PATIENT: ignore administrative fields

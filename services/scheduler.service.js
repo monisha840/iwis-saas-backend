@@ -67,6 +67,14 @@ class SchedulerService {
         this.jobs.push(cron.schedule('0 9 * * 1',    this._safeJob('sendWeeklyGamificationDigest',  this.sendWeeklyGamificationDigest)));
         this.jobs.push(cron.schedule('0 20 * * *',   this._safeJob('sendStreakAtRiskNotifications', this.sendStreakAtRiskNotifications)));
 
+        // ── Monday Motivation Card ────────────────────────────────────────────
+        // 10:00 IST every Monday — generate one personalized weekly tip per
+        // active patient and send a WhatsApp nudge.
+        this.jobs.push(cron.schedule('0 10 * * 1',   this._safeJob('generateDailyMotivationCards',  async () => {
+            const { MotivationService } = await import('./motivation.service.js');
+            return MotivationService.generateDailyCardsForAllPatients();
+        })));
+
         // Seed badge definitions on startup
         this.seedBadges();
 
