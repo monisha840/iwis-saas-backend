@@ -7,7 +7,7 @@
  *   PATCH  /:id               update (toggle active, edit fields, etc.)
  *   DELETE /:id               delete (cascades to logs + cooldowns)
  *   GET    /:id/logs          paginated firing history with patient name
- *   POST   /evaluate-now      ADMIN / ADMIN_DOCTOR manual sweep, fire-and-forget
+ *   POST   /evaluate-now      ADMIN-only manual sweep, fire-and-forget
  *
  * authMiddleware is applied at the mount point in index.js. Per-route role
  * gating uses roleMiddleware. Branch scope is enforced inside each handler.
@@ -131,22 +131,6 @@ router.post(
                     isActive:       true,
                 },
             });
-
-            // Fire the engine once, scoped to just the new rule, so the admin
-            // doesn't have to wait for the next */15-minute cron tick or click
-            // "Evaluate Now". Mirrors the pattern used by /evaluate-now below.
-            // Errors are logged but never surface — the rule is already saved
-            // in DB; the on-create fire is a side-effect, not a transaction.
-            // PHASE_COMPLETED triggers are skipped inside the engine itself
-            // (event-driven path), so no special-case is needed here.
-            evaluateAllRules({ branchId, ruleId: created.id }).catch((evalErr) =>
-                logger.warn('[workflowRules.create] fire-on-create failed', {
-                    err:    evalErr.message,
-                    ruleId: created.id,
-                    branchId,
-                }),
-            );
-
             res.status(201).json(created);
         } catch (err) {
             logger.error('[workflowRules.create] failed', { err: err.message });
@@ -292,10 +276,9 @@ router.get(
 
 router.post(
     '/evaluate-now',
-    // ADMIN_DOCTOR is also allowed: the manual sweep is branch-scoped via
-    // resolveCallerBranchId below, so an admin doctor can only re-evaluate
-    // rules in their own branch.
-    roleMiddleware(ADMIN_ROLES),
+    // ADMIN only per spec — ADMIN_DOCTOR isn't allowed here so a clinician
+    // can't accidentally fan out WhatsApp messages while testing.
+    roleMiddleware(['ADMIN']),
     async (req, res) => {
         try {
             const branchId = await resolveCallerBranchId(req);

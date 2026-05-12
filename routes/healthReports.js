@@ -177,10 +177,7 @@ router.get(
 
 const generateSchema = z.object({
     appointmentId: z.string().min(1).optional().nullable(),
-    // patientId is optional in the schema. When the caller supplies an
-    // appointmentId we derive patientId from the appointment row below; we
-    // still 400 if both are missing because the report is per-patient.
-    patientId:     z.string().min(1).optional(),
+    patientId:     z.string().min(1, 'patientId is required'),
     sendWhatsApp:  z.boolean().optional(),
 });
 
@@ -190,26 +187,20 @@ router.post(
     resolveDoctorId,
     validate({ body: generateSchema }),
     async (req, res) => {
-        const { appointmentId, sendWhatsApp } = req.body;
-        let { patientId } = req.body;
+        const { appointmentId, patientId, sendWhatsApp } = req.body;
 
         try {
             // If an appointmentId was supplied, verify the appointment exists.
             // Per spec rule #7: missing appointment is OK only when appointmentId
             // wasn't supplied — a SUPPLIED-but-NOT-FOUND id is a bad request.
-            // We also use this lookup to derive a missing patientId.
             if (appointmentId) {
                 const appt = await prisma.appointment.findUnique({
                     where: { id: appointmentId },
-                    select: { id: true, patientId: true },
+                    select: { id: true },
                 });
                 if (!appt) {
                     return res.status(404).json({ error: 'Appointment not found' });
                 }
-                if (!patientId) patientId = appt.patientId;
-            }
-            if (!patientId) {
-                return res.status(400).json({ error: 'patientId is required (or supply appointmentId to derive it)' });
             }
 
             // resolveDoctorId middleware sets req.user.doctorProfileId for
