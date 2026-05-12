@@ -505,6 +505,15 @@ export class PharmacyService {
                 include: {
                     patient: { select: { fullName: true } },
                     dispenser: { select: { email: true } },
+                    // Linked prescription (when the dispense was made against
+                    // a specific Rx) — exposes the prescribing clinician so
+                    // the pharmacy history can show "Prescribed by Dr. X".
+                    prescription: {
+                        select: {
+                            doctor: { select: { fullName: true } },
+                            therapist: { select: { fullName: true } },
+                        },
+                    },
                     items: {
                         include: { medicine: { select: { name: true } } }
                     }
