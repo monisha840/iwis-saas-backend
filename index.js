@@ -282,7 +282,7 @@ app.use('/api/self-exam', selfExamRoutes);
 app.use('/api/daily-tracking', dailyTrackingRoutes);
 // Ayurvedic Food Database
 import ayurvedicFoodRoutes from './routes/ayurvedicFood.js';
-app.use('/api/ayurvedic-foods', ayurvedicFoodRoutes);
+app.use('/api/ayurvedic-foods', authMw, ayurvedicFoodRoutes);
 // Daily Ayurvedic Motivation Card
 app.use('/api/motivation', motivationRoutes);
 // Care Gap Dashboard
@@ -386,4 +386,6 @@ httpServer.listen(PORT, async () => {
     logger.warn('[Redis] state check failed:', err.message);
   }
 });
+
+
 
