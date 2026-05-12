@@ -1042,16 +1042,12 @@ export async function assemblePhaseProgressData(phaseId, patientId, doctorId) {
 
         // ── Pain vitals during the phase window ──────────────────────────────
         // PatientVital.patientId references User.id — use patient.userId.
-        // VitalType enum is PAIN_SCORE (NOT 'PAIN' — that literal trips a
-        // Prisma validation error and makes assemble() return null, which
-        // surfaces in the journey hook as a silent warn. Same shape the seed
-        // and the patient dashboard use.
         const vitalPatientId = patient?.userId || patientId;
         const painVitals = phaseStart
             ? await prisma.patientVital.findMany({
                 where: {
                     patientId: vitalPatientId,
-                    type: 'PAIN_SCORE',
+                    type: 'PAIN',
                     recordedAt: { gte: phaseStart, lte: phaseEnd },
                 },
                 orderBy: { recordedAt: 'asc' },
@@ -1312,18 +1308,12 @@ export function generateProgressPDF(progressData) {
             sectionHeader('Your Progress This Phase');
             const stats = progressData.stats || {};
 
-            // 2×2 metric tile grid. Wider gap between columns + rows so the
-            // mainValue (20pt) and subText (9pt, can wrap to 2 lines on
-            // longer captions like "5 of 7 meals followed") have breathing
-            // room and never overlap a neighbouring tile.
-            const TILE_COL_GAP = 16;
-            const TILE_ROW_GAP = 14;
-            const TILE_HEIGHT  = 88;
+            // 2×2 metric tile grid.
             function drawTile(col, row, title, mainValue, subText, mainColor) {
-                const tileW = (doc.page.width - PAGE_MARGIN * 2 - TILE_COL_GAP) / 2;
-                const tileH = TILE_HEIGHT;
-                const x = PAGE_MARGIN + col * (tileW + TILE_COL_GAP);
-                const y = doc.y + row * (tileH + TILE_ROW_GAP);
+                const tileW = (doc.page.width - PAGE_MARGIN * 2 - 12) / 2;
+                const tileH = 80;
+                const x = PAGE_MARGIN + col * (tileW + 12);
+                const y = doc.y + row * (tileH + 10);
 
                 doc.save();
                 doc.rect(x, y, tileW, tileH).fill(TILE_BG);
@@ -1334,13 +1324,13 @@ export function generateProgressPDF(progressData) {
                     .text(title.toUpperCase(), x + 12, y + 10, { width: tileW - 24 });
 
                 doc.fillColor(mainColor || BRAND_TEAL).font('Helvetica-Bold').fontSize(20)
-                    .text(mainValue, x + 12, y + 26, { width: tileW - 24 });
+                    .text(mainValue, x + 12, y + 24, { width: tileW - 24 });
 
                 doc.fillColor(BODY_TEXT).font('Helvetica').fontSize(9)
-                    .text(subText || '', x + 12, y + 58, { width: tileW - 24 });
+                    .text(subText || '', x + 12, y + 54, { width: tileW - 24 });
             }
 
-            ensureSpace(2 * TILE_HEIGHT + TILE_ROW_GAP + 24);
+            ensureSpace(180);
             const gridStartY = doc.y;
 
             // Tile 1 — Pain Score
@@ -1381,7 +1371,7 @@ export function generateProgressPDF(progressData) {
                 : 'No diet adherence logged';
             drawTile(1, 1, 'Diet Adherence', dietMain, dietSub, BRAND_TEAL);
 
-            doc.y = gridStartY + 2 * TILE_HEIGHT + TILE_ROW_GAP + 8;
+            doc.y = gridStartY + 2 * 80 + 10 + 6;
             doc.moveDown(0.4);
             dividerLine();
 
@@ -1583,13 +1573,7 @@ export async function createAndDeliverProgressReport(phaseId, patientId, doctorI
             if (stats.dietAdherencePercent !== null) {
                 message += `*Diet Adherence:* ${stats.dietAdherencePercent}%\n`;
             }
-            // Only render the tasks line when the phase actually had tasks. Some
-            // phases are pure follow-up (no PhaseTask rows) and an unconditional
-            // "0/0 (0%)" reads like a delivery bug. Matches the conditional
-            // pattern used for pain / wellness / diet above.
-            if (stats.tasksTotal > 0) {
-                message += `*Tasks Completed:* ${stats.tasksDone}/${stats.tasksTotal} (${stats.tasksPercent}%)\n\n`;
-            }
+            message += `*Tasks Completed:* ${stats.tasksDone}/${stats.tasksTotal} (${stats.tasksPercent}%)\n\n`;
 
             if (progressData.nextPhase) {
                 message += `*Next Phase:* ${progressData.nextPhase.name}\n`;

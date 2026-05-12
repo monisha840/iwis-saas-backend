@@ -519,25 +519,14 @@ export async function executeActions(rule, patient, reason) {
  * @param {Object} [opts]
  * @param {string} [opts.branchId]  Restrict to a single branch (used by the
  *                                  manual `evaluate-now` admin endpoint).
- * @param {string} [opts.ruleId]    Restrict to one rule. Used by the
- *                                  fire-on-create path in routes/workflowRules.js
- *                                  so a freshly-saved rule fires for its
- *                                  matching patients within seconds, without
- *                                  waiting for the next 15-minute cron tick
- *                                  and without re-walking every other rule
- *                                  in the branch.
  * @returns {Promise<{ rulesEvaluated: number, totalFired: number, perRule: Array }>}
  */
 export async function evaluateAllRules(opts = {}) {
     const startedAt = Date.now();
-    logger.info('[WorkflowEngine] starting rule evaluation', {
-        branchId: opts.branchId || null,
-        ruleId:   opts.ruleId   || null,
-    });
+    logger.info('[WorkflowEngine] starting rule evaluation', { branchId: opts.branchId || null });
 
     const where = { isActive: true };
     if (opts.branchId) where.branchId = opts.branchId;
-    if (opts.ruleId)   where.id       = opts.ruleId;
 
     const activeRules = await prisma.workflowRule.findMany({
         where,
