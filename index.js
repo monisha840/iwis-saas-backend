@@ -88,6 +88,12 @@ import webhooksRoutes from './routes/webhooks.js';
 // Ayurvedic Voice Health Coach (AYURVEDIC_VOICE_COACH feature)
 import voiceCoachRoutes from './routes/voice-coach.js';
 import painMapRoutes from './routes/painMap.js';
+// Monday Motivation Card — daily Ayurvedic tip per patient, +5 Zen Points
+// on first read, optional save / share. Routes were authored but never
+// mounted in this file; the Monday cron lived only in the node-cron
+// fallback (services/scheduler.service.js), so when Redis was up the
+// BullMQ scheduler ran without it. Both gaps fixed in this commit.
+import motivationRoutes from './routes/motivation.js';
 
 import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from './config/swagger.js';
@@ -229,6 +235,10 @@ app.use('/api/queue', queueRoutes);
 // Consultation Room — single-shot patient history aggregate
 app.use('/api/patient', consultationContextRoutes);
 app.use('/api/visit-summary', visitSummaryRoutes);
+// Monday Motivation Card — patient-only endpoints (today / save / saved /
+// :id/read). Auth is enforced inside the route file via authMiddleware +
+// roleMiddleware(['PATIENT']), so we don't add a layer here.
+app.use('/api/motivation', motivationRoutes);
 // Pain Map (clinician + patient self) — mounted at /api so it can serve both
 //   /api/patients/:patientId/pain-map  (clinician, scoped)
 //   /api/patient/pain/my-map           (patient, self-only)
