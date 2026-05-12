@@ -332,10 +332,6 @@ import { authMiddleware as patientsAuthMw } from './middleware/auth.js';
 app.use('/api/patients-admin', patientsAuthMw, patientsRoutes);
 
 // Medication Adherence (uses reports route)
-// Health Reports
-import healthReportsRoutes from './routes/healthReports.js';
-import { authMiddleware as healthReportsAuthMw } from './middleware/auth.js';
-app.use('/api/health-reports', healthReportsAuthMw, healthReportsRoutes);
 // Workflow Automation Rules Engine (Feature 3). Branch-scoped no-code
 // automation; per-route role gating lives inside workflowRules.js.
 import workflowRulesRoutes from './routes/workflowRules.js';
@@ -427,4 +423,5 @@ httpServer.listen(PORT, async () => {
     logger.warn('[Redis] state check failed:', err.message);
   }
 });
+
 
