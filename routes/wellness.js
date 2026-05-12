@@ -38,6 +38,15 @@ router.post('/check-in', authMiddleware, roleMiddleware(['PATIENT']), validate({
     }
 });
 
+router.get('/check-in/today', authMiddleware, roleMiddleware(['PATIENT']), async (req, res, next) => {
+    try {
+        const data = await WellnessService.getTodayCheckIn(req.user.id);
+        res.json(data);
+    } catch (err) {
+        next(err);
+    }
+});
+
 router.get('/videos', authMiddleware, async (req, res, next) => {
     try {
         const videos = await WellnessService.getVideos();
