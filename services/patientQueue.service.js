@@ -176,30 +176,42 @@ export class PatientQueueService {
    * one appointment today in this branch.
    */
   static async getLiveBoard({ branchId, date = new Date() }) {
-    if (!branchId) return { doctors: [], summary: this.emptySummary() };
+    // branchId === null is allowed for cross-branch admin views ("All Branches").
     const dayStart = startOfDay(date);
     const dayEnd = endOfDay(date);
 
-    // 1. Find every doctor with at least one appointment today in this branch
+    // 1. Find every doctor with at least one appointment today (optionally
+    //    scoped to a single branch).
+    const apptWhere = {
+      date: { gte: dayStart, lte: dayEnd },
+      status: { in: ACTIVE_APPOINTMENT_STATUSES },
+      doctorId: { not: null },
+    };
+    if (branchId) apptWhere.branchId = branchId;
     const todayAppts = await prisma.appointment.findMany({
-      where: {
-        branchId,
-        date: { gte: dayStart, lte: dayEnd },
-        status: { in: ACTIVE_APPOINTMENT_STATUSES },
-        doctorId: { not: null },
-      },
-      select: { doctorId: true },
+      where: apptWhere,
+      select: { doctorId: true, branchId: true },
     });
-    const doctorIds = [...new Set(todayAppts.map((a) => a.doctorId).filter(Boolean))];
+    const doctorBranchPairs = [
+      ...new Map(
+        todayAppts
+          .filter((a) => a.doctorId)
+          .map((a) => [`${a.doctorId}|${a.branchId}`, { doctorId: a.doctorId, branchId: a.branchId }]),
+      ).values(),
+    ];
 
     // 2. Lazily seed each doctor's queue
-    for (const did of doctorIds) {
-      await this.ensureEntriesForDay({ doctorId: did, branchId, date });
+    for (const pair of doctorBranchPairs) {
+      if (!pair.branchId) continue;
+      await this.ensureEntriesForDay({ doctorId: pair.doctorId, branchId: pair.branchId, date });
     }
 
-    // 3. Pull all queue entries for the branch+day
+    // 3. Pull all queue entries for the branch+day (or every branch when
+    //    branchId is null).
+    const entryWhere = { date: dayStart };
+    if (branchId) entryWhere.branchId = branchId;
     const entries = await prisma.queueEntry.findMany({
-      where: { branchId, date: dayStart },
+      where: entryWhere,
       orderBy: { queuePosition: 'asc' },
       include: {
         appointment: {

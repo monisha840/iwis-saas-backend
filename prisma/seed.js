@@ -92,7 +92,7 @@ const SEED_USERS = [
       gender: 'Male',
       age: 40,
       phoneNumber: '+91-9000000001',
-      therapyType: 'Physical',
+      therapyTypes: ['Physical'],
       patientId: 'PAT-0001',
       onboardingCompleted: true,
     },

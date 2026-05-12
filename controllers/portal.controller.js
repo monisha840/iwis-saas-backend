@@ -84,9 +84,14 @@ export class PortalController {
   // Doctor / therapist sees the visit summaries they authored.
   static async getMyVisitSummaries(req, res, next) {
     try {
+      // ADMIN_DOCTOR oversees consultations across the branch / hospital, so
+      // their dashboard returns every visit summary in scope rather than
+      // only the ones they personally authored. Plain DOCTOR / THERAPIST
+      // continue to see their own.
+      const isAdminDoctor = req.user.role === 'ADMIN_DOCTOR' || req.user.role === 'ADMIN';
       const result = await VisitSummaryService.listClinicianVisitSummaries(
-        req.user.id,
-        req.query,
+        isAdminDoctor ? null : req.user.id,
+        { ...req.query, branchId: isAdminDoctor ? (req.query.branchId || req.user.branchId || null) : undefined },
       );
       res.json(result);
     } catch (err) {

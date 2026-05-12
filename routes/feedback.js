@@ -38,8 +38,25 @@ const consultationFeedbackSchema = z.object({
 });
 
 // POST /api/feedback/:appointmentId — patient submits a star rating
+//
+// IMPORTANT — the `[a-zA-Z0-9-]{24,}` constraint on the path param is what
+// keeps this dynamic route from shadowing the single-segment static
+// routes registered LATER in this file (POST /consultation, POST /journey,
+// POST /home-therapy-session, etc.). Without it, Express path-to-regexp
+// matches /:appointmentId greedily on registration order, so a request to
+// POST /api/feedback/consultation gets routed here and validated against
+// `submitSchema` (which requires `rating`), producing the misleading
+// "Validation failed · rating: Required" error on the 4-question MCQ flow.
+//
+// Any real Appointment.id is at least 24 chars (UUID = 36, CUID = 25),
+// so legitimate callers still match. Static segments like "consultation"
+// (12), "journey" (7), "home-therapy-session" (20), "stats" (5) are
+// shorter and correctly fall through to their dedicated handlers below.
+// If a future static route name happens to be ≥24 chars, register it
+// BEFORE this handler.
+const ID_PATTERN = '[a-zA-Z0-9-]{24,}';
 router.post(
-    '/:appointmentId',
+    `/:appointmentId(${ID_PATTERN})`,
     authMiddleware,
     roleMiddleware(['PATIENT']),
     validate({ body: submitSchema }),
@@ -59,7 +76,7 @@ router.post(
 
 // GET /api/feedback/:appointmentId — clinician or patient retrieves feedback
 router.get(
-    '/:appointmentId',
+    `/:appointmentId(${ID_PATTERN})`,
     authMiddleware,
     roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST', 'PATIENT']),
     async (req, res, next) => {

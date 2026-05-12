@@ -78,7 +78,14 @@ export class BulkService {
                         phoneNumber: data.phoneNumber,
                         age: data.age ? parseInt(data.age) : null,
                         gender: data.gender || null,
-                        therapyType: data.therapyType || null,
+                        // therapyTypes is now a String[] column. CSV import
+                        // accepts a single value, a comma-separated list, or
+                        // a pre-split array; falls back to [] when absent.
+                        therapyTypes: Array.isArray(data.therapyTypes)
+                            ? data.therapyTypes
+                            : (typeof data.therapyType === 'string' && data.therapyType.trim()
+                                ? data.therapyType.split(',').map((s) => s.trim()).filter(Boolean)
+                                : []),
                         branchId: branchId // Lockdown to the importer's branch
                     },
                 });

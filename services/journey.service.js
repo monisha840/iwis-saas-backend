@@ -294,6 +294,26 @@ export class JourneyService {
         } catch (err) {
             logger.warn('[Journey] journey_feedback_request emit failed', { journeyId, err: err.message });
         }
+
+        // 3) Patient History & Health Passport — write the immutable snapshot.
+        //    Strictly fire-and-forget so a snapshot failure (e.g. missing Doctor
+        //    profile, supabase outage during PDF write) never blocks the
+        //    journey-completion side effects above. createHistoryRecord is
+        //    idempotent on the journeyId @unique constraint.
+        try {
+            const { createHistoryRecord } = await import('./patientHistory.service.js');
+            createHistoryRecord(journeyId)
+                .then((result) => {
+                    if (!result.alreadyExisted) {
+                        logger.info('[PatientHistory] Record created', { journeyId, recordId: result.record.id });
+                    }
+                })
+                .catch((err) => {
+                    logger.error('[PatientHistory] Record creation failed', { journeyId, err: err.message });
+                });
+        } catch (err) {
+            logger.error('[PatientHistory] Hook import failed', { journeyId, err: err.message });
+        }
     }
 
     /**
@@ -594,6 +614,34 @@ export class JourneyService {
                 doctor: true,
             },
             orderBy: { createdAt: 'desc' }
+        });
+    }
+
+    /**
+     * Get journeys owned by a clinician (TreatmentJourney.doctorId = User.id).
+     * Drives the "Existing Journeys" panel inside the Journey Builder page so
+     * a doctor can see what they've already built and progress phases without
+     * jumping into each patient's profile.
+     */
+    static async getDoctorJourneys(doctorUserId) {
+        return prisma.treatmentJourney.findMany({
+            where: { doctorId: doctorUserId },
+            include: {
+                phases: { orderBy: { order: 'asc' } },
+                patient: {
+                    select: {
+                        id: true,
+                        email: true,
+                        patient: { select: { id: true, fullName: true, patientId: true } },
+                    },
+                },
+            },
+            orderBy: [
+                // ACTIVE first, then COMPLETED, then PAUSED/DISCONTINUED — keeps the
+                // doctor's working list at the top.
+                { status: 'asc' },
+                { updatedAt: 'desc' },
+            ],
         });
     }
 

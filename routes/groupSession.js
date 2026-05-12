@@ -18,6 +18,10 @@ const createSchema = z.object({
     startTime:   z.string().regex(/^\d{2}:\d{2}$/),
     endTime:     z.string().regex(/^\d{2}:\d{2}$/),
     maxCapacity: z.coerce.number().int().positive(),
+    // Pre-enrol N patients at session-create time. Each id is bulk-joined
+    // by the service. Optional so the legacy "create empty session, patients
+    // join later" flow still works.
+    patientIds:  z.array(z.string().min(1)).optional(),
 });
 
 router.post('/', authorizeRoles('ADMIN', 'ADMIN_DOCTOR', 'THERAPIST'), async (req, res, next) => {

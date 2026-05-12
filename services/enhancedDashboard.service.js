@@ -99,11 +99,22 @@ export class EnhancedDashboardService {
       prisma.prescription.findMany({
         where: {
           patientId,
+          // "Active" = not discontinued, not yet past its expected end date.
+          //
+          // The legacy `totalQuantity > 0` gate was dropping every freshly-
+          // written prescription that hadn't had a manual quantity entered
+          // (the prescription form leaves it as the schema @default(0)) AND
+          // every prescription using the newer dispensedQty/consumedQty
+          // lifecycle (both also @default(0) pre-dispense). Quantity-
+          // remaining is a refill-warning concern handled by
+          // MedicationSupplyCard via the medicationLifecycle forecasts —
+          // not a gate on whether the patient should see the dose to log
+          // today.
           discontinuedAt: null,
-          // Remaining balance > 0 — kept on totalQuantity for back-compat
-          // with the legacy counter. dispensedQty/consumedQty are the new
-          // source of truth but totalQuantity tracks the same balance.
-          totalQuantity: { gt: 0 },
+          OR: [
+            { expectedEndDate: null },
+            { expectedEndDate: { gte: startOfToday() } },
+          ],
         },
         select: {
           id: true, medicationName: true, dosage: true, frequency: true,

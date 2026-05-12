@@ -11,6 +11,7 @@
     "seed:feature-registry": "node prisma/seed-feature-registry.js",
     "seed:superadmin": "node scripts/seed-superadmin.js",
     "seed:e2e": "node scripts/seed-e2e-users.js",
+    "seed:test": "node scripts/seedTestData.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
