@@ -295,6 +295,47 @@ import followUpTasksRoutes from './routes/followUpTasks.js';
 import { authMiddleware as followUpAuthMw } from './middleware/auth.js';
 app.use('/api/follow-up-tasks', followUpAuthMw, followUpTasksRoutes);
 
+
+// Patient History
+import patientHistoryRoutes from './routes/patientHistory.js';
+import { authMiddleware as patientHistAuthMw } from './middleware/auth.js';
+app.use('/api/patient-history', patientHistAuthMw, patientHistoryRoutes);
+
+// Care Gaps Dashboard
+import careGapsRoutes from './routes/careGaps.js';
+import { authMiddleware as careGapAuthMw } from './middleware/auth.js';
+app.use('/api/care-gaps', careGapAuthMw, careGapsRoutes);
+
+// Revenue Dashboard
+import revenueRoutes from './routes/revenue.js';
+import { authMiddleware as revenueAuthMw } from './middleware/auth.js';
+app.use('/api/revenue', revenueAuthMw, revenueRoutes);
+
+// Daily Tracking
+import dailyTrackingRoutes from './routes/dailyTracking.js';
+import { authMiddleware as dailyTrackAuthMw } from './middleware/auth.js';
+app.use('/api/daily-tracking', dailyTrackAuthMw, dailyTrackingRoutes);
+
+// Motivation
+import motivationRoutes from './routes/motivation.js';
+import { authMiddleware as motivationAuthMw } from './middleware/auth.js';
+app.use('/api/motivation', motivationAuthMw, motivationRoutes);
+
+// Therapy Sessions
+import therapySessionsRoutes from './routes/therapySessions.js';
+import { authMiddleware as therapySessionAuthMw } from './middleware/auth.js';
+app.use('/api/therapy-sessions', therapySessionAuthMw, therapySessionsRoutes);
+
+// Patients (admin view)
+import patientsRoutes from './routes/patients.js';
+import { authMiddleware as patientsAuthMw } from './middleware/auth.js';
+app.use('/api/patients-admin', patientsAuthMw, patientsRoutes);
+
+// Medication Adherence (uses reports route)
+// Health Reports
+import healthReportsRoutes from './routes/healthReports.js';
+import { authMiddleware as healthReportsAuthMw } from './middleware/auth.js';
+app.use('/api/health-reports', healthReportsAuthMw, healthReportsRoutes);
 // Workflow Automation Rules Engine (Feature 3). Branch-scoped no-code
 // automation; per-route role gating lives inside workflowRules.js.
 import workflowRulesRoutes from './routes/workflowRules.js';
@@ -386,3 +427,4 @@ httpServer.listen(PORT, async () => {
     logger.warn('[Redis] state check failed:', err.message);
   }
 });
+
