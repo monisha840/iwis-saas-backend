@@ -94,6 +94,11 @@ import painMapRoutes from './routes/painMap.js';
 // fallback (services/scheduler.service.js), so when Redis was up the
 // BullMQ scheduler ran without it. Both gaps fixed in this commit.
 import motivationRoutes from './routes/motivation.js';
+// Sheizen-inspired daily tracking — water / activity / measurements /
+// meal-photo / full-day-bonus. Patient-only logging endpoints + a doctor
+// summary for the PatientTimeline view. Auth + role are enforced per-route
+// inside the file; we just mount it here.
+import dailyTrackingRoutes from './routes/dailyTracking.js';
 
 import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from './config/swagger.js';
@@ -239,6 +244,10 @@ app.use('/api/visit-summary', visitSummaryRoutes);
 // :id/read). Auth is enforced inside the route file via authMiddleware +
 // roleMiddleware(['PATIENT']), so we don't add a layer here.
 app.use('/api/motivation', motivationRoutes);
+// Daily tracking — frontend dailyTracking.service.ts hits these directly.
+// The router existed but was never mounted, which caused HTML 404 responses
+// on every water/activity/meal-photo/measurement call.
+app.use('/api/daily-tracking', dailyTrackingRoutes);
 // Pain Map (clinician + patient self) — mounted at /api so it can serve both
 //   /api/patients/:patientId/pain-map  (clinician, scoped)
 //   /api/patient/pain/my-map           (patient, self-only)
@@ -351,6 +360,20 @@ app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
 app.get('/api/docs.json', (req, res) => {
     res.setHeader('Content-Type', 'application/json');
     res.send(swaggerSpec);
+});
+
+// JSON 404 catch-all — must be AFTER all routes, BEFORE error handlers.
+// Without this, Express's default handler returns an HTML body for any
+// unmatched path, which the frontend then renders as raw "<!DOCTYPE html>"
+// inside toast error popups. Returning JSON here keeps the error surface
+// consistent with what the rest of the API emits.
+app.use((req, res) => {
+  res.status(404).json({
+    error: {
+      code: 'NOT_FOUND',
+      message: `Cannot ${req.method} ${req.path}`,
+    },
+  });
 });
 
 // Sentry error handler — must be before the app error handler
