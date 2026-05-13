@@ -73,4 +73,20 @@ router.get('/:id/roster', async (req, res, next) => {
     } catch (err) { next(err); }
 });
 
+// Live attendance toggle — therapist marks an enrolled participant
+// present/absent during the session. participantId is the Appointment.id
+// (the join row); isPresent flips it into / out of the session's
+// attendedParticipantIds array. The complete() flow then uses that array
+// to set COMPLETED vs NO_SHOW per appointment.
+const attendanceSchema = z.object({
+    participantId: z.string().min(1),
+    isPresent:     z.boolean(),
+});
+router.patch('/:id/attendance', authorizeRoles('ADMIN', 'ADMIN_DOCTOR', 'THERAPIST'), async (req, res, next) => {
+    try {
+        const data = attendanceSchema.parse(req.body);
+        res.json(await GroupSessionService.setAttendance(req.params.id, data));
+    } catch (err) { next(err); }
+});
+
 export default router;

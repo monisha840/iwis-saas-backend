@@ -3020,6 +3020,12 @@ model GroupSession {
   endTime     String
   maxCapacity Int
   status      GroupSessionStatus @default(OPEN)
+  // Live attendance roll — stores the Appointment.id of each participant
+  // the therapist has marked present during the sitting. Default empty so
+  // patients arrive as ABSENT and have to be checked in. On complete() the
+  // backend uses this to flip only attended appointments to COMPLETED;
+  // absent ones become NO_SHOW.
+  attendedParticipantIds String[] @default([])
   createdAt   DateTime           @default(now())
   updatedAt   DateTime           @updatedAt
 

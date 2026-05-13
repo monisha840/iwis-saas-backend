@@ -108,8 +108,68 @@ export class GroupSessionService {
 
     static async complete(groupSessionId) {
         return prisma.$transaction(async (tx) => {
-            await tx.appointment.updateMany({ where: { groupSessionId }, data: { status: 'COMPLETED' } });
+            // Honour the live attendance roll: appointments the therapist
+            // tagged present become COMPLETED, the rest go to NO_SHOW. If
+            // the roll is empty (e.g. legacy session created before the
+            // attendance feature shipped) fall back to the original
+            // mark-everyone-completed behaviour so we don't blanket-NO_SHOW
+            // patients who actually attended pre-feature.
+            const session = await tx.groupSession.findUnique({
+                where: { id: groupSessionId },
+                select: { attendedParticipantIds: true },
+            });
+            const attended = session?.attendedParticipantIds ?? [];
+            if (attended.length === 0) {
+                await tx.appointment.updateMany({ where: { groupSessionId }, data: { status: 'COMPLETED' } });
+            } else {
+                await tx.appointment.updateMany({
+                    where: { groupSessionId, id: { in: attended } },
+                    data: { status: 'COMPLETED' },
+                });
+                await tx.appointment.updateMany({
+                    where: { groupSessionId, id: { notIn: attended } },
+                    data: { status: 'NO_SHOW' },
+                });
+            }
             return tx.groupSession.update({ where: { id: groupSessionId }, data: { status: 'COMPLETED' } });
+        });
+    }
+
+    /**
+     * Toggle a single participant's attendance during a live session.
+     * `participantId` is the Appointment.id (the join row). Idempotent —
+     * toggling on/off is safe even on rapid double-clicks because we
+     * de-dup with a Set before writing back.
+     */
+    static async setAttendance(groupSessionId, { participantId, isPresent }) {
+        const session = await prisma.groupSession.findUnique({
+            where: { id: groupSessionId },
+            select: { id: true, status: true, attendedParticipantIds: true },
+        });
+        if (!session) {
+            throw Object.assign(new Error('Session not found'), { status: 404 });
+        }
+        if (session.status === 'COMPLETED' || session.status === 'CANCELLED') {
+            throw Object.assign(new Error('Session is locked'), { status: 409 });
+        }
+        // Verify the appointment actually belongs to this session — prevents
+        // a malicious caller from grafting an unrelated id into the array.
+        const appt = await prisma.appointment.findFirst({
+            where: { id: participantId, groupSessionId },
+            select: { id: true },
+        });
+        if (!appt) {
+            throw Object.assign(new Error('Participant not enrolled in this session'), { status: 404 });
+        }
+
+        const next = new Set(session.attendedParticipantIds || []);
+        if (isPresent) next.add(participantId);
+        else next.delete(participantId);
+
+        return prisma.groupSession.update({
+            where: { id: groupSessionId },
+            data: { attendedParticipantIds: Array.from(next) },
+            select: { id: true, attendedParticipantIds: true },
         });
     }
 
