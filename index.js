@@ -98,6 +98,10 @@ import motivationRoutes from './routes/motivation.js';
 // Assessment / Plan). Separate from Appointment.sessionNotes (doctor
 // consult notes) — see routes/therapistNotes.js for the access model.
 import therapistNotesRoutes from './routes/therapistNotes.js';
+// Structured per-session therapy outcomes (pain / mobility scores).
+// Complements TherapistSessionNote with quantifiable fields the doctor
+// trends on the patient timeline.
+import therapyOutcomesRoutes from './routes/therapyOutcomes.js';
 // Sheizen-inspired daily tracking — water / activity / measurements /
 // meal-photo / full-day-bonus. Patient-only logging endpoints + a doctor
 // summary for the PatientTimeline view. Auth + role are enforced per-route
@@ -249,6 +253,7 @@ app.use('/api/visit-summary', visitSummaryRoutes);
 // roleMiddleware(['PATIENT']), so we don't add a layer here.
 app.use('/api/motivation', motivationRoutes);
 app.use('/api/therapist-notes', therapistNotesRoutes);
+app.use('/api/therapy-outcomes', therapyOutcomesRoutes);
 // Daily tracking — frontend dailyTracking.service.ts hits these directly.
 // The router existed but was never mounted, which caused HTML 404 responses
 // on every water/activity/meal-photo/measurement call.

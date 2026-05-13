@@ -435,6 +435,9 @@ model Therapist {
   // SOAP-format session notes authored by this therapist. See model
   // TherapistSessionNote below.
   sessionNotes        TherapistSessionNote[]
+  // Structured per-session outcome rows (pain / mobility / swelling /
+  // observations) authored by this therapist. See model TherapyOutcome.
+  therapyOutcomes     TherapyOutcome[]
 }
 
 model Pharmacist {
@@ -547,6 +550,9 @@ model Patient {
   homeTherapySessions HomeTherapySession[]
   // SOAP session notes authored about this patient by their therapist(s).
   therapistSessionNotes TherapistSessionNote[]
+  // Per-session therapy outcome scores (pain / mobility / swelling)
+  // authored by therapists working on this patient. See TherapyOutcome.
+  therapyOutcomes       TherapyOutcome[]
   // Structured allergy list — used by AyurvedicFood conflict-check
   // (Feature 1). Empty array by default; populated from onboarding form
   // or by a clinician during intake.
@@ -696,6 +702,10 @@ model Appointment {
   // can carry multiple notes when a single visit covers more than one
   // therapy modality.
   therapistSessionNotes TherapistSessionNote[]
+  // Structured per-session outcome rows (pain/mobility scores) tied to
+  // the appointment they were recorded on. Optional — outcomes can also
+  // exist without a linked appointment.
+  therapyOutcomes       TherapyOutcome[]
   // Branded PDF health reports + WhatsApp delivery (Feature 2)
   healthReports         HealthReport[]
 
@@ -2587,6 +2597,36 @@ model TherapistSessionNote {
   @@index([appointmentId])
   @@index([patientId, isVisibleToDoctor])
   @@index([therapistId, patientId])
+}
+
+// Structured per-session therapy outcomes — the therapist's
+// quantifiable counterpart to TherapistSessionNote (SOAP free text).
+// Doctors trend pain / mobility / swelling across sessions on the
+// patient timeline; therapists log one row per delivered sitting.
+//
+// All score fields are nullable so partial entries are valid (e.g.
+// the therapist captures pain + observation but no mobility test).
+model TherapyOutcome {
+  id                    String       @id @default(cuid())
+  therapistId           String
+  therapist             Therapist    @relation(fields: [therapistId], references: [id])
+  patientId             String
+  patient               Patient      @relation(fields: [patientId], references: [id])
+  appointmentId         String?
+  appointment           Appointment? @relation(fields: [appointmentId], references: [id])
+  sessionDate           DateTime     @db.Date
+  mobilityScore         Int?
+  painScore             Int?
+  swellingReduced       Boolean?
+  functionalImprovement String?
+  therapistObservation  String?
+  nextSessionGoal       String?
+  createdAt             DateTime     @default(now())
+  updatedAt             DateTime     @default(now()) @updatedAt
+
+  @@index([patientId, sessionDate])
+  @@index([therapistId])
+  @@index([appointmentId])
 }
 
 // ── Feature 39: Post-Visit Summary ──────────────────────────────────────────
