@@ -5,14 +5,23 @@ import { FollowUpService, FOLLOWUP_INTERVALS } from '../services/followUp.servic
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
 import { auditAction, auditDelete } from '../middleware/auditLog.js';
+import prisma from '../lib/prisma.js';
+import { notificationService } from '../services/notification.service.js';
+import { WhatsAppService } from '../services/whatsapp.service.js';
+import { VideoService } from '../services/video.service.js';
 
 // Valid transitions: from → allowed next statuses
 const VALID_STATUS_TRANSITIONS = {
   PENDING:                    ['CONFIRMED', 'CANCELLED', 'PENDING_DOCTOR_APPROVAL', 'PENDING_THERAPIST_APPROVAL'],
   PENDING_DOCTOR_APPROVAL:    ['ACCEPTED', 'CANCELLED', 'PENDING_THERAPIST_APPROVAL'],
   PENDING_THERAPIST_APPROVAL: ['ACCEPTED', 'CANCELLED', 'PENDING_DOCTOR_APPROVAL'],
-  CONFIRMED:                  ['COMPLETED', 'CANCELLED'],
-  ACCEPTED:                   ['COMPLETED', 'CANCELLED'],
+  // CONFIRMED / ACCEPTED → IN_PROGRESS lets the therapist's "Start
+  // Session" flow flip the appointment without going through the
+  // doctor-centric queue (QueueEntry has a required doctorId, so
+  // therapist-only appointments can't carry one).
+  CONFIRMED:                  ['IN_PROGRESS', 'COMPLETED', 'CANCELLED'],
+  ACCEPTED:                   ['IN_PROGRESS', 'COMPLETED', 'CANCELLED'],
+  IN_PROGRESS:                ['COMPLETED', 'CANCELLED'],
   SCHEDULED:                  ['CONFIRMED', 'CANCELLED'],
   COMPLETED:                  [],   // terminal
   CANCELLED:                  [],   // terminal
@@ -27,7 +36,7 @@ const appointmentSchema = z.object({
   doctorId: z.string().nullable().optional(),
   therapistId: z.string().nullable().optional(),
   date: z.string(),
-  status: z.enum(['PENDING', 'SCHEDULED', 'CONFIRMED', 'CANCELLED', 'COMPLETED', 'PENDING_THERAPIST_APPROVAL', 'PENDING_DOCTOR_APPROVAL', 'ACCEPTED']).optional(),
+  status: z.enum(['PENDING', 'SCHEDULED', 'CONFIRMED', 'CANCELLED', 'COMPLETED', 'PENDING_THERAPIST_APPROVAL', 'PENDING_DOCTOR_APPROVAL', 'ACCEPTED', 'IN_PROGRESS']).optional(),
   triageSessionId: z.string().optional(),
   consultationType: z.enum(['DOCTOR', 'THERAPIST', 'COMBINED']).optional(),
   consultationMode: z.enum(['OFFLINE', 'ONLINE']).optional(),
@@ -64,7 +73,7 @@ const followUpSchema = z.object({
 
 const updateAppointmentSchema = z.object({
   date: z.string().optional(),
-  status: z.enum(['PENDING', 'SCHEDULED', 'CONFIRMED', 'CANCELLED', 'COMPLETED', 'PENDING_THERAPIST_APPROVAL', 'PENDING_DOCTOR_APPROVAL', 'ACCEPTED']).optional(),
+  status: z.enum(['PENDING', 'SCHEDULED', 'CONFIRMED', 'CANCELLED', 'COMPLETED', 'PENDING_THERAPIST_APPROVAL', 'PENDING_DOCTOR_APPROVAL', 'ACCEPTED', 'IN_PROGRESS']).optional(),
   notes: z.string().optional(),
   doctorId: z.string().nullable().optional(),
   therapistId: z.string().nullable().optional(),
@@ -135,6 +144,203 @@ router.get('/', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR
  *       201: { description: Appointment created }
  *       400: { description: Validation error or slot unavailable }
  */
+// ── Walk-In Appointment Booking (admin front-desk flow) ─────────────────────
+//
+// POST /api/appointments/walk-in — ADMIN / ADMIN_DOCTOR books a CONFIRMED
+// appointment for a patient who arrived at the clinic. Bypasses the
+// PENDING → APPROVED workflow used by patient-initiated bookings.
+//
+// Key behaviours that differ from the standard POST /:
+//   - Status lands directly at CONFIRMED (not PENDING/PENDING_*_APPROVAL)
+//   - doctorApproved / therapistApproved pre-set to true (no notification fan-out
+//     to the clinician for approval — they get an in-app "booked for you" note)
+//   - isWalkIn flag persisted for later reporting
+//   - 409 with requiresOverride: true on conflict; client can resubmit with
+//     overrideReason to force-book (the override reason is captured in notes
+//     and the audit log)
+//   - Past-time bookings are allowed (walk-in IS "right now")
+
+const walkInSchema = z.object({
+    patientId: z.string().optional(),
+    guestPatientId: z.string().optional(),
+    doctorId: z.string().min(1),
+    therapistId: z.string().optional().nullable(),
+    consultationType: z.enum(['DOCTOR', 'THERAPIST', 'COMBINED']).default('DOCTOR'),
+    date: z.string().min(1),
+    time: z.string().regex(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/, 'Invalid time format HH:mm'),
+    notes: z.string().max(2000).optional(),
+    overrideReason: z.string().max(500).optional(),
+}).refine((d) => d.patientId || d.guestPatientId, {
+    message: 'patientId or guestPatientId is required',
+});
+
+router.post(
+    '/walk-in',
+    authMiddleware,
+    roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']),
+    validate({ body: walkInSchema }),
+    async (req, res, next) => {
+        try {
+            const {
+                patientId, guestPatientId, doctorId, therapistId,
+                consultationType, date, time, notes, overrideReason,
+            } = req.body;
+
+            const resolvedPatientId = patientId || guestPatientId;
+
+            // Build the appointment datetime from date + HH:mm.
+            const [hours, minutes] = time.split(':').map(Number);
+            const appointmentDate = new Date(date);
+            appointmentDate.setHours(hours, minutes, 0, 0);
+
+            // Conflict scan: any non-cancelled appointment within a ±15-minute
+            // window for the same doctor (or therapist if specified). We use
+            // the wider negative side (15 min before) because a 30-min slot
+            // overlapping the start of an existing 1-hr appt is a real clash.
+            const windowStart = new Date(appointmentDate.getTime() - 15 * 60 * 1000);
+            const windowEnd = new Date(appointmentDate.getTime() + 30 * 60 * 1000);
+            const conflict = await prisma.appointment.findFirst({
+                where: {
+                    OR: [
+                        { doctorId },
+                        ...(therapistId ? [{ therapistId }] : []),
+                    ],
+                    date: { gte: windowStart, lte: windowEnd },
+                    status: { notIn: ['CANCELLED', 'REJECTED'] },
+                },
+                select: { id: true, status: true, date: true },
+            });
+
+            if (conflict && !overrideReason) {
+                return res.status(409).json({
+                    error: 'This slot is already booked',
+                    conflictingAppointment: { id: conflict.id, status: conflict.status },
+                    requiresOverride: true,
+                });
+            }
+
+            // Branch resolution: prefer admin's branch; fall back to the
+            // patient's branch so out-of-branch admins booking on behalf of a
+            // patient still land in the right branch context.
+            let branchIdToUse = req.user.branchId;
+            if (!branchIdToUse) {
+                const patientRow = await prisma.patient.findUnique({
+                    where: { id: resolvedPatientId },
+                    select: { branchId: true },
+                });
+                branchIdToUse = patientRow?.branchId || null;
+            }
+            if (!branchIdToUse) {
+                return res.status(400).json({ error: 'No branch context available for this booking' });
+            }
+
+            const compiledNotes = overrideReason
+                ? `Walk-in booking. Override reason: ${overrideReason}`
+                : 'Walk-in booking by admin';
+
+            const appointment = await prisma.appointment.create({
+                data: {
+                    patientId: resolvedPatientId,
+                    doctorId,
+                    therapistId: therapistId || null,
+                    branchId: branchIdToUse,
+                    date: appointmentDate,
+                    status: 'CONFIRMED',
+                    consultationType,
+                    consultationMode: 'OFFLINE',
+                    isWalkIn: true,
+                    walkInNotes: notes || null,
+                    doctorApproved: true,
+                    therapistApproved: therapistId ? true : false,
+                    notes: compiledNotes,
+                },
+                include: {
+                    patient: {
+                        select: {
+                            id: true, fullName: true, phoneNumber: true,
+                            user: { select: { id: true, email: true } },
+                        },
+                    },
+                    doctor: { select: { id: true, userId: true, fullName: true } },
+                    therapist: { select: { id: true, userId: true, fullName: true } },
+                },
+            });
+
+            const patientName = appointment.patient?.fullName
+                || appointment.patient?.user?.email
+                || 'Walk-in patient';
+            const dateLabel = appointmentDate.toLocaleDateString('en-IN', {
+                day: 'numeric', month: 'short', year: 'numeric',
+            });
+
+            // In-app notification → assigned doctor (best-effort).
+            try {
+                if (appointment.doctor?.userId) {
+                    await notificationService.createNotification({
+                        userId: appointment.doctor.userId,
+                        type: 'CLINICAL',
+                        title: 'Walk-In Appointment Booked',
+                        message: `${patientName} has been booked as a walk-in for ${time} on ${dateLabel} by admin.`,
+                        priority: 'INFO',
+                        relatedId: appointment.id,
+                        data: { appointmentId: appointment.id, isWalkIn: true },
+                    });
+                }
+                if (therapistId && appointment.therapist?.userId) {
+                    await notificationService.createNotification({
+                        userId: appointment.therapist.userId,
+                        type: 'CLINICAL',
+                        title: 'Walk-In Appointment Booked',
+                        message: `${patientName} has been booked as a walk-in for ${time} on ${dateLabel} by admin.`,
+                        priority: 'INFO',
+                        relatedId: appointment.id,
+                        data: { appointmentId: appointment.id, isWalkIn: true },
+                    });
+                }
+            } catch (notifyErr) {
+                console.warn('[walk-in] clinician notification skipped:', notifyErr.message);
+            }
+
+            // WhatsApp confirmation to patient (best-effort).
+            try {
+                const phone = appointment.patient?.phoneNumber;
+                if (phone) {
+                    await WhatsAppService.sendText(
+                        phone,
+                        `Hello ${patientName}! Your appointment at Al-Shifa has been confirmed for ${dateLabel} at ${time}. Please arrive 10 minutes early. Thank you!`,
+                    );
+                }
+            } catch (smsErr) {
+                console.warn('[walk-in] WhatsApp confirmation skipped:', smsErr.message);
+            }
+
+            // Audit log — best-effort.
+            try {
+                await prisma.auditLog.create({
+                    data: {
+                        userId: req.user.id,
+                        action: 'WALK_IN_APPOINTMENT_CREATED',
+                        entityType: 'Appointment',
+                        entityId: appointment.id,
+                        newData: {
+                            patientId: resolvedPatientId,
+                            doctorId,
+                            therapistId: therapistId || null,
+                            date: appointmentDate.toISOString(),
+                            isWalkIn: true,
+                            overrideReason: overrideReason || null,
+                        },
+                    },
+                });
+            } catch (auditErr) {
+                console.warn('[walk-in] audit log skipped:', auditErr.message);
+            }
+
+            return res.status(201).json({ appointment });
+        } catch (err) { next(err); }
+    },
+);
+
 router.post('/', authMiddleware, roleMiddleware(['PATIENT', 'ADMIN', 'ADMIN_DOCTOR']), validate({ body: appointmentSchema }), auditAction('CREATE_APPOINTMENT', 'Appointment', () => null), async (req, res, next) => {
   try {
     // Strict control for PATIENT: ignore administrative fields
@@ -177,6 +383,21 @@ router.get('/available-staff', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_D
   }
 });
 
+// GET /api/appointments/:id — single appointment fetch used by the
+// Consultation Room (and any other surface that needs the full row).
+// Was missing despite AppointmentsController.getById existing in the
+// controllers file — that's why ConsultationRoom showed "Failed to
+// fetch appointment details". Same role allowlist as the PUT below.
+router.get('/:id', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST', 'PATIENT']), async (req, res, next) => {
+  try {
+    const appointment = await AppointmentService.getAppointmentById(req.params.id);
+    if (!appointment) return res.status(404).json({ error: 'Appointment not found' });
+    res.json(appointment);
+  } catch (err) {
+    next(err);
+  }
+});
+
 router.put('/:id', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST', 'PATIENT']), validate({ body: updateAppointmentSchema }), auditAction('UPDATE_APPOINTMENT', 'Appointment', (req) => req.params.id), async (req, res, next) => {
   try {
     // Validate status transition if a new status is provided
@@ -193,6 +414,14 @@ router.put('/:id', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOC
     }
     const appointment = await AppointmentService.updateAppointment(req.params.id, req.user, req.body);
     res.json(appointment);
+    // Feature 5 — fire-and-forget follow-up task when this update flipped
+    // the appointment to COMPLETED. Service inspects the patient's most
+    // recent PAIN vital and only creates a task if value > 7.
+    if (req.body.status === 'COMPLETED') {
+      import('../services/followUpTask.service.js').then(({ fireFollowUpFromAppointmentCompletion }) => {
+        fireFollowUpFromAppointmentCompletion(req.params.id);
+      }).catch(() => { /* swallow — never block appointment update */ });
+    }
   } catch (err) {
     next(err);
   }
@@ -320,5 +549,66 @@ router.put('/:id/follow-up', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOC
     next(err);
   }
 });
+
+router.get(
+  '/:id/video-session',
+  authMiddleware,
+  roleMiddleware(['DOCTOR', 'THERAPIST', 'PATIENT']),
+  async (req, res, next) => {
+    try {
+      const appointment = await AppointmentService.getAppointmentById(req.params.id);
+      if (!appointment) return res.status(404).json({ error: 'Appointment not found' });
+
+      const role = req.user.role;
+      const userId = req.user.id;
+      const isOwnDoctor    = role === 'DOCTOR'    && appointment.doctor?.userId    === userId;
+      const isOwnTherapist = role === 'THERAPIST' && appointment.therapist?.userId === userId;
+      const isOwnPatient   = role === 'PATIENT'   && appointment.patient?.userId   === userId;
+
+      if (!isOwnDoctor && !isOwnTherapist && !isOwnPatient) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+
+      if (appointment.consultationMode !== 'ONLINE') {
+        return res.status(400).json({ error: 'Appointment is not a video consultation' });
+      }
+      if (!appointment.dailyRoomName) {
+        return res.status(400).json({ error: 'Video room has not been provisioned for this appointment' });
+      }
+      if (!appointment.dailyRoomExpiry || appointment.dailyRoomExpiry <= new Date()) {
+        return res.status(400).json({ error: 'Video room has expired' });
+      }
+
+      const isDailyRoom = typeof appointment.dailyRoomUrl === 'string'
+        && appointment.dailyRoomUrl.includes('.daily.co/');
+
+      let meetingToken = null;
+      if (isDailyRoom) {
+        const userName = isOwnDoctor
+          ? (appointment.doctor?.fullName    || 'Doctor')
+          : isOwnTherapist
+            ? (appointment.therapist?.fullName || 'Therapist')
+            : (appointment.patient?.fullName   || 'Patient');
+
+        meetingToken = await VideoService.createMeetingToken({
+          roomName:  appointment.dailyRoomName,
+          userId,
+          userName,
+          isOwner:   isOwnDoctor || isOwnTherapist,
+          expiresAt: appointment.dailyRoomExpiry,
+        });
+      }
+
+      res.json({
+        url:          appointment.dailyRoomUrl,
+        roomName:     appointment.dailyRoomName,
+        expiresAt:    appointment.dailyRoomExpiry,
+        meetingToken,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 
 export default router;

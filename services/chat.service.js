@@ -56,6 +56,38 @@ export class ChatService {
         return false;
     }
 
+    /**
+     * Resolve the patient's "consultation doctor" — the most recent doctor
+     * attached to a CONFIRMED or COMPLETED appointment for this patient.
+     * Returns the Doctor row (with userId so we can hydrate the chat banner)
+     * or null when the patient has no consultation yet.
+     *
+     * Used as the single source of truth for patient ↔ doctor chat scoping
+     * (REST + WebSocket guards both call into this).
+     */
+    static async findPatientConsultationDoctor(patientId) {
+        const appt = await prisma.appointment.findFirst({
+            where: {
+                patientId,
+                status: { in: ['CONFIRMED', 'COMPLETED'] },
+                doctorId: { not: null },
+            },
+            orderBy: { date: 'desc' },
+            select: {
+                doctor: {
+                    select: {
+                        id: true,
+                        userId: true,
+                        fullName: true,
+                        specialization: true,
+                        profilePhoto: true,
+                    },
+                },
+            },
+        });
+        return appt?.doctor ?? null;
+    }
+
     static async getOrCreateConversation(patientId, targetId, clinicianType = 'DOCTOR') {
         const whereMap = {
             'DOCTOR': { patientId_doctorId: { patientId, doctorId: targetId } },

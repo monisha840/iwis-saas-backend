@@ -59,6 +59,24 @@ class SchedulerService {
         // with no reminderSentAt get one notification. Expiry (30 days) is read-time only.
         this.jobs.push(cron.schedule('45 * * * *',   this._safeJob('sendJourneyFeedbackReminders',  this.sendJourneyFeedbackReminders)));
         this.jobs.push(cron.schedule('0 7 * * *',    this._safeJob('runCareGapDetection',           this.runCareGapDetection)));
+        // No-improvement detection: 7 AM daily — flags patients whose pain has
+        // not eased AND mood has not improved over their last 7 daily check-ins,
+        // notifying both patient and assigned doctor (cooldown: 5 days).
+        this.jobs.push(cron.schedule('0 7 * * *',    this._safeJob('runNoImprovementCheck',         this.runNoImprovementCheck)));
+        // Photo reminders: 9 AM daily — nudges patients on active treatment
+        // journeys to upload a DURING photo for their current phase if none
+        // has been captured in the last 7 days. Cooldown: 3 days.
+        this.jobs.push(cron.schedule('0 9 * * *',    this._safeJob('runPhotoReminderCheck',         this.runPhotoReminderCheck)));
+        // Diet adherence sweep (Feature 5): 9:15 AM daily — scans active
+        // diet prescriptions and creates a MEDIUM-priority follow-up task
+        // for the assigned doctor when 7-day adherence drops below 60%.
+        // Idempotent on (DIET_ADHERENCE_LOW, prescriptionId) so re-runs are
+        // safe; offset 15 minutes to spread load away from other 9 AM jobs.
+        this.jobs.push(cron.schedule('15 9 * * *',   this._safeJob('runDietAdherenceCheck',         this.runDietAdherenceCheck)));
+        // Workflow automation engine (Feature 3): hourly sweep over every
+        // active branch-admin authored rule. Per-rule cooldowns prevent
+        // duplicate firings against the same patient.
+        this.jobs.push(cron.schedule('0 * * * *',    this._safeJob('runWorkflowEngine',             this.runWorkflowEngine)));
 
         // ── Gamification jobs ─────────────────────────────────────────────────
         this.jobs.push(cron.schedule('0 2 * * *',    this._safeJob('runGamificationRecalculation',  this.runGamificationRecalculation)));
@@ -66,6 +84,14 @@ class SchedulerService {
         this.jobs.push(cron.schedule('0 3 * * *',    this._safeJob('recalculateBranchCompetitions', this.recalculateBranchCompetitions)));
         this.jobs.push(cron.schedule('0 9 * * 1',    this._safeJob('sendWeeklyGamificationDigest',  this.sendWeeklyGamificationDigest)));
         this.jobs.push(cron.schedule('0 20 * * *',   this._safeJob('sendStreakAtRiskNotifications', this.sendStreakAtRiskNotifications)));
+
+        // ── Monday Motivation Card ────────────────────────────────────────────
+        // 10:00 IST every Monday — generate one personalized weekly tip per
+        // active patient and send a WhatsApp nudge.
+        this.jobs.push(cron.schedule('0 10 * * 1',   this._safeJob('generateDailyMotivationCards',  async () => {
+            const { MotivationService } = await import('./motivation.service.js');
+            return MotivationService.generateDailyCardsForAllPatients();
+        })));
 
         // Seed badge definitions on startup
         this.seedBadges();
@@ -933,6 +959,243 @@ class SchedulerService {
             logger.info(`[SchedulerService] Care gap detection: ${alerts} alerts sent`);
         } catch (error) {
             logger.error('[SchedulerService] Error in care gap detection:', error);
+        }
+    }
+
+    /**
+     * Daily 7 AM no-improvement check.
+     *
+     * For each patient who is "active" (CONFIRMED/COMPLETED appointment in the
+     * last 30 days), pull the last 7 DailyCheckIn rows and flag the patient
+     * when BOTH pain and mood show no improvement:
+     *   • Pain trend: every painLevel in the window is >= the oldest painLevel
+     *     (no reduction at all over 7 days).
+     *   • Mood trend: avg(latest 3) <= avg(first 3) on a 1–5 ordinal scale.
+     *
+     * When both trip, fan out a NO_IMPROVEMENT_ALERT to the patient and a
+     * HIGH-priority PATIENT_NO_IMPROVEMENT to the assigned doctor — but only
+     * if a similar alert hasn't been sent in the last 5 days (cooldown).
+     */
+    async runNoImprovementCheck() {
+        const MOOD_SCORES = { TERRIBLE: 1, LOW: 2, OKAY: 3, GOOD: 4, GREAT: 5 };
+        const SEVEN_DAYS_AGO  = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        const FIVE_DAYS_AGO   = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000);
+        const THIRTY_DAYS_AGO = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+        // Active patients: at least one CONFIRMED/COMPLETED appointment in the
+        // last 30 days. Distinct on patientId so we don't process the same
+        // patient once per appointment.
+        const activeAppts = await prisma.appointment.findMany({
+            where: {
+                status: { in: ['CONFIRMED', 'COMPLETED'] },
+                date:   { gte: THIRTY_DAYS_AGO },
+            },
+            select: { patientId: true, doctorId: true, date: true },
+            orderBy: { date: 'desc' },
+        });
+
+        // Map patientId → most recent doctorId seen (so we route the alert to
+        // the doctor who saw them most recently).
+        const doctorByPatient = new Map();
+        for (const a of activeAppts) {
+            if (!doctorByPatient.has(a.patientId) && a.doctorId) {
+                doctorByPatient.set(a.patientId, a.doctorId);
+            }
+        }
+        const patientIds = Array.from(doctorByPatient.keys());
+
+        let flagged = 0;
+        for (const patientId of patientIds) {
+            try {
+                const checkIns = await prisma.dailyCheckIn.findMany({
+                    where: { patientId, createdAt: { gte: SEVEN_DAYS_AGO } },
+                    orderBy: { createdAt: 'asc' },
+                    select: { painLevel: true, mood: true, createdAt: true },
+                });
+                if (checkIns.length < 7) continue; // insufficient data
+
+                const initialPain = checkIns[0].painLevel;
+                const painNoImprovement = checkIns.every((c) => c.painLevel >= initialPain);
+
+                const moodScores = checkIns.map((c) => MOOD_SCORES[c.mood] ?? 3);
+                const avg = (arr) => arr.reduce((s, n) => s + n, 0) / arr.length;
+                const moodNoImprovement =
+                    avg(moodScores.slice(-3)) <= avg(moodScores.slice(0, 3));
+
+                if (!painNoImprovement || !moodNoImprovement) continue;
+
+                // 5-day cooldown — don't spam if we already alerted this week.
+                const patient = await prisma.patient.findUnique({
+                    where: { id: patientId },
+                    select: { userId: true, fullName: true },
+                });
+                if (!patient?.userId) continue;
+
+                const recentAlert = await prisma.notification.findFirst({
+                    where: {
+                        userId: patient.userId,
+                        type: 'NO_IMPROVEMENT_ALERT',
+                        createdAt: { gte: FIVE_DAYS_AGO },
+                    },
+                    select: { id: true },
+                });
+                if (recentAlert) continue;
+
+                // Resolve the assigned doctor's user id (notifications key on
+                // User.id, not Doctor.id).
+                const doctorProfileId = doctorByPatient.get(patientId);
+                const doctor = doctorProfileId
+                    ? await prisma.doctor.findUnique({
+                        where: { id: doctorProfileId },
+                        select: { userId: true, fullName: true },
+                    })
+                    : null;
+
+                // Patient notification.
+                await notificationService.createNotification({
+                    userId: patient.userId,
+                    type: 'NO_IMPROVEMENT_ALERT',
+                    title: 'Your health check-in needs attention',
+                    message: "We've noticed your pain levels and wellness haven't improved over the past week. Your doctor has been notified and may reach out soon.",
+                    priority: 'MEDIUM',
+                    data: { source: 'noImprovementCheck' },
+                    relatedId: patientId,
+                });
+
+                // Doctor notification.
+                if (doctor?.userId) {
+                    await notificationService.createNotification({
+                        userId: doctor.userId,
+                        type: 'PATIENT_NO_IMPROVEMENT',
+                        title: 'Patient showing no improvement',
+                        message: `${patient.fullName || 'A patient'} has shown no improvement in pain or wellness over the past 7 days. Consider scheduling a follow-up.`,
+                        priority: 'HIGH',
+                        data: { patientId },
+                        relatedId: patientId,
+                    });
+                }
+
+                flagged++;
+            } catch (err) {
+                logger.warn('[SchedulerService] no-improvement scan failed for one patient', {
+                    patientId, err: err.message,
+                });
+            }
+        }
+        logger.info('[SchedulerService] no-improvement check complete', {
+            scanned: patientIds.length, flagged,
+        });
+    }
+
+    /**
+     * Daily 9 AM photo-reminder sweep — for each patient with an ACTIVE
+     * treatment journey, nudge them to upload a DURING photo for the current
+     * ACTIVE phase if no photo has been captured in the last 7 days. Skips
+     * patients who got the same nudge in the last 3 days (cooldown).
+     */
+    async runPhotoReminderCheck() {
+        const SEVEN_DAYS_AGO  = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+        const THREE_DAYS_AGO  = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
+
+        const journeys = await prisma.treatmentJourney.findMany({
+            where: { status: 'ACTIVE' },
+            select: {
+                id: true,
+                patientId: true, // Note: TreatmentJourney.patientId is User.id (see schema)
+                phases: {
+                    where: { status: 'ACTIVE' },
+                    select: { id: true, name: true },
+                    take: 1,
+                },
+            },
+        });
+
+        let sent = 0;
+        for (const j of journeys) {
+            try {
+                const phase = j.phases[0];
+                if (!phase) continue;
+
+                // The patient's Patient.id is needed to query ClinicalPhoto
+                // (which keys on Patient.id, not User.id). Resolve it once.
+                const patient = await prisma.patient.findUnique({
+                    where: { userId: j.patientId },
+                    select: { id: true },
+                });
+                if (!patient) continue;
+
+                const recentPhoto = await prisma.clinicalPhoto.findFirst({
+                    where: {
+                        patientId: patient.id,
+                        phaseId: phase.id,
+                        stage: 'DURING',
+                        takenAt: { gte: SEVEN_DAYS_AGO },
+                    },
+                    select: { id: true },
+                });
+                if (recentPhoto) continue;
+
+                const recentReminder = await prisma.notification.findFirst({
+                    where: {
+                        userId: j.patientId,
+                        type: 'PHOTO_REMINDER',
+                        createdAt: { gte: THREE_DAYS_AGO },
+                    },
+                    select: { id: true },
+                });
+                if (recentReminder) continue;
+
+                await this._sendPhotoReminder(j.patientId, phase.name, j.id, phase.id);
+                sent++;
+            } catch (err) {
+                logger.warn('[SchedulerService] photo reminder failed for one journey', {
+                    journeyId: j.id, err: err.message,
+                });
+            }
+        }
+        logger.info('[SchedulerService] photo reminder sweep complete', { scanned: journeys.length, sent });
+    }
+
+    /** Shared helper — also called from JourneyService on phase activation
+     *  (no cooldown there: a fresh phase is the most clinically relevant
+     *  moment to capture a baseline photo). */
+
+    /**
+     * Daily diet adherence sweep (Feature 5). Delegates to
+     * followUpTask.service.runDietAdherenceCheck — kept as a thin shim so the
+     * cron registration in init() stays aligned with the other jobs.
+     */
+    async runDietAdherenceCheck() {
+        const { runDietAdherenceCheck } = await import('./followUpTask.service.js');
+        return runDietAdherenceCheck();
+    }
+
+    /**
+     * Workflow automation engine sweep (Feature 3). Delegates to
+     * workflowEngine.service.evaluateAllRules — same shim pattern as above.
+     */
+    async runWorkflowEngine() {
+        const { evaluateAllRules } = await import('./workflowEngine.service.js');
+        return evaluateAllRules();
+    }
+
+    async _sendPhotoReminder(userId, phaseName, journeyId, phaseId) {
+        await notificationService.createNotification({
+            userId,
+            type: 'PHOTO_REMINDER',
+            title: 'Time to capture your progress 📸',
+            message: `You're currently in phase "${phaseName}" of your treatment journey. Upload a photo today to track your visual progress. Your doctor reviews these to monitor your recovery.`,
+            priority: 'MEDIUM',
+            data: { journeyId, phaseId, phaseName },
+            relatedId: journeyId,
+        });
+        // Dedicated socket event so the wellness banner can appear without
+        // waiting for the notification list to refresh.
+        try {
+            const { emitToUser } = await import('../websocket/index.js');
+            emitToUser(userId, 'photo_reminder', { journeyId, phaseId, phaseName });
+        } catch (err) {
+            logger.warn('[SchedulerService] photo_reminder socket emit failed', { err: err.message });
         }
     }
 

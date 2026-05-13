@@ -102,6 +102,10 @@ export class JourneyService {
      * end-of-journey feedback invite is fanned out to the patient.
      */
     static async activateNextPhase(journeyId) {
+        // Capture the phase that just got marked COMPLETED so the post-tx
+        // hook below can fire the Feature 4 progress-report generator
+        // against it (we lose the closure once the tx returns).
+        let completedPhaseId = null;
         const result = await prisma.$transaction(async (tx) => {
             const phases = await tx.journeyPhase.findMany({
                 where: { journeyId },
@@ -114,6 +118,7 @@ export class JourneyService {
                     where: { id: currentActive.id },
                     data: { status: 'COMPLETED', completedAt: new Date() }
                 });
+                completedPhaseId = currentActive.id;
             }
 
             const nextPhase = phases.find(p => p.status === 'UPCOMING');
@@ -139,9 +144,78 @@ export class JourneyService {
             await this._onJourneyCompleted(journeyId).catch((err) => {
                 logger.error('[Journey] _onJourneyCompleted hook failed', { journeyId, err: err.message });
             });
+        } else if (result.nextPhase) {
+            // Fresh phase activation = clinically the best moment to capture a
+            // baseline photo. Skip the 3-day cooldown the daily sweep applies.
+            this._onPhaseActivated(journeyId, result.nextPhase).catch((err) => {
+                logger.warn('[Journey] _onPhaseActivated hook failed', { journeyId, err: err.message });
+            });
+            // Feature 5 — auto-create a LOW-priority "check phase progress in
+            // 7 days" follow-up task for the assigned doctor. Strictly fire-
+            // and-forget; idempotency lives inside the service.
+            import('./followUpTask.service.js').then(({ fireFollowUpFromPhaseActivation }) => {
+                fireFollowUpFromPhaseActivation(journeyId, result.nextPhase);
+            }).catch((err) => {
+                logger.warn('[Journey] fireFollowUpFromPhaseActivation import failed', { journeyId, err: err.message });
+            });
+        }
+
+        // Feature 4 — auto-generate the end-of-phase progress report. Strictly
+        // fire-and-forget (no await) so the API caller is never blocked by
+        // PDF generation, WhatsApp, or notification fan-out. Errors only land
+        // in the log.
+        if (completedPhaseId) {
+            this._fireProgressReport(journeyId, completedPhaseId).catch((err) => {
+                logger.warn('[Journey] _fireProgressReport hook failed', { journeyId, completedPhaseId, err: err.message });
+            });
         }
 
         return result.nextPhase;
+    }
+
+    /**
+     * Feature 4 hook — invoke the progress-report generator with the
+     * patient/doctor pair derived from the journey row. Lazy-imported so we
+     * don't pull pdfkit + WhatsApp into every journey-service caller.
+     *
+     * journey.patientId and journey.doctorId both store **User.id** (per the
+     * schema relation). We translate the patient User.id → Patient.id (the
+     * progress generator expects Patient.id) and the doctor User.id → Doctor.id.
+     */
+    static async _fireProgressReport(journeyId, phaseId) {
+        const journey = await prisma.treatmentJourney.findUnique({
+            where: { id: journeyId },
+            select: { patientId: true, doctorId: true },
+        });
+        if (!journey?.patientId || !journey?.doctorId) {
+            logger.warn('[Journey] progress report skipped — missing patientId/doctorId', { journeyId });
+            return;
+        }
+
+        const [patient, doctor] = await Promise.all([
+            prisma.patient.findUnique({ where: { userId: journey.patientId }, select: { id: true } }),
+            prisma.doctor.findUnique({ where: { userId: journey.doctorId },  select: { id: true } }),
+        ]);
+        if (!patient?.id || !doctor?.id) {
+            logger.warn('[Journey] progress report skipped — missing Patient/Doctor row', {
+                journeyId, hasPatient: !!patient?.id, hasDoctor: !!doctor?.id,
+            });
+            return;
+        }
+
+        const { createAndDeliverProgressReport } = await import('./healthReport.service.js');
+        await createAndDeliverProgressReport(phaseId, patient.id, doctor.id);
+    }
+
+    /** Photo-reminder fan-out on phase activation — best-effort. */
+    static async _onPhaseActivated(journeyId, phase) {
+        const journey = await prisma.treatmentJourney.findUnique({
+            where: { id: journeyId },
+            select: { patientId: true }, // User.id of the patient
+        });
+        if (!journey?.patientId) return;
+        const { schedulerService } = await import('./scheduler.service.js');
+        await schedulerService._sendPhotoReminder(journey.patientId, phase.name, journeyId, phase.id);
     }
 
     /**
@@ -219,6 +293,26 @@ export class JourneyService {
             });
         } catch (err) {
             logger.warn('[Journey] journey_feedback_request emit failed', { journeyId, err: err.message });
+        }
+
+        // 3) Patient History & Health Passport — write the immutable snapshot.
+        //    Strictly fire-and-forget so a snapshot failure (e.g. missing Doctor
+        //    profile, supabase outage during PDF write) never blocks the
+        //    journey-completion side effects above. createHistoryRecord is
+        //    idempotent on the journeyId @unique constraint.
+        try {
+            const { createHistoryRecord } = await import('./patientHistory.service.js');
+            createHistoryRecord(journeyId)
+                .then((result) => {
+                    if (!result.alreadyExisted) {
+                        logger.info('[PatientHistory] Record created', { journeyId, recordId: result.record.id });
+                    }
+                })
+                .catch((err) => {
+                    logger.error('[PatientHistory] Record creation failed', { journeyId, err: err.message });
+                });
+        } catch (err) {
+            logger.error('[PatientHistory] Hook import failed', { journeyId, err: err.message });
         }
     }
 
@@ -520,6 +614,34 @@ export class JourneyService {
                 doctor: true,
             },
             orderBy: { createdAt: 'desc' }
+        });
+    }
+
+    /**
+     * Get journeys owned by a clinician (TreatmentJourney.doctorId = User.id).
+     * Drives the "Existing Journeys" panel inside the Journey Builder page so
+     * a doctor can see what they've already built and progress phases without
+     * jumping into each patient's profile.
+     */
+    static async getDoctorJourneys(doctorUserId) {
+        return prisma.treatmentJourney.findMany({
+            where: { doctorId: doctorUserId },
+            include: {
+                phases: { orderBy: { order: 'asc' } },
+                patient: {
+                    select: {
+                        id: true,
+                        email: true,
+                        patient: { select: { id: true, fullName: true, patientId: true } },
+                    },
+                },
+            },
+            orderBy: [
+                // ACTIVE first, then COMPLETED, then PAUSED/DISCONTINUED — keeps the
+                // doctor's working list at the top.
+                { status: 'asc' },
+                { updatedAt: 'desc' },
+            ],
         });
     }
 

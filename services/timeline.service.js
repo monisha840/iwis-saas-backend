@@ -20,8 +20,8 @@ export class TimelineService {
 
         const hasDateFilter = Object.keys(dateFilter).length > 0;
 
-        // ── Parallel fetch of all five sources ────────────────────────────────
-        const [appointments, prescriptions, checkIns, documents, medLogs] = await Promise.all([
+        // ── Parallel fetch of all six sources ─────────────────────────────────
+        const [appointments, prescriptions, checkIns, documents, medLogs, healthReports] = await Promise.all([
 
             // 1. Appointments
             prisma.appointment.findMany({
@@ -79,6 +79,18 @@ export class TimelineService {
                     prescription: { select: { medicationName: true, dosage: true, frequency: true } },
                 },
                 orderBy: { date: 'desc' },
+            }),
+
+            // 6. Health reports (Feature 2) — branded PDF generations.
+            prisma.healthReport.findMany({
+                where: {
+                    patientId,
+                    ...(hasDateFilter ? { createdAt: dateFilter } : {}),
+                },
+                include: {
+                    doctor: { select: { fullName: true, specialization: true } },
+                },
+                orderBy: { createdAt: 'desc' },
             }),
         ]);
 
@@ -177,6 +189,20 @@ export class TimelineService {
                     takenAt: ml.takenAt,
                     notes:   ml.notes,
                     prescription: ml.prescription,
+                },
+            })),
+
+            ...healthReports.map(hr => ({
+                id:       hr.id,
+                type:     'HEALTH_REPORT',
+                date:     hr.createdAt,
+                title:    'Health Report Generated',
+                subtitle: hr.doctor?.fullName ? `by Dr. ${hr.doctor.fullName}` : 'by your care team',
+                status:   hr.sentViaWhatsApp ? 'SENT_VIA_WHATSAPP' : 'GENERATED',
+                meta: {
+                    reportId:        hr.id,
+                    sentViaWhatsApp: hr.sentViaWhatsApp,
+                    pdfSizeBytes:    hr.pdfSizeBytes,
                 },
             })),
         ];

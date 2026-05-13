@@ -43,6 +43,10 @@ export class ClinicianXPService {
         MENTOR_SESSION:        30,
         STREAK_BONUS:           0, // currentStreak * 2
         DIET_PACKAGE_APPROVED: 25, // suggested default; admin can override per-approval
+        // Awarded once per (doctor, patient, day) when a clinician spends
+        // ≥60s reviewing a patient record. Anti-spam: route enforces both
+        // the duration floor and the daily rate-limit (Redis key TTL 24h).
+        PATIENT_REVIEW:        15,
     };
 
     /**

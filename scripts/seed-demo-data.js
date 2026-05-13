@@ -68,22 +68,22 @@ const EXTRA_PATIENTS = [
   {
     email: 'priya@demo.com', password: 'Patient@123', role: 'PATIENT', profileType: 'patient',
     profile: { fullName: 'Priya Sundaram', gender: 'Female', age: 32, phoneNumber: '+91-9000000002',
-               therapyType: 'Occupational', patientId: 'PAT-0002', onboardingCompleted: true, zenPoints: 120 },
+               therapyTypes: ['Occupational'], patientId: 'PAT-0002', onboardingCompleted: true, zenPoints: 120 },
   },
   {
     email: 'hussain@demo.com', password: 'Patient@123', role: 'PATIENT', profileType: 'patient',
     profile: { fullName: 'Mohammed Hussain', gender: 'Male', age: 55, phoneNumber: '+91-9000000003',
-               therapyType: 'Physical', patientId: 'PAT-0003', onboardingCompleted: true, zenPoints: 80 },
+               therapyTypes: ['Physical'], patientId: 'PAT-0003', onboardingCompleted: true, zenPoints: 80 },
   },
   {
     email: 'lakshmi@demo.com', password: 'Patient@123', role: 'PATIENT', profileType: 'patient',
     profile: { fullName: 'Lakshmi Devi', gender: 'Female', age: 28, phoneNumber: '+91-9000000004',
-               therapyType: 'Speech', patientId: 'PAT-0004', onboardingCompleted: true, zenPoints: 200 },
+               therapyTypes: ['Speech'], patientId: 'PAT-0004', onboardingCompleted: true, zenPoints: 200 },
   },
   {
     email: 'rajan@demo.com', password: 'Patient@123', role: 'PATIENT', profileType: 'patient',
     profile: { fullName: 'Rajan Kumar', gender: 'Male', age: 65, phoneNumber: '+91-9000000005',
-               therapyType: 'Physical', patientId: 'PAT-0005', onboardingCompleted: true, zenPoints: 50 },
+               therapyTypes: ['Physical'], patientId: 'PAT-0005', onboardingCompleted: true, zenPoints: 50 },
   },
 ];
 

@@ -19,6 +19,36 @@ const TARGETABLE_ROLES = [
   'DOCTOR', 'THERAPIST', 'PHARMACIST', 'PATIENT',
 ];
 
+// Accept the same DD/MM/YYYY shape the platform's DateInput emits, plus
+// YYYY-MM-DD and full ISO. We normalise to ISO before the service writes it
+// — Zod's strict `.datetime()` was the reason the form failed with
+// "Invalid datetime" when an admin typed a plain date.
+const expiresAtSchema = z.string().trim().optional().nullable().transform((val, ctx) => {
+  if (val === undefined || val === null || val === '') return null;
+  if (val.includes('T')) {
+    const d = new Date(val);
+    if (Number.isNaN(d.getTime())) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Invalid expiry date' });
+      return z.NEVER;
+    }
+    return d.toISOString();
+  }
+  if (/^\d{2}\/\d{2}\/\d{4}$/.test(val)) {
+    const [dd, mm, yyyy] = val.split('/');
+    const d = new Date(`${yyyy}-${mm}-${dd}T23:59:59.000Z`);
+    if (Number.isNaN(d.getTime())) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Invalid expiry date' });
+      return z.NEVER;
+    }
+    return d.toISOString();
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(val)) {
+    return new Date(`${val}T23:59:59.000Z`).toISOString();
+  }
+  ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Use DD/MM/YYYY for expiry date' });
+  return z.NEVER;
+});
+
 const createAnnouncementSchema = z.object({
   title:       z.string().trim().min(2).max(150),
   message:     z.string().trim().min(2).max(4000),
@@ -26,7 +56,7 @@ const createAnnouncementSchema = z.object({
   branchIds:   z.array(z.string().min(1)).max(100).optional(),
   targetRoles: z.array(z.enum(TARGETABLE_ROLES)).max(10).optional(),
   isPinned:    z.boolean().optional(),
-  expiresAt:   z.string().datetime().optional().nullable(),
+  expiresAt:   expiresAtSchema,
 });
 
 const updateAnnouncementSchema = createAnnouncementSchema.partial();

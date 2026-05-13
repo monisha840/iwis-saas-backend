@@ -62,6 +62,24 @@ export class WellnessService {
         return streak;
     }
 
+    /**
+     * Today's DailyCheckIn for the patient — used by the dashboard popup to
+     * decide whether to prompt the patient for their daily mood/sleep input.
+     * Returns hasSubmittedToday=false when the patient has no profile (the
+     * popup just hides itself in that case rather than 404'ing the UI).
+     */
+    static async getTodayCheckIn(userId) {
+        const patient = await prisma.patient.findUnique({ where: { userId } });
+        if (!patient) return { hasSubmittedToday: false, checkIn: null };
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const checkIn = await prisma.dailyCheckIn.findFirst({
+            where: { patientId: patient.id, createdAt: { gte: today } },
+            orderBy: { createdAt: 'desc' },
+        });
+        return { hasSubmittedToday: !!checkIn, checkIn };
+    }
+
     static async submitCheckIn(userId, data) {
         const patient = await prisma.patient.findUnique({ where: { userId } });
         if (!patient) throw new Error('Patient profile not found. Please complete onboarding.');

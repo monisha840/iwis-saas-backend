@@ -1,7 +1,7 @@
 import express from 'express';
 import { z } from 'zod';
 import { ChatService } from '../services/chat.service.js';
-import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
+import { authMiddleware, roleMiddleware, resolvePatientId } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
 import prisma from '../lib/prisma.js';
 
@@ -98,6 +98,31 @@ router.post('/conversation', validate({ body: conversationSchema }), enforcePati
     try {
         const { patientId, doctorId, therapistId, pharmacistId } = req.body;
 
+        // Patient-side scope: a patient can ONLY open a conversation with their
+        // assigned consultation doctor. Therapist/pharmacist chats from the
+        // patient side are no longer permitted (admin-driven only).
+        if (req.user.role === 'PATIENT') {
+            if (!doctorId || therapistId || pharmacistId) {
+                return res.status(403).json({
+                    error: 'You can only chat with your assigned consultation doctor',
+                });
+            }
+            const patient = await prisma.patient.findUnique({
+                where: { userId: req.user.id },
+                select: { id: true },
+            });
+            if (!patient) return res.status(404).json({ error: 'Patient profile not found' });
+            const consultationDoctor = await ChatService.findPatientConsultationDoctor(patient.id);
+            if (!consultationDoctor || consultationDoctor.id !== doctorId) {
+                return res.status(403).json({
+                    error: 'You can only chat with your assigned consultation doctor',
+                });
+            }
+            // Body may have omitted patientId — resolve to caller's patient.
+            const conversation = await ChatService.getOrCreateConversation(patient.id, doctorId, 'DOCTOR');
+            return res.json(conversation);
+        }
+
         // Determine clinician type from whichever ID was provided
         let targetId, clinicianType;
         if (therapistId) {
@@ -123,6 +148,25 @@ router.post('/conversation', validate({ body: conversationSchema }), enforcePati
 });
 
 /**
+ * GET /api/chat/my-doctor — patient resolves their consultation doctor.
+ * Returns { doctor: { id, name, specialization, profilePhoto } } or { doctor: null }.
+ */
+router.get('/my-doctor', roleMiddleware(['PATIENT']), resolvePatientId, async (req, res, next) => {
+    try {
+        const doctor = await ChatService.findPatientConsultationDoctor(req.user.patientId);
+        if (!doctor) return res.json({ doctor: null });
+        res.json({
+            doctor: {
+                id: doctor.id,
+                name: doctor.fullName,
+                specialization: doctor.specialization,
+                profilePhoto: doctor.profilePhoto,
+            },
+        });
+    } catch (err) { next(err); }
+});
+
+/**
  * @swagger
  * /chat/conversations:
  *   get:
@@ -133,6 +177,37 @@ router.post('/conversation', validate({ body: conversationSchema }), enforcePati
  */
 router.get('/conversations', async (req, res, next) => {
     try {
+        // Patient-side override: patients only see the conversation with their
+        // assigned consultation doctor (no admin-doctor / therapist threads).
+        if (req.user.role === 'PATIENT') {
+            const patient = await prisma.patient.findUnique({
+                where: { userId: req.user.id },
+                select: { id: true },
+            });
+            if (!patient) return res.json([]);
+            const consultationDoctor = await ChatService.findPatientConsultationDoctor(patient.id);
+            if (!consultationDoctor) return res.json([]);
+
+            // Ensure the conversation row exists so the patient sees the thread
+            // even before either side has sent a message.
+            try {
+                await ChatService.getOrCreateConversation(patient.id, consultationDoctor.id, 'DOCTOR');
+            } catch { /* best-effort — surfaced via empty list if it fails */ }
+
+            const conversations = await prisma.conversation.findMany({
+                where: { patientId: patient.id, doctorId: consultationDoctor.id },
+                include: {
+                    patient:    { select: { fullName: true, userId: true } },
+                    doctor:     { select: { fullName: true, userId: true, profilePhoto: true } },
+                    therapist:  { select: { fullName: true, userId: true, profilePhoto: true } },
+                    pharmacist: { select: { fullName: true, userId: true, profilePhoto: true } },
+                    messages:   { orderBy: { createdAt: 'desc' }, take: 1 },
+                },
+                orderBy: { updatedAt: 'desc' },
+            });
+            return res.json(conversations);
+        }
+
         const conversations = await ChatService.listUserConversations(req.user.id);
         res.json(conversations);
     } catch (err) {

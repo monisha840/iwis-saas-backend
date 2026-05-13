@@ -36,18 +36,27 @@ export class PatientQueueController {
     } catch (err) { next(err); }
   }
 
-  /** GET /api/queue/live-board?branchId= */
+  /** GET /api/queue/live-board?branchId=  ('all' or empty → cross-branch for admin roles) */
   static async getLiveBoard(req, res, next) {
     try {
       const { branchId: branchIdParam, date } = req.query || {};
-      // BRANCH_ADMIN is fixed to their own branch regardless of query.
-      const branchId = req.user.role === 'BRANCH_ADMIN'
-        ? req.user.branchId
-        : (branchIdParam || req.user.branchId || null);
-      if (!branchId) {
+      // ADMIN / ADMIN_DOCTOR / SUPER_ADMIN may view every branch — used by
+      // the "All Branches" filter in the live-queue board.
+      const isCrossBranchAdmin = ['ADMIN', 'ADMIN_DOCTOR', 'SUPER_ADMIN'].includes(req.user.role);
+      const wantsAll = branchIdParam === 'all' || branchIdParam === '';
+      let branchId;
+      if (req.user.role === 'BRANCH_ADMIN') {
+        // BRANCH_ADMIN is always pinned to their own branch.
+        branchId = req.user.branchId;
+      } else if (isCrossBranchAdmin && (wantsAll || !branchIdParam)) {
+        branchId = null;
+      } else {
+        branchId = branchIdParam || req.user.branchId || null;
+      }
+      if (!branchId && !isCrossBranchAdmin) {
         return res.status(400).json({ error: 'branchId is required' });
       }
-      if (denyIf(!PatientQueueService.canAccessQueue(req.user, { branchId }), res)) return;
+      if (branchId && denyIf(!PatientQueueService.canAccessQueue(req.user, { branchId }), res)) return;
       const board = await PatientQueueService.getLiveBoard({
         branchId,
         date: date ? new Date(date) : new Date(),

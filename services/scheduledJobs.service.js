@@ -58,6 +58,19 @@ const JOB_DEFINITIONS = [
     // the current local time against each branch's tz (target 07:00) and
     // dedupes so each branch fires once per local day.
     { name: 'home-therapy-daily-brief', cron: '*/5 * * * *', handler: 'homeTherapyDailyBrief' },
+    // Workflow automation engine (Feature 3) — branch-admin authored rules.
+    // Runs hourly; per-rule cooldowns prevent the same patient from being
+    // messaged on consecutive sweeps. PHASE_COMPLETED triggers are skipped
+    // here (event-based, fired from the journey routes).
+    { name: 'workflow-engine-evaluation', cron: '0 * * * *', handler: 'workflowEngineEvaluation' },
+    // Monday Motivation Card — 10:00 IST every Monday. Generates one
+    // personalized weekly tip per active patient (using prakriti + Indian
+    // season) and dispatches a Monday Motivation WhatsApp message. The
+    // job was previously only registered in the node-cron fallback
+    // (services/scheduler.service.js), so when Redis was reachable and
+    // BullMQ took over, the cron never fired. Mirror it here so the
+    // weekly nudge runs under whichever scheduler is active.
+    { name: 'monday-motivation', cron: '0 10 * * 1', handler: 'mondayMotivation' },
 ];
 
 async function processJob(job) {
@@ -115,6 +128,14 @@ async function processJob(job) {
         homeTherapyDailyBrief: async () => {
             const mod = await import('../jobs/homeTherapyReminder.job.js');
             return mod.runHomeTherapyDailyBrief();
+        },
+        workflowEngineEvaluation: async () => {
+            const { evaluateAllRules } = await import('./workflowEngine.service.js');
+            return evaluateAllRules();
+        },
+        mondayMotivation: async () => {
+            const { MotivationService } = await import('./motivation.service.js');
+            return MotivationService.generateDailyCardsForAllPatients();
         },
     };
 

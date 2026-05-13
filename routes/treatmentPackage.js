@@ -74,15 +74,51 @@ router.put('/:id', authorizeRoles('ADMIN', 'ADMIN_DOCTOR'), async (req, res, nex
 
 router.delete('/:id', authorizeRoles('ADMIN', 'ADMIN_DOCTOR'), async (req, res, next) => {
     try {
-        await TreatmentPackageService.deactivate(req.params.id);
-        res.json({ success: true });
-    } catch (err) { next(err); }
+        const result = await TreatmentPackageService.deleteOrFail(req.params.id);
+        const message = result.mode === 'soft'
+            ? 'Package deactivated (kept on file because of past enrolments)'
+            : 'Package deleted';
+        res.json({ success: true, ...result, message });
+    } catch (err) {
+        // Conflict = active enrolments. Surface the human message and the
+        // structured code so the frontend can branch on it without parsing
+        // the message string.
+        if (err.status === 409) {
+            return res.status(409).json({ error: err.message, code: err.code });
+        }
+        next(err);
+    }
 });
 
 router.post('/:id/enrol', authorizeRoles('ADMIN', 'ADMIN_DOCTOR', 'DOCTOR'), async (req, res, next) => {
     try {
         const data = enrolSchema.parse(req.body);
         res.status(201).json(await TreatmentPackageService.enrolPatient({ packageId: req.params.id, ...data }));
+    } catch (err) { next(err); }
+});
+
+/**
+ * Therapist-side delivery view. Returns the caller-therapist's active
+ * package work — in-flight enrolments in their branch plus any
+ * enrolments they've already touched. Per-enrolment shape includes
+ * progress, package + patient info, and the therapist's own session
+ * logs. The page at /therapist/package-sessions consumes this directly.
+ */
+router.get('/therapist-sessions', authorizeRoles('THERAPIST'), async (req, res, next) => {
+    try {
+        const { default: prisma } = await import('../lib/prisma.js');
+        const therapist = await prisma.therapist.findUnique({
+            where: { userId: req.user.id },
+            select: { id: true, user: { select: { branchId: true } } },
+        });
+        if (!therapist) {
+            return res.json({ data: { enrolments: [] } });
+        }
+        const enrolments = await TreatmentPackageService.listForTherapist({
+            therapistId: therapist.id,
+            branchId: therapist.user?.branchId ?? null,
+        });
+        res.json({ data: { enrolments } });
     } catch (err) { next(err); }
 });
 

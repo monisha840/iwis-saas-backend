@@ -187,9 +187,12 @@ export class UserService {
 
     static async listDoctors(options = null) {
         // Supports legacy positional call listDoctors(branchId) and new object form
-        // listDoctors({ branchId, search, includeAvailability }).
+        // listDoctors({ branchId, search, excludeUserId, includeAvailability }).
         const branchId          = typeof options === 'string' ? options : (options?.branchId ?? null);
         const search            = typeof options === 'string' ? ''      : (options?.search   ?? '');
+        const excludeUserId     = typeof options === 'object' && options !== null
+            ? (options.excludeUserId ?? null)
+            : null;
         const includeAvailability = typeof options === 'object' && options !== null
             ? options.includeAvailability !== false
             : true;
@@ -198,10 +201,20 @@ export class UserService {
             // Both DOCTOR and ADMIN_DOCTOR get a Doctor profile at user-creation time
             // (see createUser), so we don't filter by role — ADMIN_DOCTOR doctors
             // need to be assignable as a regular doctor target.
-            const conditions = [{ user: { deletedAt: null } }];
-            if (branchId) conditions.push({ user: { branchId } });
-            if (search)   conditions.push({ fullName: { contains: search, mode: 'insensitive' } });
-            const where = conditions.length === 1 ? conditions[0] : { AND: conditions };
+            //
+            // Filters consolidated into a single `user` block (mirrors
+            // listPharmacists). The previous AND-of-multiple-`user`-objects shape
+            // produced inconsistent filtering on nested relations and was the
+            // suspected cause of the "Assign Patients dropdown only shows self"
+            // bug for admin doctors.
+            const where = {
+                user: {
+                    deletedAt: null,
+                    ...(branchId ? { branchId } : {}),
+                    ...(excludeUserId ? { id: { not: excludeUserId } } : {}),
+                },
+                ...(search ? { fullName: { contains: search, mode: 'insensitive' } } : {}),
+            };
 
             const doctors = await prisma.doctor.findMany({
                 where,
@@ -335,7 +348,6 @@ export class UserService {
             // the user.deletedAt filter and the optional branchId filter. Without explicit
             // AND, a root-level OR could shadow the sibling filter keys in some Prisma versions.
             const conditions = [{ user: { deletedAt: null } }];
-            if (branchId) conditions.push({ OR: [{ branchId }, { branchId: null }] });
             if (search) {
                 conditions.push({
                     OR: [
@@ -345,19 +357,42 @@ export class UserService {
                     ],
                 });
             }
-            // Restrict to patients with an active or completed appointment under
-            // the calling clinician — same definition the chat & assignment
-            // checks use, so visibility stays consistent across the app.
+            // Restrict to patients assigned to the calling clinician. We check
+            // BOTH sources of truth and OR them together so a patient appears
+            // for the doctor regardless of whether the relationship was
+            // established via an explicit assignment (the canonical
+            // PatientAssignment row created when an admin assigns a doctor or
+            // when a freshly created doctor receives initial patients) or via
+            // a confirmed/completed appointment (legacy data path before the
+            // assignment table existed). Without the PatientAssignment branch
+            // a newly-created doctor whose patients were assigned via the
+            // admin UI but who hasn't booked any appointments yet would see
+            // an empty list on the prescription page.
             const ASSIGNED_STATUSES = ['CONFIRMED', 'COMPLETED', 'ASSIGNED'];
+            const hasAssignmentFilter = !!(assignedDoctorId || assignedTherapistId);
             if (assignedDoctorId) {
                 conditions.push({
-                    appointments: { some: { doctorId: assignedDoctorId, status: { in: ASSIGNED_STATUSES } } },
+                    OR: [
+                        { patientAssignments: { some: { doctorId: assignedDoctorId, status: 'ACTIVE' } } },
+                        { appointments:       { some: { doctorId: assignedDoctorId, status: { in: ASSIGNED_STATUSES } } } },
+                    ],
                 });
             }
             if (assignedTherapistId) {
                 conditions.push({
                     appointments: { some: { therapistId: assignedTherapistId, status: { in: ASSIGNED_STATUSES } } },
                 });
+            }
+            // Branch scoping applies ONLY when the caller hasn't pre-filtered to
+            // their own assignments. An explicit PatientAssignment is a stronger
+            // scope than branch — admins legitimately assign cross-branch coverage
+            // (relocating patient, covering clinician, specialist consult), and
+            // without this carve-out a doctor at Branch A literally cannot see a
+            // patient at Branch B even after the admin has formally linked them.
+            // For the unscoped browse case (e.g. ADMIN listing all patients at a
+            // branch), the filter still applies.
+            if (branchId && !hasAssignmentFilter) {
+                conditions.push({ OR: [{ branchId }, { branchId: null }] });
             }
             const where = conditions.length === 1 ? conditions[0] : { AND: conditions };
 
@@ -373,7 +408,7 @@ export class UserService {
                 gender: pat.gender,
                 phoneNumber: pat.phoneNumber,
                 patientId: pat.patientId,
-                therapyType: pat.therapyType,
+                therapyTypes: pat.therapyTypes,
                 email: pat.user?.email,
                 branchId: pat.branchId,
                 branchName: pat.branch?.name,
@@ -437,7 +472,7 @@ export class UserService {
         const {
             fullName, phoneNumber, profilePhoto, clinic,
             bio, languages,
-            dob, gender: rawGender, therapyType,
+            dob, gender: rawGender, therapyTypes,
             addressLine1, addressLine2, city, state, pincode,
             primaryPhone, alternativePhone,
         } = data || {};
@@ -533,7 +568,10 @@ export class UserService {
                         ...(dobDate !== undefined && { dob: dobDate }),
                         ...(age !== undefined && { age }),
                         ...(gender !== undefined && { gender: gender || null }),
-                        ...(therapyType !== undefined && { therapyType: therapyType || null }),
+                        // String[] column: `undefined` skip, otherwise write
+                        // the array as-is (an empty array is a legitimate
+                        // "clear my preferences" signal from the profile page).
+                        ...(therapyTypes !== undefined && { therapyTypes: Array.isArray(therapyTypes) ? therapyTypes : [] }),
 
                         ...(addressLine1     !== undefined && { addressLine1:     emptyToNull(addressLine1) }),
                         ...(addressLine2     !== undefined && { addressLine2:     emptyToNull(addressLine2) }),
@@ -568,6 +606,13 @@ export class UserService {
             where: { id: patient.id },
             data: {
                 gender: data.gender || patient.gender,
+                // Persist the patient's preferred therapy types into the
+                // dedicated column (this is new — previously the onboarding
+                // payload was only stashed inside the onboardingData JSON
+                // blob and the column stayed null). `undefined`-skipped so
+                // a partial submission doesn't wipe a previously-saved set.
+                ...(Array.isArray(data.therapyTypes) && data.therapyTypes.length > 0
+                    && { therapyTypes: data.therapyTypes }),
                 onboardingCompleted: true,
                 onboardingData: data,
                 ...(isFirstCompletion && { zenPoints: { increment: 50 } }),
@@ -622,7 +667,7 @@ export class UserService {
                     email:        j.patient.user?.email,
                     phoneNumber:  j.patient.phoneNumber,
                     branchId:     j.patient.branchId ?? j.patient.user?.branchId ?? null,
-                    therapyType:  j.patient.therapyType,
+                    therapyTypes: j.patient.therapyTypes,
                     status:       j.status,
                     journeyType:  j.status,
                     completedSittings: j.completedSessions ?? 0,
@@ -639,7 +684,7 @@ export class UserService {
                     email:        a.patient.user?.email,
                     phoneNumber:  a.patient.phoneNumber,
                     branchId:     a.patient.branchId ?? a.patient.user?.branchId ?? null,
-                    therapyType:  a.patient.therapyType,
+                    therapyTypes: a.patient.therapyTypes,
                     // No journey → derive a synthetic status from the most
                     // recent appointment status so the UI can still bucket.
                     status:       a.status === 'COMPLETED' ? 'COMPLETED' : 'ACTIVE',
@@ -722,7 +767,7 @@ export class UserService {
     static async createUser(data) {
         const {
             email, password, role, fullName, branchId: inputBranchId,
-            phoneNumber, dob, gender: rawGender, therapyType,
+            phoneNumber, dob, gender: rawGender, therapyTypes,
             specialization, qualification, yearsExperience, clinic,
             registrationNumber,
             initialSkills,
@@ -785,7 +830,7 @@ export class UserService {
         }
         return prisma.$transaction(async (tx) => {
             const newUser = await tx.user.create({
-                data: { email, password: hashed, role, branchId, hospitalId },
+                data: { email, password: hashed, role, branchId, hospitalId, emailVerifiedAt: new Date() },
             });
 
             // Note: Doctor, Therapist, and Pharmacist schemas DO NOT include branchId.
@@ -875,7 +920,7 @@ export class UserService {
                         dob: dobDate,
                         age,
                         gender: gender || null,
-                        therapyType: therapyType || null,
+                        therapyTypes: Array.isArray(therapyTypes) ? therapyTypes : [],
                         patientId: resolvedPatientId,
                         // Medical history is stashed in the existing
                         // onboardingData JSON column so we don't need a
@@ -1284,3 +1329,4 @@ export class UserService {
         });
     }
 }
+

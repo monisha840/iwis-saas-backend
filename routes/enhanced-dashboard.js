@@ -21,7 +21,7 @@ router.use(resolvePatientId);
 // normalisation (`normalizePainRegions`) drops malformed entries silently;
 // the schema below is the explicit *allow-list* of accepted fields so
 // untrusted clients can't smuggle extra keys into the JSON column.
-const PAIN_CHARACTERS = ['Aching', 'Burning', 'Stabbing', 'Throbbing', 'Cramping', 'Numbness', 'Tingling'];
+const PAIN_CHARACTERS = ['Aching', 'Burning', 'Stabbing', 'Throbbing', 'Cramping', 'Numbness', 'Tingling', 'Swelling'];
 const painRegionSchema = z.object({
   regionId:    z.string().trim().min(1).max(64),
   regionLabel: z.string().trim().max(80).optional(),

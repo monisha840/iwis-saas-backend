@@ -18,6 +18,10 @@ const createSchema = z.object({
     startTime:   z.string().regex(/^\d{2}:\d{2}$/),
     endTime:     z.string().regex(/^\d{2}:\d{2}$/),
     maxCapacity: z.coerce.number().int().positive(),
+    // Pre-enrol N patients at session-create time. Each id is bulk-joined
+    // by the service. Optional so the legacy "create empty session, patients
+    // join later" flow still works.
+    patientIds:  z.array(z.string().min(1)).optional(),
 });
 
 router.post('/', authorizeRoles('ADMIN', 'ADMIN_DOCTOR', 'THERAPIST'), async (req, res, next) => {
@@ -66,6 +70,22 @@ router.get('/:id/roster', async (req, res, next) => {
         const r = await GroupSessionService.getRoster(req.params.id);
         if (!r) return res.status(404).json({ error: 'Not found' });
         res.json(r);
+    } catch (err) { next(err); }
+});
+
+// Live attendance toggle — therapist marks an enrolled participant
+// present/absent during the session. participantId is the Appointment.id
+// (the join row); isPresent flips it into / out of the session's
+// attendedParticipantIds array. The complete() flow then uses that array
+// to set COMPLETED vs NO_SHOW per appointment.
+const attendanceSchema = z.object({
+    participantId: z.string().min(1),
+    isPresent:     z.boolean(),
+});
+router.patch('/:id/attendance', authorizeRoles('ADMIN', 'ADMIN_DOCTOR', 'THERAPIST'), async (req, res, next) => {
+    try {
+        const data = attendanceSchema.parse(req.body);
+        res.json(await GroupSessionService.setAttendance(req.params.id, data));
     } catch (err) { next(err); }
 });
 

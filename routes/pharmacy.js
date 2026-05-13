@@ -7,6 +7,7 @@ import { MedicineImportService } from '../services/medicineImport.service.js';
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
 import { auditAction } from '../middleware/auditLog.js';
+import prisma from '../lib/prisma.js';
 
 const csvUpload = multer({
     dest: 'uploads/',
@@ -163,6 +164,33 @@ router.put('/medicines/:id', authMiddleware, roleMiddleware(['ADMIN', 'PHARMACIS
         const data = await PharmacyService.updateMedicine(req.params.id, req.body);
         res.json(data);
     } catch (err) {
+        next(err);
+    }
+});
+
+// Delete is admin-only and gated on active-prescription usage so we don't
+// orphan a medication a patient is mid-course on. Active = not discontinued.
+router.delete('/medicines/:id', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']), async (req, res, next) => {
+    try {
+        const { id } = req.params;
+        const activePrescriptions = await prisma.prescription.count({
+            where: { medicineId: id, discontinuedAt: null },
+        });
+        if (activePrescriptions > 0) {
+            return res.status(409).json({
+                error: {
+                    code: 'MEDICINE_IN_USE',
+                    message: 'Cannot delete: medicine has active prescriptions. Discontinue them or wait for the courses to end.',
+                },
+            });
+        }
+        await prisma.medicine.delete({ where: { id } });
+        res.json({ data: { message: 'Medicine deleted successfully' } });
+    } catch (err) {
+        // Prisma P2025 = record not found.
+        if (err?.code === 'P2025') {
+            return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Medicine not found' } });
+        }
         next(err);
     }
 });

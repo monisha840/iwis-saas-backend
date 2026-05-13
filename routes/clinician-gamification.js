@@ -36,18 +36,69 @@ router.get('/xp/leaderboard', authMiddleware, roleMiddleware([...ADMIN_ROLES, 'D
 
 // ── Seasonal Challenges ─────────────────────────────────────────────────────
 
+// Date inputs from the form arrive as DD/MM/YYYY (the platform-wide
+// DateInput component) or YYYY-MM-DD (native date input). Strict
+// `.datetime()` rejected both — admins were reporting "date cannot be
+// entered" because the frontend bailed before submit. We coerce whatever
+// the form sends into ISO inside Zod so the service layer keeps a clean
+// Date contract. Likewise the `target` (time-limit / quota) field arrives
+// as a string from numeric inputs — coerce + clamp here too.
+const dateLikeToISO = (assumeEndOfDay) =>
+    z.union([z.string(), z.date()]).transform((val, ctx) => {
+        if (val instanceof Date) {
+            if (Number.isNaN(val.getTime())) {
+                ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Invalid date' });
+                return z.NEVER;
+            }
+            return val.toISOString();
+        }
+        const trimmed = String(val).trim();
+        if (!trimmed) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Date is required' });
+            return z.NEVER;
+        }
+        if (trimmed.includes('T')) {
+            const d = new Date(trimmed);
+            if (Number.isNaN(d.getTime())) {
+                ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Invalid date' });
+                return z.NEVER;
+            }
+            return d.toISOString();
+        }
+        if (/^\d{2}\/\d{2}\/\d{4}$/.test(trimmed)) {
+            const [dd, mm, yyyy] = trimmed.split('/');
+            const time = assumeEndOfDay ? '23:59:59.000Z' : '00:00:00.000Z';
+            return new Date(`${yyyy}-${mm}-${dd}T${time}`).toISOString();
+        }
+        if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+            const time = assumeEndOfDay ? '23:59:59.000Z' : '00:00:00.000Z';
+            return new Date(`${trimmed}T${time}`).toISOString();
+        }
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Use DD/MM/YYYY' });
+        return z.NEVER;
+    });
+
+const numericFromForm = z.union([z.string(), z.number()]).transform((val, ctx) => {
+    const n = typeof val === 'number' ? val : parseFloat(String(val).trim());
+    if (!Number.isFinite(n)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Must be a number' });
+        return z.NEVER;
+    }
+    return n;
+});
+
 const createChallengeSchema = z.object({
     title: z.string().min(3).max(100),
     description: z.string().min(3).max(500),
     icon: z.string().max(50).optional(),
     metric: z.string().min(1).max(100),
-    target: z.number().positive(),
-    startDate: z.string().datetime(),
-    endDate: z.string().datetime(),
+    target: numericFromForm.pipe(z.number().positive()),
+    startDate: dateLikeToISO(false),
+    endDate: dateLikeToISO(true),
     scope: z.enum(['INDIVIDUAL', 'BRANCH', 'ALL']).optional(),
     targetRoles: z.array(z.enum(['DOCTOR', 'THERAPIST'])).optional(),
-    rewardXP: z.number().int().min(0).optional(),
-    rewardPoints: z.number().int().min(0).optional(),
+    rewardXP: numericFromForm.pipe(z.number().int().min(0)).optional(),
+    rewardPoints: numericFromForm.pipe(z.number().int().min(0)).optional(),
 });
 
 /** POST /api/clinician-gamification/seasonal-challenges — create challenge */
@@ -63,13 +114,28 @@ router.get('/seasonal-challenges/history', authMiddleware, roleMiddleware(ADMIN_
 
 // ── Reward Store ────────────────────────────────────────────────────────────
 
+// The form sent category as TitleCase ("Perk", "Leave"…) which the strict
+// `.enum(['PERK', …])` rejected — that was the root cause of the
+// "Failed to create reward" toast. Normalise to uppercase up front and
+// coerce numeric fields the same way we do for seasonal challenges.
+const REWARD_CATEGORIES = ['LEAVE', 'PERK', 'GIFT', 'TRAINING'];
 const createRewardSchema = z.object({
     name: z.string().min(2).max(100),
     description: z.string().min(2).max(500),
-    icon: z.string().max(50).optional(),
-    category: z.enum(['LEAVE', 'PERK', 'GIFT', 'TRAINING']),
-    pointsCost: z.number().int().positive(),
-    stock: z.number().int().min(0).nullable().optional(),
+    icon: z.string().max(50).optional().nullable(),
+    category: z.string().transform((val, ctx) => {
+        const upper = String(val || '').trim().toUpperCase();
+        if (!REWARD_CATEGORIES.includes(upper)) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: `Category must be one of ${REWARD_CATEGORIES.join(', ')}`,
+            });
+            return z.NEVER;
+        }
+        return upper;
+    }),
+    pointsCost: numericFromForm.pipe(z.number().int().positive()),
+    stock: numericFromForm.pipe(z.number().int().min(0)).nullable().optional(),
 });
 
 /** GET /api/clinician-gamification/rewards — available rewards */

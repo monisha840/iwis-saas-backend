@@ -136,12 +136,32 @@ export async function initializeWebSocket(httpServer) {
                             { pharmacist: { userId: socket.userId } },
                         ]
                     },
-                    select: { id: true }
+                    select: { id: true, patient: { select: { id: true } }, doctorId: true }
                 });
 
                 if (!isMember) {
                     socket.emit('error', { message: 'Unauthorized' });
                     return;
+                }
+
+                // Patient-side scope guard — the conversation must be with the
+                // patient's assigned consultation doctor. Re-checks every send so
+                // a stale conversation row (e.g. doctor reassigned mid-session)
+                // can't be used to bypass the scope.
+                if (socket.userRole === 'PATIENT' && isMember.patient) {
+                    const latestAppt = await prisma.appointment.findFirst({
+                        where: {
+                            patientId: isMember.patient.id,
+                            status: { in: ['CONFIRMED', 'COMPLETED'] },
+                            doctorId: { not: null },
+                        },
+                        orderBy: { date: 'desc' },
+                        select: { doctorId: true },
+                    });
+                    if (!latestAppt || latestAppt.doctorId !== isMember.doctorId) {
+                        socket.emit('error', { message: 'Unauthorized: not your consultation doctor' });
+                        return;
+                    }
                 }
 
                 // Persist message to DB
@@ -236,6 +256,20 @@ export async function initializeWebSocket(httpServer) {
                                 // Deliver immediately to recipient's personal room so the
                                 // NotificationContext socket listener picks it up in real-time
                                 io.to(`user:${userId}`).emit('notification', notification);
+
+                                // Patient → clinician chat: also emit a dedicated
+                                // 'new_chat_message_notification' so the doctor's
+                                // notification bell can surface a toast with a
+                                // direct "Open Chat" action.
+                                if (socket.userRole === 'PATIENT') {
+                                    io.to(`user:${userId}`).emit('new_chat_message_notification', {
+                                        senderId: socket.userId,
+                                        senderName,
+                                        preview,
+                                        conversationId,
+                                        timestamp: new Date(),
+                                    });
+                                }
                             } catch (perUserErr) {
                                 // Non-critical per-recipient failure — log and continue
                                 logger.warn('[WebSocket] message notification failed', {

@@ -87,6 +87,26 @@ import auditLogRoutes from './routes/audit-logs.js';
 import webhooksRoutes from './routes/webhooks.js';
 // Ayurvedic Voice Health Coach (AYURVEDIC_VOICE_COACH feature)
 import voiceCoachRoutes from './routes/voice-coach.js';
+import painMapRoutes from './routes/painMap.js';
+// Monday Motivation Card — daily Ayurvedic tip per patient, +5 Zen Points
+// on first read, optional save / share. Routes were authored but never
+// mounted in this file; the Monday cron lived only in the node-cron
+// fallback (services/scheduler.service.js), so when Redis was up the
+// BullMQ scheduler ran without it. Both gaps fixed in this commit.
+import motivationRoutes from './routes/motivation.js';
+// SOAP-format therapist session notes (Subjective / Objective /
+// Assessment / Plan). Separate from Appointment.sessionNotes (doctor
+// consult notes) — see routes/therapistNotes.js for the access model.
+import therapistNotesRoutes from './routes/therapistNotes.js';
+// Structured per-session therapy outcomes (pain / mobility scores).
+// Complements TherapistSessionNote with quantifiable fields the doctor
+// trends on the patient timeline.
+import therapyOutcomesRoutes from './routes/therapyOutcomes.js';
+// Sheizen-inspired daily tracking — water / activity / measurements /
+// meal-photo / full-day-bonus. Patient-only logging endpoints + a doctor
+// summary for the PatientTimeline view. Auth + role are enforced per-route
+// inside the file; we just mount it here.
+import dailyTrackingRoutes from './routes/dailyTracking.js';
 
 import swaggerUi from 'swagger-ui-express';
 import { swaggerSpec } from './config/swagger.js';
@@ -228,6 +248,20 @@ app.use('/api/queue', queueRoutes);
 // Consultation Room — single-shot patient history aggregate
 app.use('/api/patient', consultationContextRoutes);
 app.use('/api/visit-summary', visitSummaryRoutes);
+// Monday Motivation Card — patient-only endpoints (today / save / saved /
+// :id/read). Auth is enforced inside the route file via authMiddleware +
+// roleMiddleware(['PATIENT']), so we don't add a layer here.
+app.use('/api/motivation', motivationRoutes);
+app.use('/api/therapist-notes', therapistNotesRoutes);
+app.use('/api/therapy-outcomes', therapyOutcomesRoutes);
+// Daily tracking — frontend dailyTracking.service.ts hits these directly.
+// The router existed but was never mounted, which caused HTML 404 responses
+// on every water/activity/meal-photo/measurement call.
+app.use('/api/daily-tracking', dailyTrackingRoutes);
+// Pain Map (clinician + patient self) — mounted at /api so it can serve both
+//   /api/patients/:patientId/pain-map  (clinician, scoped)
+//   /api/patient/pain/my-map           (patient, self-only)
+app.use('/api', painMapRoutes);
 
 // IWIS competitor feature additions
 app.use('/api/therapy-rooms', therapyRoomRoutes);
@@ -258,6 +292,43 @@ app.use('/api/audit-logs', auditLogRoutes);
 
 // Ayurvedic Voice Health Coach — patient-facing 24/7 coach (feature-gated)
 app.use('/api/voice-coach', voiceCoachRoutes);
+
+// Voice-Note dictation helper — clinician-side dictation → OpenAI structuring
+// → 7 visit-summary fields auto-filled into the consultation form. No audio
+// leaves the browser; only the live STT transcript is sent to the backend.
+import voiceNoteRefineRoutes from './services/voiceNote/refine.route.js';
+import { authMiddleware as voiceNoteAuthMw, roleMiddleware as voiceNoteRoleMw } from './middleware/auth.js';
+app.use(
+  '/api/voice-note',
+  voiceNoteAuthMw,
+  voiceNoteRoleMw(['DOCTOR', 'ADMIN_DOCTOR']),
+  voiceNoteRefineRoutes,
+);
+
+// Ayurvedic Food Database + Recipe Library (Feature 1) — branch-scoped
+// catalogue + recipe library + DietMeal ↔ Food links. Per-route role
+// gating lives inside ayurvedicFood.js; only authMiddleware runs here.
+import ayurvedicFoodRoutes from './routes/ayurvedicFood.js';
+import { authMiddleware as ayurAuthMw } from './middleware/auth.js';
+app.use('/api/ayurvedic-foods', ayurAuthMw, ayurvedicFoodRoutes);
+
+// Branded PDF Health Report + WhatsApp delivery (Feature 2). Per-route
+// role gating lives inside healthReports.js; only authMiddleware runs here.
+import healthReportsRoutes from './routes/healthReports.js';
+import { authMiddleware as healthReportsAuthMw } from './middleware/auth.js';
+app.use('/api/health-reports', healthReportsAuthMw, healthReportsRoutes);
+
+// Auto-generated Follow-Up Tasks (Feature 5). Per-route role gating lives
+// inside followUpTasks.js; only authMiddleware runs here.
+import followUpTasksRoutes from './routes/followUpTasks.js';
+import { authMiddleware as followUpAuthMw } from './middleware/auth.js';
+app.use('/api/follow-up-tasks', followUpAuthMw, followUpTasksRoutes);
+
+// Workflow Automation Rules Engine (Feature 3). Branch-scoped no-code
+// automation; per-route role gating lives inside workflowRules.js.
+import workflowRulesRoutes from './routes/workflowRules.js';
+import { authMiddleware as workflowAuthMw } from './middleware/auth.js';
+app.use('/api/workflow-rules', workflowAuthMw, workflowRulesRoutes);
 
 // Inbound webhooks (Daily.co room-ended → auto-complete appointment, etc.)
 // Route uses express.raw() internally for HMAC verification — scoped local
@@ -299,6 +370,20 @@ app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
 app.get('/api/docs.json', (req, res) => {
     res.setHeader('Content-Type', 'application/json');
     res.send(swaggerSpec);
+});
+
+// JSON 404 catch-all — must be AFTER all routes, BEFORE error handlers.
+// Without this, Express's default handler returns an HTML body for any
+// unmatched path, which the frontend then renders as raw "<!DOCTYPE html>"
+// inside toast error popups. Returning JSON here keeps the error surface
+// consistent with what the rest of the API emits.
+app.use((req, res) => {
+  res.status(404).json({
+    error: {
+      code: 'NOT_FOUND',
+      message: `Cannot ${req.method} ${req.path}`,
+    },
+  });
 });
 
 // Sentry error handler — must be before the app error handler

@@ -26,10 +26,11 @@ function httpError(status, message) {
 }
 
 /**
- * Diet Packages — reusable templates with an approval workflow.
+ * Diet Packages — reusable templates.
  *
- *  - ADMIN / ADMIN_DOCTOR authors → status APPROVED immediately (approvers).
- *  - DOCTOR / THERAPIST authors    → status PENDING, needs admin approval.
+ *  - All authors (DOCTOR / THERAPIST / ADMIN_DOCTOR / ADMIN) auto-approve on
+ *    create. Admin approval was retired so doctors can publish + assign in
+ *    one step. Existing PENDING / REJECTED rows are preserved as-is.
  *  - Only APPROVED + isActive packages can be assigned to patients.
  *  - Assignment snapshots the package into a new DietPrescription so later
  *    edits on the template don't mutate active patient plans.
@@ -91,17 +92,20 @@ export const DietPackageService = {
             throw httpError(403, 'Only doctors, therapists, and admins can author diet packages');
         }
         const { meals = [], ...rest } = data;
-        const isAdminAuthor = APPROVER_ROLES.has(user.role);
         const now = new Date();
 
-        const pkg = await prisma.dietPackage.create({
+        // Direct-publish: the previous PENDING-then-admin-approves flow was
+        // retired. Every new package lands as APPROVED, attributed to the
+        // creator on the approval metadata too (so audit + UI continue to
+        // show "approved by" without an extra approver hop).
+        return prisma.dietPackage.create({
             data: {
                 ...rest,
                 hospitalId:   user.hospitalId ?? null,
                 createdById:  user.id,
-                status:       isAdminAuthor ? 'APPROVED' : 'PENDING',
-                approvedById: isAdminAuthor ? user.id : null,
-                approvedAt:   isAdminAuthor ? now : null,
+                status:       'APPROVED',
+                approvedById: user.id,
+                approvedAt:   now,
                 meals: {
                     create: meals.map((m) => ({
                         mealTime:     m.mealTime,
@@ -113,12 +117,6 @@ export const DietPackageService = {
             },
             include: { meals: true },
         });
-
-        // Only fan out to approvers when the package actually needs review.
-        if (!isAdminAuthor && user.hospitalId) {
-            await this.notifyApprovers(pkg, user).catch(() => {});
-        }
-        return pkg;
     },
 
     async update({ id, user, data }) {
@@ -126,9 +124,9 @@ export const DietPackageService = {
         if (!existing) throw httpError(404, 'Diet package not found');
 
         // Author-only: the creator can edit their own package.
-        //  - DOCTOR / THERAPIST edit  → status resets to PENDING for re-review.
-        //  - ADMIN_DOCTOR edit        → stays APPROVED, approval metadata refreshed.
-        //  - ARCHIVED packages are frozen.
+        // Direct-publish: edits stay APPROVED for every role (doctors no
+        // longer round-trip through PENDING). ARCHIVED packages remain
+        // frozen.
         const isOwner = existing.createdById === user.id;
         if (!isOwner || !CREATOR_ROLES.has(user.role)) {
             throw httpError(403, 'Only the package author can edit it');
@@ -138,27 +136,18 @@ export const DietPackageService = {
         }
 
         const { meals, ...rest } = data;
-        const isAdminAuthor = APPROVER_ROLES.has(user.role);
         const now = new Date();
 
         return prisma.$transaction(async (tx) => {
             await tx.dietPackage.update({
                 where: { id },
-                data: isAdminAuthor
-                    ? {
-                        ...rest,
-                        status:          'APPROVED',
-                        approvedById:    user.id,
-                        approvedAt:      now,
-                        rejectionReason: null,
-                    }
-                    : {
-                        ...rest,
-                        status:          'PENDING',
-                        approvedById:    null,
-                        approvedAt:      null,
-                        rejectionReason: null,
-                    },
+                data: {
+                    ...rest,
+                    status:          'APPROVED',
+                    approvedById:    user.id,
+                    approvedAt:      now,
+                    rejectionReason: null,
+                },
             });
 
             if (Array.isArray(meals)) {
@@ -174,13 +163,9 @@ export const DietPackageService = {
                 });
             }
 
-            const refreshed = await tx.dietPackage.findUnique({ where: { id }, include: { meals: true } });
-
-            // Re-notify approvers only when the edit re-enters the review queue.
-            if (!isAdminAuthor && user.hospitalId) {
-                this.notifyApprovers(refreshed, user).catch(() => {});
-            }
-            return refreshed;
+            // Direct-publish: edits no longer re-enter a review queue, so no
+            // approver fan-out here.
+            return tx.dietPackage.findUnique({ where: { id }, include: { meals: true } });
         });
     },
 

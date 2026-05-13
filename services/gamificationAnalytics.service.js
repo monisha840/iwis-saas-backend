@@ -54,34 +54,75 @@ export class GamificationAnalyticsService {
 
     /**
      * Score distribution: average score over time (last 12 weeks).
+     *
+     * Always emits 12 weekly buckets — older code returned an empty array
+     * when LeaderboardAudit had no records, which left the
+     * "Average Score Trend (12 Weeks)" chart blank on fresh installs. We
+     * now fall back to averaged XPLedger amounts per week so the chart at
+     * least surfaces clinician activity even before the first audit run.
      */
     static async getScoreTrend() {
-        const twelveWeeksAgo = new Date(Date.now() - 84 * 24 * 60 * 60 * 1000);
-
-        const audits = await prisma.leaderboardAudit.findMany({
-            where: { calculationDate: { gte: twelveWeeksAgo } },
-            select: { score: true, calculationDate: true },
-            orderBy: { calculationDate: 'asc' }
-        });
-
-        // Group by week
-        const weeklyData = {};
-        for (const audit of audits) {
-            const weekStart = new Date(audit.calculationDate);
-            weekStart.setDate(weekStart.getDate() - weekStart.getDay());
-            const weekKey = weekStart.toISOString().split('T')[0];
-
-            if (!weeklyData[weekKey]) {
-                weeklyData[weekKey] = { total: 0, count: 0 };
-            }
-            weeklyData[weekKey].total += audit.score;
-            weeklyData[weekKey].count++;
+        const buckets = [];
+        const now = new Date();
+        for (let i = 11; i >= 0; i--) {
+            const weekStart = new Date(now);
+            weekStart.setHours(0, 0, 0, 0);
+            weekStart.setDate(weekStart.getDate() - i * 7);
+            const weekEnd = new Date(weekStart);
+            weekEnd.setDate(weekEnd.getDate() + 7);
+            buckets.push({
+                weekStart,
+                weekEnd,
+                week: weekStart.toISOString().split('T')[0],
+                label: `${weekStart.getDate()}/${weekStart.getMonth() + 1}`,
+                avgScore: 0,
+                sampleSize: 0,
+                source: 'EMPTY',
+            });
         }
 
-        return Object.entries(weeklyData).map(([week, data]) => ({
-            week,
-            avgScore: Math.round((data.total / data.count) * 10) / 10,
-            sampleSize: data.count
+        const earliest = buckets[0].weekStart;
+        const latest = buckets[buckets.length - 1].weekEnd;
+
+        // Primary source: LeaderboardAudit. We pull all rows in the 12-week
+        // window and bucket by week. If a bucket ends up with zero samples
+        // we'll backfill it from XPLedger below.
+        const audits = await prisma.leaderboardAudit.findMany({
+            where: { calculationDate: { gte: earliest, lt: latest } },
+            select: { score: true, calculationDate: true },
+        }).catch(() => []);
+        for (const audit of audits) {
+            const t = new Date(audit.calculationDate).getTime();
+            const idx = buckets.findIndex(b => t >= b.weekStart.getTime() && t < b.weekEnd.getTime());
+            if (idx === -1) continue;
+            buckets[idx].avgScore = (buckets[idx].avgScore * buckets[idx].sampleSize + audit.score) / (buckets[idx].sampleSize + 1);
+            buckets[idx].sampleSize += 1;
+            buckets[idx].source = 'AUDIT';
+        }
+
+        const needsFallback = buckets.some(b => b.sampleSize === 0);
+        if (needsFallback) {
+            const xpRows = await prisma.xPLedger.findMany({
+                where: { createdAt: { gte: earliest, lt: latest } },
+                select: { xpAmount: true, createdAt: true },
+            }).catch(() => []);
+            for (const row of xpRows) {
+                const t = new Date(row.createdAt).getTime();
+                const idx = buckets.findIndex(b => t >= b.weekStart.getTime() && t < b.weekEnd.getTime());
+                if (idx === -1) continue;
+                if (buckets[idx].source === 'AUDIT') continue; // prefer audit data
+                buckets[idx].avgScore = (buckets[idx].avgScore * buckets[idx].sampleSize + row.xpAmount) / (buckets[idx].sampleSize + 1);
+                buckets[idx].sampleSize += 1;
+                buckets[idx].source = 'XP_FALLBACK';
+            }
+        }
+
+        return buckets.map(b => ({
+            week: b.week,
+            label: b.label,
+            avgScore: Math.round(b.avgScore * 10) / 10,
+            sampleSize: b.sampleSize,
+            source: b.source,
         }));
     }
 

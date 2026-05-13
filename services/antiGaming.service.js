@@ -160,6 +160,24 @@ export class AntiGamingService {
         STREAK_BONUS: { maxPerDay: 1, pointsPer: 50 },
         MILESTONE: { maxPerDay: 5, pointsPer: 100 },
         CHALLENGE: { maxPerDay: 3, pointsPer: 15 },
+        // Sheizen-inspired daily tracking. The route layer awards once per
+        // first water log of the day, once per measurement entry (capped 1/day),
+        // up to 3 activity sessions, and up to 3 meal photos. Activity points
+        // (5/10/20 by duration) are picked at award-time by passing the right
+        // action; we keep one ledger entry per session.
+        WATER_LOGGED:        { maxPerDay: 1, pointsPer: 5 },
+        ACTIVITY_LOGGED:     { maxPerDay: 3, pointsPer: 10 },
+        MEASUREMENTS_LOGGED: { maxPerDay: 1, pointsPer: 10 },
+        MEAL_PHOTO_LOGGED:   { maxPerDay: 3, pointsPer: 10 },
+        // Bonus awarded once per day when the patient submits a daily
+        // check-in AND logs water + activity + a meal photo all in the
+        // same calendar day. Verified server-side before the award call so
+        // a stale client can't claim it without the underlying records.
+        FULL_DAY_COMPLETE:   { maxPerDay: 1, pointsPer: 15 },
+        // Daily Ayurvedic Motivation Card — patient earns 5 Zen Points the
+        // first time they tap "Got it" on today's tip. Subsequent reads of
+        // the same card don't re-award.
+        MOTIVATION_READ:     { maxPerDay: 1, pointsPer: 5 },
     };
 
     /**
