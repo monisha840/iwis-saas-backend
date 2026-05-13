@@ -97,6 +97,31 @@ router.post('/:id/enrol', authorizeRoles('ADMIN', 'ADMIN_DOCTOR', 'DOCTOR'), asy
     } catch (err) { next(err); }
 });
 
+/**
+ * Therapist-side delivery view. Returns the caller-therapist's active
+ * package work — in-flight enrolments in their branch plus any
+ * enrolments they've already touched. Per-enrolment shape includes
+ * progress, package + patient info, and the therapist's own session
+ * logs. The page at /therapist/package-sessions consumes this directly.
+ */
+router.get('/therapist-sessions', authorizeRoles('THERAPIST'), async (req, res, next) => {
+    try {
+        const { default: prisma } = await import('../lib/prisma.js');
+        const therapist = await prisma.therapist.findUnique({
+            where: { userId: req.user.id },
+            select: { id: true, user: { select: { branchId: true } } },
+        });
+        if (!therapist) {
+            return res.json({ data: { enrolments: [] } });
+        }
+        const enrolments = await TreatmentPackageService.listForTherapist({
+            therapistId: therapist.id,
+            branchId: therapist.user?.branchId ?? null,
+        });
+        res.json({ data: { enrolments } });
+    } catch (err) { next(err); }
+});
+
 router.get('/enrolments', authorizeRoles('ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST', 'PATIENT'), async (req, res, next) => {
     try {
         if (!req.query.patientId) return res.status(400).json({ error: 'patientId is required' });

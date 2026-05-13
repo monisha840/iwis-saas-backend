@@ -159,6 +159,94 @@ export class TreatmentPackageService {
         });
     }
 
+    /**
+     * Therapist-side delivery view.
+     *
+     * The schema doesn't carry an `assignedTherapistId` on the enrolment —
+     * therapists are only tied to a package via PackageSessionLog after a
+     * session has been delivered. So "my package sessions" is composed of:
+     *
+     *   (a) every enrolment in the caller's branch that's still in flight
+     *       (status ACTIVE and sessionsRemaining > 0) — the therapist's
+     *       available work queue;
+     *   (b) every other enrolment where this therapist has logged at least
+     *       one PackageSessionLog — their own delivery history.
+     *
+     * Both sets are merged + de-duped on enrolment id. The caller gets
+     * patient + package + per-enrolment progress + this therapist's
+     * own session logs.
+     */
+    static async listForTherapist({ therapistId, branchId }) {
+        // (b) enrolments this therapist has actually worked on
+        const myLogs = await prisma.packageSessionLog.findMany({
+            where: { conductedById: therapistId },
+            select: { enrolmentId: true },
+            distinct: ['enrolmentId'],
+        });
+        const workedEnrolmentIds = myLogs.map((r) => r.enrolmentId);
+
+        // (a) in-flight enrolments in the same branch (workload queue) +
+        //     (b) any enrolment the therapist has already touched.
+        const where = {
+            OR: [
+                ...(branchId ? [{
+                    status: 'ACTIVE',
+                    patient: { branchId },
+                }] : []),
+                ...(workedEnrolmentIds.length > 0 ? [{ id: { in: workedEnrolmentIds } }] : []),
+            ],
+        };
+        // If neither clause applies (therapist has no branch + no logs),
+        // return empty rather than scan the whole table.
+        if (where.OR.length === 0) return [];
+
+        const enrolments = await prisma.packageEnrolment.findMany({
+            where,
+            include: {
+                package: { select: { id: true, name: true } },
+                patient: {
+                    select: {
+                        id: true, fullName: true, patientId: true,
+                        user: { select: { id: true } },
+                    },
+                },
+                sessionLogs: {
+                    where: { conductedById: therapistId },
+                    orderBy: { conductedAt: 'desc' },
+                    select: {
+                        id: true, sessionType: true, conductedAt: true,
+                        notes: true, appointmentId: true,
+                    },
+                },
+            },
+            orderBy: { startDate: 'desc' },
+        });
+
+        return enrolments.map((e) => ({
+            enrolmentId: e.id,
+            status: e.status,
+            startDate: e.startDate,
+            endDate: e.endDate,
+            sessionsTotal: e.sessionsTotal,
+            sessionsUsed: e.sessionsUsed,
+            sessionsRemaining: Math.max(0, e.sessionsTotal - e.sessionsUsed),
+            progressPct: e.sessionsTotal > 0
+                ? Math.round((e.sessionsUsed / e.sessionsTotal) * 100)
+                : 0,
+            packageName: e.package?.name ?? null,
+            packageId: e.package?.id ?? null,
+            patient: e.patient
+                ? {
+                    id: e.patient.id,
+                    fullName: e.patient.fullName,
+                    patientId: e.patient.patientId,
+                }
+                : null,
+            // Sessions this therapist has personally logged on this enrolment.
+            mySessions: e.sessionLogs,
+        }));
+    }
+
     static async getProgress(enrolmentId) {
         const enrolment = await prisma.packageEnrolment.findUnique({
             where: { id: enrolmentId },
