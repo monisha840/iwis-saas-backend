@@ -564,6 +564,12 @@ model Patient {
   // Workflow automation engine logs + cooldowns (Feature 3)
   workflowRuleLogs    WorkflowRuleLog[]
   workflowCooldowns   WorkflowCooldown[]
+  // Sheizen-inspired daily tracking — water, activity, body measurements,
+  // meal photos. Patient-only logging surfaces under /api/daily-tracking/*.
+  waterIntakeLogs     WaterIntakeLog[]
+  activityLogs        ActivityLog[]
+  bodyMeasurementLogs BodyMeasurementLog[]
+  mealPhotoLogs       MealPhotoLog[]
 
   @@index([branchId]) // branch-scoped patient queries (listPatients, triage dispatch)
 }
@@ -4294,4 +4300,70 @@ model WorkflowCooldown {
 
   @@unique([ruleId, patientId])
   @@index([ruleId])
+}
+
+// ── Daily tracking logs (Sheizen-inspired wellness surfaces) ───────────────
+// One row per patient action, mounted under /api/daily-tracking/*.
+// `date` is a midnight-stamped DateTime used for same-day filtering;
+// `loggedAt` is the precise timestamp shown in the UI.
+
+model WaterIntakeLog {
+  id        String   @id @default(uuid())
+  patientId String
+  amount    Int
+  loggedAt  DateTime
+  date      DateTime
+  createdAt DateTime @default(now())
+  patient   Patient  @relation(fields: [patientId], references: [id])
+
+  @@index([patientId, date])
+  @@index([patientId, loggedAt])
+}
+
+model ActivityLog {
+  id               String   @id @default(uuid())
+  patientId        String
+  activityType     String
+  durationMins     Int
+  notes            String?
+  loggedAt         DateTime
+  date             DateTime
+  zenPointsAwarded Int      @default(0)
+  createdAt        DateTime @default(now())
+  patient          Patient  @relation(fields: [patientId], references: [id])
+
+  @@index([patientId, date])
+  @@index([patientId, loggedAt])
+}
+
+model BodyMeasurementLog {
+  id        String   @id @default(uuid())
+  patientId String
+  arm       Float?
+  chest     Float?
+  waist     Float?
+  hip       Float?
+  thigh     Float?
+  weight    Float?
+  notes     String?
+  loggedAt  DateTime
+  createdAt DateTime @default(now())
+  patient   Patient  @relation(fields: [patientId], references: [id])
+
+  @@index([patientId, loggedAt])
+}
+
+model MealPhotoLog {
+  id        String   @id @default(uuid())
+  patientId String
+  mealType  String
+  photoPath String
+  photoUrl  String?
+  notes     String?
+  loggedAt  DateTime
+  date      DateTime
+  createdAt DateTime @default(now())
+  patient   Patient  @relation(fields: [patientId], references: [id])
+
+  @@index([patientId, date])
 }
