@@ -432,6 +432,9 @@ model Therapist {
   groupSessions       GroupSession[]
   packageSessionLogs  PackageSessionLog[]  @relation("PackageSessionConductor")
   homeTherapySessions HomeTherapySession[]
+  // SOAP-format session notes authored by this therapist. See model
+  // TherapistSessionNote below.
+  sessionNotes        TherapistSessionNote[]
 }
 
 model Pharmacist {
@@ -542,6 +545,8 @@ model Patient {
 
   homeTherapyRequests HomeTherapyRequest[]
   homeTherapySessions HomeTherapySession[]
+  // SOAP session notes authored about this patient by their therapist(s).
+  therapistSessionNotes TherapistSessionNote[]
   // Structured allergy list — used by AyurvedicFood conflict-check
   // (Feature 1). Empty array by default; populated from onboarding form
   // or by a clinician during intake.
@@ -687,6 +692,10 @@ model Appointment {
   // Optional 1:1 link to a HomeTherapySession (when this Appointment was
   // auto-created by the home-therapy approval flow).
   homeTherapySession    HomeTherapySession?
+  // SOAP notes written by the therapist after the sitting — one Appointment
+  // can carry multiple notes when a single visit covers more than one
+  // therapy modality.
+  therapistSessionNotes TherapistSessionNote[]
   // Branded PDF health reports + WhatsApp delivery (Feature 2)
   healthReports         HealthReport[]
 
@@ -2534,6 +2543,50 @@ model HandoffNote {
   @@index([isRead])
   @@index([status])
   @@index([fromClinicianId, status])
+}
+
+// SOAP-format session notes authored by a therapist after a sitting.
+// Distinct from Appointment.sessionNotes (which is the doctor's
+// free-text consult notes on the same appointment) — therapists
+// document the four canonical SOAP fields plus session metadata, and
+// optionally make each note visible to the patient's doctor for
+// hand-off context.
+model TherapistSessionNote {
+  id            String       @id @default(cuid())
+  therapistId   String
+  therapist     Therapist    @relation(fields: [therapistId], references: [id])
+  patientId     String
+  patient       Patient      @relation(fields: [patientId], references: [id])
+  appointmentId String?
+  appointment   Appointment? @relation(fields: [appointmentId], references: [id])
+
+  // SOAP — Subjective, Objective, Assessment, Plan. All nullable so a
+  // therapist can save a partial draft and finish later.
+  subjective String?
+  objective  String?
+  assessment String?
+  plan       String?
+
+  // Session metadata. sessionType is a free-form string so the surface
+  // can evolve without schema churn (typical values: INDIVIDUAL, GROUP,
+  // HOME_THERAPY).
+  sessionType     String?
+  duration        Int? // minutes
+  nextSessionPlan String?
+
+  // Visibility toggle — when false, only the authoring therapist (and
+  // admin roles) can read this note. The patient-timeline endpoint
+  // filters on this for non-author readers.
+  isVisibleToDoctor Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([therapistId])
+  @@index([patientId])
+  @@index([appointmentId])
+  @@index([patientId, isVisibleToDoctor])
+  @@index([therapistId, patientId])
 }
 
 // ── Feature 39: Post-Visit Summary ──────────────────────────────────────────

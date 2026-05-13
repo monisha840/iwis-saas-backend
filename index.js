@@ -94,6 +94,10 @@ import painMapRoutes from './routes/painMap.js';
 // fallback (services/scheduler.service.js), so when Redis was up the
 // BullMQ scheduler ran without it. Both gaps fixed in this commit.
 import motivationRoutes from './routes/motivation.js';
+// SOAP-format therapist session notes (Subjective / Objective /
+// Assessment / Plan). Separate from Appointment.sessionNotes (doctor
+// consult notes) — see routes/therapistNotes.js for the access model.
+import therapistNotesRoutes from './routes/therapistNotes.js';
 // Sheizen-inspired daily tracking — water / activity / measurements /
 // meal-photo / full-day-bonus. Patient-only logging endpoints + a doctor
 // summary for the PatientTimeline view. Auth + role are enforced per-route
@@ -244,6 +248,7 @@ app.use('/api/visit-summary', visitSummaryRoutes);
 // :id/read). Auth is enforced inside the route file via authMiddleware +
 // roleMiddleware(['PATIENT']), so we don't add a layer here.
 app.use('/api/motivation', motivationRoutes);
+app.use('/api/therapist-notes', therapistNotesRoutes);
 // Daily tracking — frontend dailyTracking.service.ts hits these directly.
 // The router existed but was never mounted, which caused HTML 404 responses
 // on every water/activity/meal-photo/measurement call.
