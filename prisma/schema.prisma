@@ -635,6 +635,11 @@ model Appointment {
   therapistDate             DateTime?
   sessionNotes              String?
   triageSessionId           String?               @unique
+  dailyRoomName             String?
+  dailyRoomUrl              String?
+  dailyRoomExpiry           DateTime?
+  videoSessionStartedAt     DateTime?
+  videoSessionEndedAt       DateTime?
   doctor                    Doctor?               @relation(fields: [doctorId], references: [id])
   patient                   Patient               @relation(fields: [patientId], references: [id])
   therapist                 Therapist?            @relation(fields: [therapistId], references: [id])

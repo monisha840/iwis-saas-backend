@@ -25,7 +25,7 @@ const rawJson = express.raw({ type: 'application/json', limit: '128kb' });
 
 router.post('/daily', rawJson, async (req, res) => {
     const signature = req.header('x-webhook-signature');
-    const raw = req.body; // Buffer because of express.raw
+    const raw = req.body;
 
     if (!VideoService.verifyDailyWebhook(raw, signature)) {
         logger.warn('[Webhook/daily] signature verification failed');
@@ -43,9 +43,8 @@ router.post('/daily', rawJson, async (req, res) => {
     const roomName = payload?.payload?.room || payload?.room || null;
     logger.info('[Webhook/daily] received', { event, roomName });
 
-    // We care about meeting-ended events for auto-completion.
-    // Daily.co publishes: 'meeting.ended', 'participant.left', etc.
-    if (event !== 'meeting.ended') {
+    const HANDLED = new Set(['meeting.started', 'meeting.ended']);
+    if (!HANDLED.has(event)) {
         return res.status(200).json({ ok: true, ignored: true });
     }
 
@@ -53,23 +52,51 @@ router.post('/daily', rawJson, async (req, res) => {
         return res.status(200).json({ ok: true, ignored: 'no room name' });
     }
 
-    // Find the appointment whose meetingLink contains this room name.
-    const appointment = await prisma.appointment.findFirst({
+    let appointment = await prisma.appointment.findFirst({
         where: {
             consultationMode: 'ONLINE',
-            meetingLink: { contains: roomName },
+            dailyRoomName: roomName,
             status: { notIn: ['COMPLETED', 'CANCELLED', 'REJECTED', 'NO_SHOW'] },
         },
     });
     if (!appointment) {
-        logger.info('[Webhook/daily] no open appointment matched room', { roomName });
+        appointment = await prisma.appointment.findFirst({
+            where: {
+                consultationMode: 'ONLINE',
+                meetingLink: { contains: roomName },
+                status: { notIn: ['COMPLETED', 'CANCELLED', 'REJECTED', 'NO_SHOW'] },
+            },
+        });
+    }
+    if (!appointment) {
+        logger.info('[Webhook/daily] no open appointment matched room', { roomName, event });
         return res.status(200).json({ ok: true, ignored: 'no matching appointment' });
     }
 
+    const now = new Date();
+
+    if (event === 'meeting.started') {
+        try {
+            await prisma.appointment.update({
+                where: { id: appointment.id },
+                data: { videoSessionStartedAt: now },
+            });
+            logger.info('[Webhook/daily] marked session started', {
+                appointmentId: appointment.id, roomName,
+            });
+        } catch (err) {
+            logger.error('[Webhook/daily] failed to set videoSessionStartedAt', {
+                appointmentId: appointment.id, err: err.message,
+            });
+        }
+        return res.status(200).json({ ok: true });
+    }
+
     try {
-        // Reuse the existing status-transition path so side effects fire
-        // (zen points, CSAT cron pickup, audit).
-        // Signature is (id, user, data) — synthetic system user for audit.
+        await prisma.appointment.update({
+            where: { id: appointment.id },
+            data: { videoSessionEndedAt: now },
+        });
         await AppointmentService.updateAppointment(
             appointment.id,
             { id: 'system', role: 'ADMIN' },
@@ -78,10 +105,9 @@ router.post('/daily', rawJson, async (req, res) => {
         logger.info('[Webhook/daily] auto-completed appointment', {
             appointmentId: appointment.id, roomName,
         });
-        // Best-effort: destroy the Daily.co room now that the call is over.
         VideoService.deleteRoom(roomName, 'daily').catch(() => {});
     } catch (err) {
-        logger.error('[Webhook/daily] updateAppointment failed', {
+        logger.error('[Webhook/daily] meeting.ended handler failed', {
             appointmentId: appointment.id, err: err.message,
         });
     }

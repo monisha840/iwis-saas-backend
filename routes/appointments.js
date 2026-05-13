@@ -8,6 +8,7 @@ import { auditAction, auditDelete } from '../middleware/auditLog.js';
 import prisma from '../lib/prisma.js';
 import { notificationService } from '../services/notification.service.js';
 import { WhatsAppService } from '../services/whatsapp.service.js';
+import { VideoService } from '../services/video.service.js';
 
 // Valid transitions: from → allowed next statuses
 const VALID_STATUS_TRANSITIONS = {
@@ -548,5 +549,66 @@ router.put('/:id/follow-up', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOC
     next(err);
   }
 });
+
+router.get(
+  '/:id/video-session',
+  authMiddleware,
+  roleMiddleware(['DOCTOR', 'THERAPIST', 'PATIENT']),
+  async (req, res, next) => {
+    try {
+      const appointment = await AppointmentService.getAppointmentById(req.params.id);
+      if (!appointment) return res.status(404).json({ error: 'Appointment not found' });
+
+      const role = req.user.role;
+      const userId = req.user.id;
+      const isOwnDoctor    = role === 'DOCTOR'    && appointment.doctor?.userId    === userId;
+      const isOwnTherapist = role === 'THERAPIST' && appointment.therapist?.userId === userId;
+      const isOwnPatient   = role === 'PATIENT'   && appointment.patient?.userId   === userId;
+
+      if (!isOwnDoctor && !isOwnTherapist && !isOwnPatient) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+
+      if (appointment.consultationMode !== 'ONLINE') {
+        return res.status(400).json({ error: 'Appointment is not a video consultation' });
+      }
+      if (!appointment.dailyRoomName) {
+        return res.status(400).json({ error: 'Video room has not been provisioned for this appointment' });
+      }
+      if (!appointment.dailyRoomExpiry || appointment.dailyRoomExpiry <= new Date()) {
+        return res.status(400).json({ error: 'Video room has expired' });
+      }
+
+      const isDailyRoom = typeof appointment.dailyRoomUrl === 'string'
+        && appointment.dailyRoomUrl.includes('.daily.co/');
+
+      let meetingToken = null;
+      if (isDailyRoom) {
+        const userName = isOwnDoctor
+          ? (appointment.doctor?.fullName    || 'Doctor')
+          : isOwnTherapist
+            ? (appointment.therapist?.fullName || 'Therapist')
+            : (appointment.patient?.fullName   || 'Patient');
+
+        meetingToken = await VideoService.createMeetingToken({
+          roomName:  appointment.dailyRoomName,
+          userId,
+          userName,
+          isOwner:   isOwnDoctor || isOwnTherapist,
+          expiresAt: appointment.dailyRoomExpiry,
+        });
+      }
+
+      res.json({
+        url:          appointment.dailyRoomUrl,
+        roomName:     appointment.dailyRoomName,
+        expiresAt:    appointment.dailyRoomExpiry,
+        meetingToken,
+      });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 
 export default router;

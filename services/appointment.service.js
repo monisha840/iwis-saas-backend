@@ -292,6 +292,9 @@ export class AppointmentService {
         // room create vs final appointment.id by generating a short UUID here
         // then updating the room name is unnecessary — we just thread through.
         let meetingLink = null;
+        let dailyRoomName = null;
+        let dailyRoomUrl = null;
+        let dailyRoomExpiry = null;
         if (consultationMode === 'ONLINE') {
             const provisionalId = crypto.randomUUID();
             try {
@@ -301,6 +304,9 @@ export class AppointmentService {
                     // endAt defaults to start + 30min inside VideoService
                 });
                 meetingLink = room.url;
+                dailyRoomName = room.roomName;
+                dailyRoomUrl = room.url;
+                dailyRoomExpiry = room.expiresAt;
             } catch (err) {
                 // Extremely defensive — VideoService already falls back to Jitsi
                 // internally, so this branch shouldn't be reachable. If it is,
@@ -465,6 +471,9 @@ export class AppointmentService {
                     consultationType: consultationType || 'DOCTOR',
                     consultationMode: consultationMode || 'OFFLINE',
                     meetingLink,
+                    dailyRoomName,
+                    dailyRoomUrl,
+                    dailyRoomExpiry,
                     branchId: branchIdToUse,
                     journeyId: journeyIdToPersist,
                     ...reminderFields,

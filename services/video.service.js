@@ -30,7 +30,7 @@ async function dailyCreateRoom({ appointmentId, startAt, endAt }) {
     const roomName = `appt-${appointmentId.slice(0, 8)}-${crypto.randomBytes(4).toString('hex')}`;
 
     // `nbf` = not before (join window opens 15 min before start).
-    // `exp` = expiry (room destroyed 2h after start).
+    // `exp` = expiry (room destroyed 2h after end).
     const nbf = Math.floor((startAt.getTime() - 15 * 60_000) / 1000);
     const exp = Math.floor((endAt.getTime()   + 120 * 60_000) / 1000);
 
@@ -82,6 +82,45 @@ async function dailyDeleteRoom(roomName) {
     } catch (err) {
         logger.warn('[Video] dailyDeleteRoom failed', { roomName, err: err.message });
     }
+}
+
+async function dailyGetRoom(roomName) {
+    const res = await fetch(`${DAILY_API}/rooms/${encodeURIComponent(roomName)}`, {
+        method: 'GET',
+        headers: { 'Authorization': `Bearer ${DAILY_API_KEY}` },
+    });
+    if (res.status === 404) return null;
+    if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Daily.co getRoom ${res.status}: ${text}`);
+    }
+    return res.json();
+}
+
+async function dailyCreateMeetingToken({ roomName, userId, userName, isOwner, expiresAt }) {
+    const body = {
+        properties: {
+            room_name: roomName,
+            user_id:   userId,
+            user_name: userName,
+            is_owner:  isOwner,
+            exp:       Math.floor(expiresAt.getTime() / 1000),
+        },
+    };
+    const res = await fetch(`${DAILY_API}/meeting-tokens`, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${DAILY_API_KEY}`,
+            'Content-Type':  'application/json',
+        },
+        body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Daily.co createMeetingToken ${res.status}: ${text}`);
+    }
+    const json = await res.json();
+    return json.token;
 }
 
 /**
@@ -156,6 +195,16 @@ export const VideoService = {
             await dailyDeleteRoom(roomName);
         }
         // Jitsi has no server-side destroy; rooms evaporate when empty.
+    },
+
+    async getRoom(roomName, provider) {
+        if (provider !== 'daily' || !DAILY_API_KEY) return null;
+        return dailyGetRoom(roomName);
+    },
+
+    async createMeetingToken({ roomName, userId, userName, isOwner, expiresAt }) {
+        if (!DAILY_API_KEY) return null;
+        return dailyCreateMeetingToken({ roomName, userId, userName, isOwner, expiresAt });
     },
 
     verifyDailyWebhook(rawBody, signature) {
