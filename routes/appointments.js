@@ -14,8 +14,13 @@ const VALID_STATUS_TRANSITIONS = {
   PENDING:                    ['CONFIRMED', 'CANCELLED', 'PENDING_DOCTOR_APPROVAL', 'PENDING_THERAPIST_APPROVAL'],
   PENDING_DOCTOR_APPROVAL:    ['ACCEPTED', 'CANCELLED', 'PENDING_THERAPIST_APPROVAL'],
   PENDING_THERAPIST_APPROVAL: ['ACCEPTED', 'CANCELLED', 'PENDING_DOCTOR_APPROVAL'],
-  CONFIRMED:                  ['COMPLETED', 'CANCELLED'],
-  ACCEPTED:                   ['COMPLETED', 'CANCELLED'],
+  // CONFIRMED / ACCEPTED → IN_PROGRESS lets the therapist's "Start
+  // Session" flow flip the appointment without going through the
+  // doctor-centric queue (QueueEntry has a required doctorId, so
+  // therapist-only appointments can't carry one).
+  CONFIRMED:                  ['IN_PROGRESS', 'COMPLETED', 'CANCELLED'],
+  ACCEPTED:                   ['IN_PROGRESS', 'COMPLETED', 'CANCELLED'],
+  IN_PROGRESS:                ['COMPLETED', 'CANCELLED'],
   SCHEDULED:                  ['CONFIRMED', 'CANCELLED'],
   COMPLETED:                  [],   // terminal
   CANCELLED:                  [],   // terminal
@@ -30,7 +35,7 @@ const appointmentSchema = z.object({
   doctorId: z.string().nullable().optional(),
   therapistId: z.string().nullable().optional(),
   date: z.string(),
-  status: z.enum(['PENDING', 'SCHEDULED', 'CONFIRMED', 'CANCELLED', 'COMPLETED', 'PENDING_THERAPIST_APPROVAL', 'PENDING_DOCTOR_APPROVAL', 'ACCEPTED']).optional(),
+  status: z.enum(['PENDING', 'SCHEDULED', 'CONFIRMED', 'CANCELLED', 'COMPLETED', 'PENDING_THERAPIST_APPROVAL', 'PENDING_DOCTOR_APPROVAL', 'ACCEPTED', 'IN_PROGRESS']).optional(),
   triageSessionId: z.string().optional(),
   consultationType: z.enum(['DOCTOR', 'THERAPIST', 'COMBINED']).optional(),
   consultationMode: z.enum(['OFFLINE', 'ONLINE']).optional(),
@@ -67,7 +72,7 @@ const followUpSchema = z.object({
 
 const updateAppointmentSchema = z.object({
   date: z.string().optional(),
-  status: z.enum(['PENDING', 'SCHEDULED', 'CONFIRMED', 'CANCELLED', 'COMPLETED', 'PENDING_THERAPIST_APPROVAL', 'PENDING_DOCTOR_APPROVAL', 'ACCEPTED']).optional(),
+  status: z.enum(['PENDING', 'SCHEDULED', 'CONFIRMED', 'CANCELLED', 'COMPLETED', 'PENDING_THERAPIST_APPROVAL', 'PENDING_DOCTOR_APPROVAL', 'ACCEPTED', 'IN_PROGRESS']).optional(),
   notes: z.string().optional(),
   doctorId: z.string().nullable().optional(),
   therapistId: z.string().nullable().optional(),
