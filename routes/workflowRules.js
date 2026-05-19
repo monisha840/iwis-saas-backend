@@ -37,13 +37,16 @@ const ADMIN_ROLES = ['ADMIN', 'ADMIN_DOCTOR'];
 // validation lives in workflowEngine.service.validate* (called inside the
 // handler) so the engine and the route share one source of truth.
 
+// PHASE_COMPLETED removed in audit fix #1 — the cron engine never fired it
+// (no event hook in journey.service.js calls back here), so rules created
+// with that trigger were silently dead. Now rejected at the API boundary
+// in addition to being absent from the dropdown.
 const triggerEnum = z.enum([
     'NO_CHECKIN',
     'PAIN_NOT_IMPROVING',
     'DIET_ADHERENCE_LOW',
     'PHASE_OVERDUE',
     'PRESCRIPTION_UNCOLLECTED',
-    'PHASE_COMPLETED',
 ]);
 
 const createSchema = z.object({

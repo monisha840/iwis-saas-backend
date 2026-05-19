@@ -48,6 +48,8 @@ model User {
   // Journey relations
   treatmentJourneys          TreatmentJourney[]         @relation("JourneyPatient")
   doctorJourneys             TreatmentJourney[]         @relation("JourneyDoctor")
+  // Group sessions this user authored (POST /api/group-sessions).
+  groupSessionsCreated       GroupSession[]             @relation("GroupSessionCreator")
   taskCompletions            TaskCompletion[]
   patientVitals              PatientVital[]
   badges                     UserBadge[]
@@ -187,6 +189,12 @@ model Branch {
   opdEnabled           Boolean                  @default(true)
   operatingHoursFrom   String?
   operatingHoursTo     String?
+  // Weekday ordinals (0=Sun, 6=Sat) when the clinic is closed. Empty = open
+  // every day. Honoured by the attendance reconciliation so closed-day
+  // shifts don't produce false ABSENT rows. Default empty so existing
+  // clinics retain their previous "open every day" behaviour until an
+  // admin explicitly marks weekends off.
+  weeklyClosedDays     Int[]                    @default([])
   users                User[]
   patients             Patient[]
   appointments         Appointment[]
@@ -570,6 +578,9 @@ model Patient {
   activityLogs        ActivityLog[]
   bodyMeasurementLogs BodyMeasurementLog[]
   mealPhotoLogs       MealPhotoLog[]
+  // Monday Motivation card — one per patient per day. Cron-generated every
+  // Monday and lazy-created on dashboard load for mid-week onboardings.
+  motivationCards     DailyMotivationCard[]
 
   @@index([branchId]) // branch-scoped patient queries (listPatients, triage dispatch)
 }
@@ -655,6 +666,14 @@ model Appointment {
   doctorApproved            Boolean               @default(false)
   therapistApproved         Boolean               @default(false)
   notificationSent          Boolean               @default(false)
+  // Walk-in marker. Set true by POST /api/appointments/walk-in so the
+  // frontend's AppointmentCard / appointment-list can render a "Walk-In"
+  // badge. Standard patient-initiated bookings leave it at the default.
+  isWalkIn                  Boolean               @default(false)
+  // Optional free-text notes captured on the walk-in form (separate from
+  // the canonical `notes` column so the admin's reason / context can be
+  // shown alongside the auto-generated "Walk-in booking" header).
+  walkInNotes               String?
   csatSentAt                DateTime?
   retentionChecklist        RetentionChecklist?
   feedback                  AppointmentFeedback?
@@ -2556,6 +2575,11 @@ model HandoffNote {
   sourceAppointmentId String?       @unique
   sourceAppointment   Appointment?  @relation("AppointmentHandoffDraft", fields: [sourceAppointmentId], references: [id], onDelete: SetNull)
   sentAt              DateTime?
+  // User-supplied effective date for the handoff (DD/MM/YYYY in the
+  // create form; converted to a DateTime by the service). The
+  // receiving doctor's notification surfaces this so they know when
+  // the handoff goes "live".
+  handoffDate         DateTime?
 
   @@index([patientId])
   @@index([fromClinicianId])
@@ -3132,12 +3156,19 @@ model GroupSession {
   attendedParticipantIds String[] @default([])
   createdAt   DateTime           @default(now())
   updatedAt   DateTime           @updatedAt
+  // The User who POSTed the create call — used by the cancel/complete
+  // ownership helper so that (e.g.) Dr. Rahman can't cancel a session
+  // Dr. Saleem created. Nullable for backward compat with rows created
+  // before this column existed; legacy rows are admin-mutable only.
+  createdById String?
+  createdBy   User?              @relation("GroupSessionCreator", fields: [createdById], references: [id])
 
   appointments Appointment[]
 
   @@index([branchId, date])
   @@index([therapistId, date])
   @@index([status])
+  @@index([createdById])
 }
 
 enum GroupSessionStatus {
@@ -4366,4 +4397,31 @@ model MealPhotoLog {
   patient   Patient  @relation(fields: [patientId], references: [id])
 
   @@index([patientId, date])
+}
+
+// ── Monday Motivation Card ────────────────────────────────────────────────
+// One Ayurvedic tip per patient per day. Cron at 10:00 IST every Monday
+// generates a row for every onboarded patient (and WhatsApps it); dashboard
+// load lazy-creates a row for patients onboarded mid-week.
+// `prakriti` is one of VATA / PITTA / KAPHA / GENERAL.
+// `season` is one of HEMANTA / SHISHIRA / VASANTA / GRISHMA / VARSHA / SHARAD.
+
+model DailyMotivationCard {
+  id             String    @id @default(uuid())
+  patientId      String
+  tip            String
+  prakriti       String
+  season         String
+  date           DateTime
+  isRead         Boolean   @default(false)
+  readAt         DateTime?
+  isSaved        Boolean   @default(false)
+  savedAt        DateTime?
+  whatsappSentAt DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  patient        Patient   @relation(fields: [patientId], references: [id])
+
+  @@unique([patientId, date])
+  @@index([patientId, isSaved])
 }

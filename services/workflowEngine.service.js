@@ -35,13 +35,17 @@ import {
 
 // ── Constants ───────────────────────────────────────────────────────────────
 
+// PHASE_COMPLETED was previously listed here as "event-based; cron skips it",
+// but no event hook ever called back into the workflow engine — admins could
+// author rules that looked active but never fired. Removed in audit fix #1.
+// The cron skip below (`if (rule.triggerType === 'PHASE_COMPLETED')`) stays
+// as defence-in-depth for any legacy DB rows still carrying that triggerType.
 export const VALID_TRIGGER_TYPES = [
     'NO_CHECKIN',
     'PAIN_NOT_IMPROVING',
     'DIET_ADHERENCE_LOW',
     'PHASE_OVERDUE',
     'PRESCRIPTION_UNCOLLECTED',
-    'PHASE_COMPLETED', // event-based; cron skips it
 ];
 
 export const VALID_ACTION_TYPES = [
@@ -96,8 +100,9 @@ export function validateConditionValue(triggerType, conditionValue) {
                 throw badReq('conditionValue.taskCompletionBelow must be 0–100');
             }
             return;
-        case 'PHASE_COMPLETED':
-            return; // no condition required
+        // PHASE_COMPLETED case removed in audit fix #1 — the trigger is no
+        // longer offered and is rejected by the create / update zod schema
+        // in routes/workflowRules.js. Falls through to the default below.
         default:
             throw badReq(`Unknown triggerType: ${triggerType}`);
     }
@@ -190,6 +195,40 @@ export async function updateCooldown(ruleId, patientId) {
     });
 }
 
+// Cross-rule cooldown (audit fix #7). If two rules share the same
+// triggerType (e.g. "Low Diet Adherence <40%/3d" AND "Low Diet Adherence
+// <50%/5d"), the per-rule WorkflowCooldown lets both fire for the same
+// patient on the same tick — the patient gets two WhatsApps. This guard
+// queries WorkflowRuleLog for any successful fire of the same triggerType
+// against this patient within the family-cooldown window, and tells the
+// caller to skip if so. Branch-scoped so unrelated branches never
+// interfere with each other.
+//
+// `windowHours` defaults to 24 — same patient shouldn't hear from us on
+// the same clinical concern more than once a day, regardless of which
+// specific rule matched. Tuneable here if we later expose it per-branch.
+const TRIGGER_FAMILY_COOLDOWN_HOURS = 24;
+export async function isInTriggerFamilyCooldown(patientId, triggerType, branchId, windowHours = TRIGGER_FAMILY_COOLDOWN_HOURS) {
+    if (!patientId || !triggerType) return false;
+    try {
+        const cutoff = new Date(Date.now() - windowHours * 3_600_000);
+        const recent = await prisma.workflowRuleLog.findFirst({
+            where: {
+                patientId,
+                triggeredAt: { gte: cutoff },
+                rule: {
+                    triggerType,
+                    ...(branchId ? { branchId } : {}),
+                },
+            },
+            select: { id: true },
+        });
+        return !!recent;
+    } catch {
+        return false;
+    }
+}
+
 // ── Trigger evaluators ──────────────────────────────────────────────────────
 //
 // Each returns Array<{ patient, reason }>. Never throws — caller is the
@@ -260,7 +299,25 @@ export async function evalDietAdherenceLow(branchId, conditionValue) {
             where: { patientId: patient.id, loggedAt: { gte: cutoff } },
             select: { followed: true },
         });
-        if (logs.length === 0) continue;
+        if (logs.length === 0) {
+            // Audit fix #3 — zero logs used to silently skip, hiding the
+            // most disengaged patients (exactly the cohort the rule wants
+            // to catch). We now treat "no logs" as 0% adherence, but only
+            // when the patient has an active DietPrescription that's been
+            // running for at least `days` — otherwise we'd nag patients
+            // who don't even have a diet plan, which is meaningless.
+            const activeRx = await prisma.dietPrescription.findFirst({
+                where: { patientId: patient.id, isActive: true, startDate: { lt: cutoff } },
+                select: { id: true },
+            });
+            if (!activeRx) continue;
+            results.push({
+                patient,
+                reason: `No diet adherence logged in the last ${days} days `
+                    + `(treated as 0% — below ${thresholdPercent}% threshold)`,
+            });
+            continue;
+        }
         const adherence = Math.round((logs.filter((l) => l.followed).length / logs.length) * 100);
         if (adherence < thresholdPercent) {
             results.push({
@@ -397,8 +454,25 @@ export async function executeActions(rule, patient, reason) {
 
             switch (action.type) {
                 case 'SEND_WHATSAPP': {
+                    // Consent gate — audit fix #4.
+                    // Block only when the patient has EXPLICITLY opted out
+                    // (notificationPreference.whatsappEnabled === false).
+                    // Patients without a NotificationPreference row at all
+                    // are treated as opted-in (back-compat: pre-feature
+                    // patients never had the chance to toggle, and the
+                    // existing automation has been sending to them by phone
+                    // number fallback). Explicit opt-OUT now wins.
+                    const pref = patient.user?.notificationPreference;
+                    if (pref && pref.whatsappEnabled === false) {
+                        actionResults.push({
+                            type: 'SEND_WHATSAPP',
+                            success: false,
+                            error: 'Patient has opted out of WhatsApp notifications',
+                        });
+                        break;
+                    }
                     const message = interpolateTemplate(action.messageTemplate || '', vars);
-                    const prefNumber  = patient.user?.notificationPreference?.whatsappNumber;
+                    const prefNumber  = pref?.whatsappNumber;
                     const fallback    = patient.phoneNumber || patient.primaryPhone;
                     const number      = normalisePhone(prefNumber || fallback);
                     if (!number) {
@@ -568,12 +642,28 @@ export async function evaluateAllRules(opts = {}) {
 
             for (const { patient, reason } of matches) {
                 try {
+                    // Per-rule cooldown — `(ruleId, patientId)` keyed.
                     if (await isOnCooldown(rule.id, patient.id, rule.cooldownHours)) continue;
+                    // Cross-rule family cooldown — prevents two rules sharing
+                    // the same triggerType (e.g. two "Low Diet Adherence"
+                    // thresholds) from both messaging the same patient on
+                    // the same hourly tick. (Audit fix #7.)
+                    if (await isInTriggerFamilyCooldown(patient.id, rule.triggerType, rule.branchId)) continue;
 
                     const actionResults = await executeActions(rule, patient, reason);
 
-                    await updateCooldown(rule.id, patient.id);
+                    // Cooldown is a SUCCESS claim — only stamp it if at
+                    // least one action actually went out. Previously every
+                    // attempt (success or not) burned the cooldown, which
+                    // meant one transient WhatsApp API outage muted the
+                    // rule for that patient for `cooldownHours`. (Audit fix #2.)
+                    const anySuccess = actionResults.some((r) => r && r.success === true);
+                    if (anySuccess) {
+                        await updateCooldown(rule.id, patient.id);
+                    }
 
+                    // Log every attempt — successful AND failed — so admins
+                    // can audit "we tried but X failed" via View Logs.
                     await prisma.workflowRuleLog.create({
                         data: {
                             ruleId:       rule.id,
@@ -583,11 +673,18 @@ export async function evaluateAllRules(opts = {}) {
                         },
                     });
 
-                    firedCount++;
-                    logger.info('[WorkflowEngine] fired', {
-                        ruleId: rule.id, ruleName: rule.name,
-                        patientId: patient.id, patientName: patient.fullName,
-                    });
+                    if (anySuccess) {
+                        firedCount++;
+                        logger.info('[WorkflowEngine] fired', {
+                            ruleId: rule.id, ruleName: rule.name,
+                            patientId: patient.id, patientName: patient.fullName,
+                        });
+                    } else {
+                        logger.warn('[WorkflowEngine] all actions failed — cooldown NOT stamped, will retry on next sweep', {
+                            ruleId: rule.id, patientId: patient.id,
+                            results: actionResults,
+                        });
+                    }
                 } catch (perPatientErr) {
                     logger.warn('[WorkflowEngine] per-patient failure', {
                         ruleId: rule.id, patientId: patient?.id, err: perPatientErr.message,
@@ -628,6 +725,7 @@ export default {
     getActiveBranchPatients,
     isOnCooldown,
     updateCooldown,
+    isInTriggerFamilyCooldown,
     evalNoCheckin,
     evalPainNotImproving,
     evalDietAdherenceLow,

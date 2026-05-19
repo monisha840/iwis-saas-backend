@@ -11,7 +11,7 @@ export class ClinicalPhotoService {
     }
 
     static async list({ patientId, journeyId, category, stage }) {
-        return prisma.clinicalPhoto.findMany({
+        const photos = await prisma.clinicalPhoto.findMany({
             where: {
                 ...(patientId ? { patientId } : {}),
                 ...(journeyId ? { journeyId } : {}),
@@ -20,6 +20,57 @@ export class ClinicalPhotoService {
             },
             orderBy: { takenAt: 'desc' },
         });
+
+        // Patient-uploaded images currently land in the Document table (via
+        // the triage media upload route at /api/triage/:sessionId/media).
+        // The Clinical Photos page expects ClinicalPhoto rows, so triage
+        // photos were invisible there. Merge them in — normalised to the
+        // ClinicalPhoto shape — so the patient sees their own uploads.
+        //
+        // Scope: requires a patientId (we never want to leak triage media
+        // across patients), and we narrow further by category + stage when
+        // the caller asked for a strict subset (e.g. BEFORE/AFTER) since
+        // triage media is always DURING / GENERAL_PROGRESS.
+        if (patientId) {
+            const wantsDuring = !stage || stage === 'DURING';
+            const wantsGeneral = !category || category === 'GENERAL_PROGRESS';
+            if (wantsDuring && wantsGeneral) {
+                const triageDocs = await prisma.document.findMany({
+                    where: {
+                        patientId,
+                        category: 'TRIAGE_MEDIA',
+                        fileType: { startsWith: 'image/' },
+                        ...(journeyId ? { /* no journey link on Document — skip */ } : {}),
+                    },
+                    orderBy: { createdAt: 'desc' },
+                });
+                // Drop journey-scoped queries (Document has no journeyId) so
+                // the doctor's journey-filtered view stays clean.
+                if (!journeyId) {
+                    for (const d of triageDocs) {
+                        photos.push({
+                            id:             d.id,
+                            patientId:      d.patientId,
+                            uploadedById:   d.uploadedBy,
+                            journeyId:      null,
+                            phaseId:        null,
+                            therapySessionId: null,
+                            category:       'GENERAL_PROGRESS',
+                            stage:          'DURING',
+                            bodyRegion:     null,
+                            notes:          d.description || null,
+                            filePath:       d.fileUrl,
+                            takenAt:        d.createdAt,
+                            createdAt:      d.createdAt,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Re-sort the merged list newest-first.
+        photos.sort((a, b) => new Date(b.takenAt).getTime() - new Date(a.takenAt).getTime());
+        return photos;
     }
 
     /**

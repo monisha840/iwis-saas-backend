@@ -8,6 +8,296 @@ import { notificationService } from './notification.service.js';
  * Run daily via cron.
  */
 export class CareGapService {
+    /**
+     * Read-only listing for the Care Gap Dashboard. Mirrors the same five
+     * detection signals as `detectAndNotify` but writes nothing — every
+     * page-load runs this fresh against the current DB state, then the UI
+     * filters / paginates client-side after the initial roll-up.
+     *
+     * Output shape matches the frontend's `CareGapResponse["data"]` type
+     * exactly (see `pages/admin/CareGapDashboard.tsx`):
+     *   { summary: { totalGaps, highSeverity, mediumSeverity, lowSeverity, byType },
+     *     gaps:    CareGap[],
+     *     pagination: { page, limit, total, totalPages } }
+     *
+     * The `gapType` and `severity` filters narrow the rolled-up rows;
+     * `branchId` scopes against TreatmentJourney.branchId / TriageSession.branchId
+     * (admin doctors pass it explicitly from the navbar selector — null = all branches).
+     */
+    static async listGaps({ branchId = null, gapType = null, severity = null, page = 1, limit = 50 } = {}) {
+        const wantTypes = new Set(
+            gapType
+                ? [gapType]
+                : ['NO_RECENT_VISIT', 'INCOMPLETE_TRIAGE', 'LOW_ADHERENCE', 'WELLNESS_DECLINE', 'OVERDUE_PHASE'],
+        );
+        const gaps = [];
+        const now = new Date();
+
+        // ── 1. NO_RECENT_VISIT — active journeys with no appointment in 21+ days ──
+        if (wantTypes.has('NO_RECENT_VISIT')) {
+            const twentyOneDaysAgo = new Date(now.getTime() - 21 * 24 * 60 * 60 * 1000);
+            const journeys = await prisma.treatmentJourney.findMany({
+                where: { status: 'ACTIVE', ...(branchId ? { branchId } : {}) },
+                select: {
+                    id: true, patientId: true, title: true,
+                    // TreatmentJourney.doctor is a User relation (not Doctor),
+                    // so fullName lives one hop deeper on User.doctor.
+                    doctor: { select: { doctor: { select: { fullName: true } } } },
+                },
+            });
+            // TreatmentJourney.patientId is User.id; resolve to Patient row for the UI.
+            const userIds = Array.from(new Set(journeys.map((j) => j.patientId).filter(Boolean)));
+            const patientRows = userIds.length
+                ? await prisma.patient.findMany({
+                    where: { userId: { in: userIds } },
+                    select: { id: true, userId: true, fullName: true, profilePhoto: true },
+                })
+                : [];
+            const patientByUserId = new Map(patientRows.map((p) => [p.userId, p]));
+            for (const j of journeys) {
+                const patient = patientByUserId.get(j.patientId);
+                if (!patient) continue;
+                const lastAppointment = await prisma.appointment.findFirst({
+                    where: { patientId: patient.id, status: { in: ['COMPLETED', 'CONFIRMED', 'ACCEPTED'] } },
+                    orderBy: { date: 'desc' },
+                    select: { date: true },
+                });
+                if (lastAppointment && lastAppointment.date >= twentyOneDaysAgo) continue;
+                const daysSince = lastAppointment
+                    ? Math.floor((now.getTime() - lastAppointment.date.getTime()) / 86400000)
+                    : null;
+                gaps.push({
+                    id: `NO_RECENT_VISIT-${j.id}`,
+                    patientId: patient.id,
+                    patientName: patient.fullName || 'Unnamed patient',
+                    patientAvatar: patient.profilePhoto || null,
+                    gapType: 'NO_RECENT_VISIT',
+                    severity: 'MEDIUM',
+                    detectedAt: now.toISOString(),
+                    detail: daysSince !== null
+                        ? `Last visit ${daysSince} days ago · "${j.title}"`
+                        : `No appointments on record · "${j.title}"`,
+                    assignedDoctorName: j.doctor?.doctor?.fullName || '—',
+                    suggestedAction: 'Schedule a follow-up consultation',
+                });
+            }
+        }
+
+        // ── 2. INCOMPLETE_TRIAGE — sessions older than 3 days with no appointment ──
+        if (wantTypes.has('INCOMPLETE_TRIAGE')) {
+            const threeDaysAgo = new Date(now.getTime() - 3 * 24 * 60 * 60 * 1000);
+            const sessions = await prisma.triageSession.findMany({
+                where: {
+                    createdAt: { lt: threeDaysAgo },
+                    appointment: null,
+                    ...(branchId ? { branchId } : {}),
+                },
+                select: {
+                    id: true, createdAt: true,
+                    patient: { select: { id: true, fullName: true, profilePhoto: true } },
+                },
+            });
+            for (const s of sessions) {
+                if (!s.patient) continue;
+                const daysSince = Math.floor((now.getTime() - s.createdAt.getTime()) / 86400000);
+                gaps.push({
+                    id: `INCOMPLETE_TRIAGE-${s.id}`,
+                    patientId: s.patient.id,
+                    patientName: s.patient.fullName || 'Unnamed patient',
+                    patientAvatar: s.patient.profilePhoto || null,
+                    gapType: 'INCOMPLETE_TRIAGE',
+                    severity: 'LOW',
+                    detectedAt: s.createdAt.toISOString(),
+                    detail: `Triage started ${daysSince} days ago, no appointment booked`,
+                    assignedDoctorName: '—',
+                    suggestedAction: 'Reach out to schedule consultation',
+                });
+            }
+        }
+
+        // ── 3. LOW_ADHERENCE — < 60% medication logs in last 7 days ──
+        if (wantTypes.has('LOW_ADHERENCE')) {
+            const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+            const activeRx = await prisma.prescription.findMany({
+                where: { totalQuantity: { gt: 0 }, ...(branchId ? { branchId } : {}) },
+                select: {
+                    id: true, patientId: true,
+                    patient: { select: { id: true, fullName: true, profilePhoto: true } },
+                    doctor:  { select: { fullName: true } },
+                },
+            });
+            const byPatient = new Map();
+            for (const rx of activeRx) {
+                if (!rx.patient) continue;
+                if (!byPatient.has(rx.patientId)) {
+                    byPatient.set(rx.patientId, {
+                        patient: rx.patient,
+                        doctorName: rx.doctor?.fullName || '—',
+                        rxIds: [],
+                    });
+                }
+                byPatient.get(rx.patientId).rxIds.push(rx.id);
+            }
+            for (const [, { patient, doctorName, rxIds }] of byPatient) {
+                const logs = await prisma.medicationLog.findMany({
+                    where: { prescriptionId: { in: rxIds }, taken: true, takenAt: { gte: sevenDaysAgo } },
+                    select: { takenAt: true },
+                });
+                const uniqueDays = new Set(logs.map((l) => l.takenAt.toISOString().slice(0, 10))).size;
+                const adherenceRate = Math.round((uniqueDays / 7) * 100);
+                if (adherenceRate >= 60) continue;
+                gaps.push({
+                    id: `LOW_ADHERENCE-${patient.id}`,
+                    patientId: patient.id,
+                    patientName: patient.fullName || 'Unnamed patient',
+                    patientAvatar: patient.profilePhoto || null,
+                    gapType: 'LOW_ADHERENCE',
+                    // High = 0-30% adherence, Medium = 30-60%, otherwise it isn't flagged
+                    severity: adherenceRate < 30 ? 'HIGH' : 'MEDIUM',
+                    detectedAt: now.toISOString(),
+                    detail: `${adherenceRate}% medication adherence over the last 7 days`,
+                    assignedDoctorName: doctorName,
+                    suggestedAction: 'Send adherence reminder / counsel patient',
+                });
+            }
+        }
+
+        // ── 4. WELLNESS_DECLINE — pain score jumped > 2 points week-over-week ──
+        if (wantTypes.has('WELLNESS_DECLINE')) {
+            const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000);
+            const journeys = await prisma.treatmentJourney.findMany({
+                where: { status: 'ACTIVE', ...(branchId ? { branchId } : {}) },
+                select: {
+                    id: true, patientId: true, title: true,
+                    // Same User → Doctor hop as the NO_RECENT_VISIT query above.
+                    doctor: { select: { doctor: { select: { fullName: true } } } },
+                },
+            });
+            const userIds = Array.from(new Set(journeys.map((j) => j.patientId).filter(Boolean)));
+            const patientRows = userIds.length
+                ? await prisma.patient.findMany({
+                    where: { userId: { in: userIds } },
+                    select: { id: true, userId: true, fullName: true, profilePhoto: true },
+                })
+                : [];
+            const patientByUserId = new Map(patientRows.map((p) => [p.userId, p]));
+            for (const j of journeys) {
+                const patient = patientByUserId.get(j.patientId);
+                if (!patient) continue;
+                const painVitals = await prisma.patientVital.findMany({
+                    where: { journeyId: j.id, type: 'PAIN_SCORE' },
+                    orderBy: { recordedAt: 'desc' },
+                    take: 14,
+                });
+                if (painVitals.length < 2) continue;
+                const recent = painVitals.slice(0, 3);
+                const older = painVitals.filter((v) => v.recordedAt < sevenDaysAgo).slice(0, 3);
+                if (older.length === 0) continue;
+                const recentAvg = recent.reduce((s, v) => s + v.value, 0) / recent.length;
+                const olderAvg  = older.reduce((s, v) => s + v.value, 0) / older.length;
+                const delta = recentAvg - olderAvg;
+                if (delta <= 2) continue;
+                gaps.push({
+                    id: `WELLNESS_DECLINE-${j.id}`,
+                    patientId: patient.id,
+                    patientName: patient.fullName || 'Unnamed patient',
+                    patientAvatar: patient.profilePhoto || null,
+                    gapType: 'WELLNESS_DECLINE',
+                    severity: 'HIGH',
+                    detectedAt: now.toISOString(),
+                    detail: `Pain score up ${delta.toFixed(1)} points in 7 days · "${j.title}"`,
+                    assignedDoctorName: j.doctor?.doctor?.fullName || '—',
+                    suggestedAction: 'Review treatment plan; consider a check-in call',
+                });
+            }
+        }
+
+        // ── 5. OVERDUE_PHASE — ACTIVE phase past its startedAt + durationDays ──
+        if (wantTypes.has('OVERDUE_PHASE')) {
+            const phases = await prisma.journeyPhase.findMany({
+                where: {
+                    status: 'ACTIVE',
+                    startedAt: { not: null },
+                    journey: { status: 'ACTIVE', ...(branchId ? { branchId } : {}) },
+                },
+                select: {
+                    id: true, name: true, startedAt: true, durationDays: true,
+                    journey: {
+                        select: {
+                            id: true, patientId: true, title: true,
+                            // Same User → Doctor hop. journey.doctor is a User
+                            // relation; Doctor.fullName lives at .doctor.doctor.fullName.
+                            doctor: { select: { doctor: { select: { fullName: true } } } },
+                        },
+                    },
+                },
+            });
+            const userIds = Array.from(new Set(phases.map((p) => p.journey?.patientId).filter(Boolean)));
+            const patientRows = userIds.length
+                ? await prisma.patient.findMany({
+                    where: { userId: { in: userIds } },
+                    select: { id: true, userId: true, fullName: true, profilePhoto: true },
+                })
+                : [];
+            const patientByUserId = new Map(patientRows.map((p) => [p.userId, p]));
+            for (const phase of phases) {
+                if (!phase.journey || !phase.startedAt) continue;
+                const expectedEnd = new Date(phase.startedAt);
+                expectedEnd.setDate(expectedEnd.getDate() + phase.durationDays);
+                if (now <= expectedEnd) continue;
+                const patient = patientByUserId.get(phase.journey.patientId);
+                if (!patient) continue;
+                const daysOver = Math.floor((now.getTime() - expectedEnd.getTime()) / 86400000);
+                gaps.push({
+                    id: `OVERDUE_PHASE-${phase.id}`,
+                    patientId: patient.id,
+                    patientName: patient.fullName || 'Unnamed patient',
+                    patientAvatar: patient.profilePhoto || null,
+                    gapType: 'OVERDUE_PHASE',
+                    severity: daysOver > 14 ? 'HIGH' : 'MEDIUM',
+                    detectedAt: expectedEnd.toISOString(),
+                    detail: `Phase "${phase.name}" overdue by ${daysOver} day${daysOver === 1 ? '' : 's'} · "${phase.journey.title}"`,
+                    assignedDoctorName: phase.journey.doctor?.doctor?.fullName || '—',
+                    suggestedAction: 'Review the journey and advance or extend the phase',
+                });
+            }
+        }
+
+        // ── Summary (computed across the full unfiltered roll-up so the
+        // "byType" counts still mean something when severity is narrowed) ──
+        const byType = {
+            NO_RECENT_VISIT:   gaps.filter((g) => g.gapType === 'NO_RECENT_VISIT').length,
+            INCOMPLETE_TRIAGE: gaps.filter((g) => g.gapType === 'INCOMPLETE_TRIAGE').length,
+            LOW_ADHERENCE:     gaps.filter((g) => g.gapType === 'LOW_ADHERENCE').length,
+            WELLNESS_DECLINE:  gaps.filter((g) => g.gapType === 'WELLNESS_DECLINE').length,
+            OVERDUE_PHASE:     gaps.filter((g) => g.gapType === 'OVERDUE_PHASE').length,
+        };
+
+        const filtered = severity ? gaps.filter((g) => g.severity === severity) : gaps;
+        const total = filtered.length;
+        const safePage = Math.max(1, Number(page) || 1);
+        const safeLimit = Math.min(100, Math.max(1, Number(limit) || 50));
+        const start = (safePage - 1) * safeLimit;
+        const pageRows = filtered.slice(start, start + safeLimit);
+
+        return {
+            summary: {
+                totalGaps: filtered.length,
+                highSeverity:   filtered.filter((g) => g.severity === 'HIGH').length,
+                mediumSeverity: filtered.filter((g) => g.severity === 'MEDIUM').length,
+                lowSeverity:    filtered.filter((g) => g.severity === 'LOW').length,
+                byType,
+            },
+            gaps: pageRows,
+            pagination: {
+                page: safePage,
+                limit: safeLimit,
+                total,
+                totalPages: Math.max(1, Math.ceil(total / safeLimit)),
+            },
+        };
+    }
+
     static async detectAndNotify() {
         let totalAlerts = 0;
 

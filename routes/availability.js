@@ -11,6 +11,13 @@ const router = express.Router();
 
 const BLOCK_KINDS = ['LEAVE', 'WFH', 'OFF', 'OTHER'];
 
+// All IWIS clinics operate on India Standard Time (UTC+05:30). Slot labels
+// like "09:00".."17:30" mean 9 AM to 5:30 PM IST, not UTC. Anchoring the
+// slot's instant to IST is what makes "is this slot in the past?" agree
+// with the receptionist's wall-clock. If the platform ever serves clinics
+// outside India this becomes a per-hospital column on `Hospital` / `Branch`.
+const CLINIC_TZ_OFFSET = '+05:30';
+
 const createBlockSchema = z.object({
     doctorId: z.string().uuid().optional(),
     therapistId: z.string().uuid().optional(),
@@ -105,6 +112,97 @@ router.delete('/block/:id', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_DOCT
     } catch (err) {
         next(err);
     }
+});
+
+/**
+ * GET /api/availability/slots?doctorId=X&date=YYYY-MM-DD
+ *
+ * Slot grid for the Walk-In booking modal (Step 4). Builds on
+ * AvailabilityService.getAvailableSlots — same 9-18 UTC window, 30-min
+ * cadence, BlockedSlot + Appointment overlap detection — and reshapes the
+ * result into the contract walkInBooking.service.ts consumes:
+ *
+ *   { slots: [{ time, dateTime, status: AVAILABLE|BOOKED|BLOCKED|PAST, blockReason? }],
+ *     nextAvailable: "HH:mm" | null,
+ *     doctorId, date, dayOfWeek,
+ *     workingHours: { start, end } }
+ *
+ * IMPORTANT — registered BEFORE the `/:doctorId` catch-all below. Without
+ * that ordering, Express would resolve `/slots` as `doctorId="slots"` and
+ * return getBlocks() results, which is what was producing the misleading
+ * "No working hours configured for this clinician on this date." empty
+ * state on the frontend (the call was 200-but-wrong-shape, not 404).
+ */
+const slotsQuerySchema = z.object({
+    doctorId: z.string().min(1, 'doctorId is required'),
+    date:     z.string().min(1, 'date is required'),
+});
+router.get('/slots', authMiddleware, validate({ query: slotsQuerySchema }), async (req, res, next) => {
+    try {
+        const { doctorId, date } = req.query;
+        // Robust YYYY-MM-DD parse — we explicitly construct a UTC-midnight
+        // Date instead of `new Date(date)`+`setHours(0,0,0,0)` because the
+        // latter is a timezone trap: on a non-UTC server (e.g. India is
+        // UTC+5:30), `new Date("2026-05-19")` parses as UTC midnight, then
+        // setHours uses LOCAL midnight, shifting the instant back to
+        // "2026-05-18T18:30:00Z" — every downstream `toISOString().slice(0,10)`
+        // and `getDay()` then ran against the wrong day, producing slot
+        // dateTimes that were always 24h before "now" and marking the entire
+        // grid as PAST. UTC construction sidesteps the whole problem.
+        const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(date).trim());
+        if (!m) {
+            return res.status(400).json({ error: 'INVALID_DATE', message: 'Invalid date — expected YYYY-MM-DD' });
+        }
+        const yyyy = Number(m[1]);
+        const mm   = Number(m[2]);
+        const dd   = Number(m[3]);
+        const baseDate = new Date(Date.UTC(yyyy, mm - 1, dd, 0, 0, 0, 0));
+        if (Number.isNaN(baseDate.getTime())) {
+            return res.status(400).json({ error: 'INVALID_DATE', message: 'Invalid date — expected YYYY-MM-DD' });
+        }
+
+        const rawSlots = await AvailabilityService.getAvailableSlots(doctorId, baseDate);
+        const now = new Date();
+        // `getUTCDay` instead of `getDay` so the dayOfWeek is independent of
+        // the server's local timezone — matters when the upstream service
+        // looks up recurring BlockedSlot rows keyed on dayOfWeek.
+        const dayOfWeek = baseDate.getUTCDay();
+        const ymd = `${m[1]}-${m[2]}-${m[3]}`;
+
+        const slots = rawSlots.map((s) => {
+            // Anchor the slot's instant in the clinic's timezone (IST) so
+            // that the past-check matches the wall-clock the receptionist
+            // sees. Without the +05:30 offset, "09:30" would be read as
+            // 09:30 UTC (= 15:00 IST), which made every morning slot look
+            // like it was still in the future to a viewer at 14:30 IST.
+            const dateTime = new Date(`${ymd}T${s.startTime}:00${CLINIC_TZ_OFFSET}`);
+            const isPast = dateTime.getTime() < now.getTime();
+            return {
+                time: s.startTime,
+                dateTime: dateTime.toISOString(),
+                // PAST takes priority over AVAILABLE — we never want to let the
+                // doctor walk a patient into a slot that has already elapsed.
+                // Existing BOOKED / BLOCKED rows stay as-is so the admin
+                // override flow can still see them.
+                status: isPast && s.status === 'AVAILABLE' ? 'PAST' : s.status,
+                blockReason: s.reason || undefined,
+            };
+        });
+
+        const nextAvailable = slots.find((s) => s.status === 'AVAILABLE')?.time ?? null;
+
+        res.json({
+            slots,
+            nextAvailable,
+            doctorId,
+            date: ymd,
+            dayOfWeek,
+            // Working hours are global constants in availability.service.js
+            // (CLINICAL_DAY_START / CLINICAL_DAY_END) — surfaced here so the
+            // UI can label the grid even if the slot array is empty.
+            workingHours: { start: '09:00', end: '18:00' },
+        });
+    } catch (err) { next(err); }
 });
 
 router.get('/:doctorId', authMiddleware, async (req, res, next) => {

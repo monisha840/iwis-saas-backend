@@ -394,6 +394,63 @@ export async function getRecipeById(recipeId) {
     return recipe;
 }
 
+/**
+ * Recipe typeahead — mirrors suggestFoods so the diet-meal "Link Food"
+ * dropdown can render foods and recipes side by side. Returns a lean
+ * shape with just enough metadata to render a result row and explain
+ * what gets linked when the user picks it.
+ */
+export async function suggestRecipes({ query, doshaTarget, branchId, limit = 8 }) {
+    if (!branchId) throw httpError(400, 'BRANCH_REQUIRED', 'branchId is required');
+    const safeLimit = Math.min(50, Math.max(1, Number(limit) || 8));
+    const trimmed = (query || '').trim();
+    const where = { branchId, isActive: true };
+    if (trimmed.length > 0) {
+        where.OR = [
+            { name:        { contains: trimmed, mode: 'insensitive' } },
+            { nameInTamil: { contains: trimmed, mode: 'insensitive' } },
+        ];
+    }
+    if (doshaTarget === 'VATA' || doshaTarget === 'PITTA' || doshaTarget === 'KAPHA' || doshaTarget === 'TRIDOSHA') {
+        // Recipes carry their pacifying targets as a string array, so we
+        // bump matches to the top via a separate query (no compound where
+        // is needed — the AND would over-filter and miss good matches).
+        const targeted = await prisma.ayurvedicRecipe.findMany({
+            where: { ...where, doshaTargets: { has: doshaTarget } },
+            orderBy: [{ name: 'asc' }],
+            take: safeLimit,
+            select: {
+                id: true, name: true, nameInTamil: true, doshaTargets: true,
+                mealCategory: true,
+                _count: { select: { ingredients: true } },
+            },
+        });
+        if (targeted.length >= safeLimit) return targeted;
+        const excludeIds = targeted.map((r) => r.id);
+        const filler = await prisma.ayurvedicRecipe.findMany({
+            where: { ...where, id: { notIn: excludeIds.length ? excludeIds : ['__none__'] } },
+            orderBy: [{ name: 'asc' }],
+            take: safeLimit - targeted.length,
+            select: {
+                id: true, name: true, nameInTamil: true, doshaTargets: true,
+                mealCategory: true,
+                _count: { select: { ingredients: true } },
+            },
+        });
+        return [...targeted, ...filler];
+    }
+    return prisma.ayurvedicRecipe.findMany({
+        where,
+        orderBy: [{ name: 'asc' }],
+        take: safeLimit,
+        select: {
+            id: true, name: true, nameInTamil: true, doshaTargets: true,
+            mealCategory: true,
+            _count: { select: { ingredients: true } },
+        },
+    });
+}
+
 function _normaliseRecipeInput(raw) {
     if (!raw || typeof raw !== 'object') throw httpError(400, 'INVALID_PAYLOAD', 'Recipe payload is required');
     const name = typeof raw.name === 'string' ? raw.name.trim() : '';
@@ -545,6 +602,75 @@ export async function linkFoodToMeal(mealId, { foodId, foodNameFree, quantity, u
             food: { select: { id: true, name: true, nameInTamil: true, category: true, calories: true,
                               doshaEffectVata: true, doshaEffectPitta: true, doshaEffectKapha: true } },
         },
+    });
+}
+
+/**
+ * Link an entire recipe to a meal by expanding each of its ingredients
+ * into a DietMealFoodLink row. No DietMealRecipeLink table exists — the
+ * recipe is treated as a "shortcut" for bulk-adding food links, which
+ * keeps the data model identical to manual linking and avoids a schema
+ * migration. Each generated link's `notes` records the source recipe so
+ * later edits can still see where the row came from.
+ *
+ * Returns { added, links } where `added` is the count of created rows.
+ */
+export async function linkRecipeToMeal(mealId, { recipeId, isAvoid }) {
+    if (!mealId)   throw httpError(400, 'MEAL_REQUIRED',   'mealId is required');
+    if (!recipeId) throw httpError(400, 'RECIPE_REQUIRED', 'recipeId is required');
+
+    const [meal, recipe] = await Promise.all([
+        prisma.dietMeal.findUnique({ where: { id: mealId }, select: { id: true } }),
+        prisma.ayurvedicRecipe.findUnique({
+            where: { id: recipeId },
+            include: {
+                ingredients: {
+                    orderBy: [{ sortOrder: 'asc' }],
+                    include: { food: { select: { id: true } } },
+                },
+            },
+        }),
+    ]);
+    if (!meal)   throw httpError(404, 'NOT_FOUND',        'Diet meal not found');
+    if (!recipe) throw httpError(404, 'RECIPE_NOT_FOUND', 'Recipe not found');
+    if (!recipe.ingredients || recipe.ingredients.length === 0) {
+        throw httpError(409, 'EMPTY_RECIPE', 'This recipe has no ingredients to link');
+    }
+
+    // Append new links after any existing ones on the same isAvoid bucket
+    // so the sort order stays stable.
+    const last = await prisma.dietMealFoodLink.findFirst({
+        where: { mealId, isAvoid: !!isAvoid },
+        orderBy: { sortOrder: 'desc' },
+        select: { sortOrder: true },
+    });
+    let nextOrder = (last?.sortOrder ?? -1) + 1;
+
+    const noteTag = `from recipe: ${recipe.name}`;
+
+    return prisma.$transaction(async (tx) => {
+        const created = [];
+        for (const ing of recipe.ingredients) {
+            if (!ing.foodId) continue; // defensive — ingredient without a Food row can't be linked
+            const link = await tx.dietMealFoodLink.create({
+                data: {
+                    mealId,
+                    foodId:       ing.foodId,
+                    foodNameFree: null,
+                    quantity:     ing.quantity ?? null,
+                    unit:         ing.unit || null,
+                    notes:        ing.notes ? `${noteTag} · ${ing.notes}` : noteTag,
+                    isAvoid:      !!isAvoid,
+                    sortOrder:    nextOrder++,
+                },
+                include: {
+                    food: { select: { id: true, name: true, nameInTamil: true, category: true, calories: true,
+                                      doshaEffectVata: true, doshaEffectPitta: true, doshaEffectKapha: true } },
+                },
+            });
+            created.push(link);
+        }
+        return { added: created.length, recipeId, recipeName: recipe.name, links: created };
     });
 }
 

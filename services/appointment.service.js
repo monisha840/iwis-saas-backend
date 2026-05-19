@@ -989,13 +989,36 @@ export class AppointmentService {
         const { circuitOpen, available } = cacheService.getStatus();
         const cacheStatus = (!available || circuitOpen) ? 'degraded' : 'ok';
 
+        // Time-based PAST gating: when the patient picks today, any slot
+        // whose start is at-or-before "now + 30 min buffer" is marked PAST so
+        // the UI can grey it out. The 30-min buffer gives the clinician time
+        // to prepare. AvailabilityService stays generic (BLOCKED/BOOKED only);
+        // we layer wall-clock awareness in this wrapper.
+        const now = new Date();
+        const isToday = new Date(date).toDateString() === now.toDateString();
+        const bufferTime = new Date(now.getTime() + 30 * 60 * 1000);
+
         const enriched = await Promise.all(slots.map(async (slot) => {
             const holdKey = `slot:hold:${clinicianId}:${date}:${slot.startTime}`;
             const held = cacheStatus === 'ok' ? await cacheService.get(holdKey) : null;
             const isHeld = !!held;
-            const spotsLeft = slot.status === 'AVAILABLE' && !isHeld ? 1 : 0;
+
+            // PAST takes precedence over the AvailabilityService verdict.
+            // We deliberately do NOT overwrite a BOOKED/BLOCKED status —
+            // the patient should still see WHY they can't book, not just
+            // "past". The lower-level reasons are more informative.
+            let status = slot.status;
+            if (isToday && status === 'AVAILABLE') {
+                const [hh, mm] = slot.startTime.split(':').map(Number);
+                const slotDateTime = new Date(date);
+                slotDateTime.setHours(hh, mm, 0, 0);
+                if (slotDateTime <= bufferTime) status = 'PAST';
+            }
+
+            const spotsLeft = status === 'AVAILABLE' && !isHeld ? 1 : 0;
             return {
                 ...slot,
+                status,
                 time: slot.startTime,
                 spotsLeft,
                 isNearlyFull: spotsLeft <= 1 && spotsLeft > 0,
@@ -1003,7 +1026,15 @@ export class AppointmentService {
             };
         }));
 
-        return { slots: enriched, cacheStatus };
+        const nextAvailable = enriched.find((s) => s.status === 'AVAILABLE' && !s.isHeld);
+
+        return {
+            slots: enriched,
+            cacheStatus,
+            isToday,
+            currentTime: now.toTimeString().slice(0, 5),
+            nextAvailable: nextAvailable?.time ?? null,
+        };
     }
 
     /**

@@ -1,6 +1,52 @@
 import prisma from '../lib/prisma.js';
 
 /**
+ * Ownership / mutation gate for a single group session. Used by the
+ * cancel + complete routes so the role-level `authorizeRoles` check
+ * (DOCTOR is allowed in by role) doesn't silently let one doctor mutate
+ * a session another doctor created.
+ *
+ * Allow rules, in order:
+ *   1. ADMIN / ADMIN_DOCTOR — full org-wide oversight.
+ *   2. The user who POSTed the create (`createdById === user.id`).
+ *   3. THERAPIST who is the assigned lead on this session
+ *      (Therapist.userId === user.id AND therapist.id === session.therapistId).
+ * Anything else → 403. Legacy rows with `createdById === null` fall
+ * through to (3) if the caller is the lead therapist; otherwise they
+ * can only be mutated by admins (which is rule 1).
+ *
+ * Throws an Error with `.status` set so the express error middleware
+ * surfaces the right HTTP code.
+ */
+export async function assertCanMutateSession(sessionId, user) {
+    if (user.role === 'ADMIN' || user.role === 'ADMIN_DOCTOR') return;
+
+    const session = await prisma.groupSession.findUnique({
+        where: { id: sessionId },
+        select: { id: true, createdById: true, therapistId: true },
+    });
+    if (!session) {
+        const e = new Error('Session not found'); e.status = 404; throw e;
+    }
+
+    // Author can always mutate (set at create time).
+    if (session.createdById && session.createdById === user.id) return;
+
+    // Lead therapist can mutate (attendance / completion is their job).
+    if (user.role === 'THERAPIST') {
+        const therapistRow = await prisma.therapist.findUnique({
+            where: { userId: user.id },
+            select: { id: true },
+        });
+        if (therapistRow && therapistRow.id === session.therapistId) return;
+    }
+
+    const e = new Error('You are not authorised to modify this group session');
+    e.status = 403;
+    throw e;
+}
+
+/**
  * Group Therapy Session scheduling (IWIS competitor feature 6)
  * One therapist + optional room, many patients. Each patient enrolment is still a
  * first-class Appointment row (sharing the same groupSessionId) so existing billing,
@@ -28,7 +74,7 @@ export class GroupSessionService {
         return session;
     }
 
-    static async list({ branchId, hospitalId, date, therapistId } = {}) {
+    static async list({ branchId, hospitalId, date, therapistId, patientId } = {}) {
         const where = { ...(therapistId ? { therapistId } : {}) };
         if (branchId) where.branchId = branchId;
         else if (hospitalId) where.branch = { hospitalId };
@@ -37,6 +83,11 @@ export class GroupSessionService {
             const end   = new Date(date); end.setHours(23,59,59,999);
             where.date = { gte: start, lte: end };
         }
+        // Patient-scoped listing: only return sessions the patient has been
+        // enrolled in (via an Appointment row keyed to the group session).
+        // Without this, patients could see every group session in the branch
+        // — including ones they weren't invited to.
+        if (patientId) where.appointments = { some: { patientId } };
         const sessions = await prisma.groupSession.findMany({
             where,
             include: {

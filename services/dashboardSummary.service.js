@@ -97,6 +97,7 @@ export class DashboardSummaryService {
             xp,
             rank,
             roster,
+            assignments,
             groupSessionsTodayOnwards,
         ] = await Promise.all([
             prisma.appointment.count({
@@ -176,6 +177,24 @@ export class DashboardSummaryService {
                 orderBy: { updatedAt: 'desc' },
                 take: 10,
             }).catch(() => []),
+            // Patients explicitly assigned to this doctor via the staff
+            // assignment workflow. Most clinics don't bother starting a
+            // formal TreatmentJourney for every patient, so without this
+            // source the "Patient Roster" widget was empty for any doctor
+            // whose patients hadn't been ceremoniously enrolled in a
+            // journey. NOTE: PatientAssignment.doctorId references
+            // Doctor.id (not User.id), so we use `doctorId` (line 68),
+            // not `userId`.
+            prisma.patientAssignment.findMany({
+                where: { doctorId, status: 'ACTIVE' },
+                select: {
+                    id: true,
+                    reason: true,
+                    patient: { select: { id: true, fullName: true, patientId: true } },
+                },
+                orderBy: { assignedAt: 'desc' },
+                take: 20,
+            }).catch(() => []),
             // Upcoming group sessions in the doctor's branch scope, OR any
             // session with a participating appointment owned by this doctor —
             // covers the case where a doctor co-runs a session alongside the
@@ -243,18 +262,47 @@ export class DashboardSummaryService {
                 suggestedSpecialty: t.suggestedSpecialty,
                 daysSince: Math.max(0, Math.floor((Date.now() - new Date(t.createdAt).getTime()) / (24 * 60 * 60 * 1000))),
             })),
-            roster: roster.map(j => ({
-                journeyId: j.id,
-                title: j.title,
-                condition: j.condition,
-                wellnessScore: j.wellnessScore,
-                patient: j.patient?.patient ? {
-                    id: j.patient.patient.id,
-                    fullName: j.patient.patient.fullName,
-                    patientId: j.patient.patient.patientId,
-                } : { id: j.patientId, fullName: j.patient?.email, patientId: null },
-                currentPhase: j.phases?.[0]?.name || null,
-            })),
+            roster: (() => {
+                // Active treatment journeys first — they carry richer
+                // clinical context (phase, wellness score). Track which
+                // patient ids we've already surfaced so assignment-derived
+                // rows don't duplicate them.
+                const seenPatientIds = new Set();
+                const journeyRows = roster.map(j => {
+                    const pid = j.patient?.patient?.id ?? j.patientId ?? null;
+                    if (pid) seenPatientIds.add(pid);
+                    return {
+                        journeyId: j.id,
+                        title: j.title,
+                        condition: j.condition,
+                        wellnessScore: j.wellnessScore,
+                        patient: j.patient?.patient ? {
+                            id: j.patient.patient.id,
+                            fullName: j.patient.patient.fullName,
+                            patientId: j.patient.patient.patientId,
+                        } : { id: j.patientId, fullName: j.patient?.email, patientId: null },
+                        currentPhase: j.phases?.[0]?.name || null,
+                    };
+                });
+                // Assigned patients without a journey row. Synthetic
+                // `journeyId: 'assignment:<id>'` keeps the frontend's
+                // `key={r.journeyId}` unique without a type contract change.
+                const assignmentRows = assignments
+                    .filter(a => a.patient && !seenPatientIds.has(a.patient.id))
+                    .map(a => ({
+                        journeyId: `assignment:${a.id}`,
+                        title: '',
+                        condition: a.reason || 'Active care',
+                        wellnessScore: 0,
+                        patient: {
+                            id: a.patient.id,
+                            fullName: a.patient.fullName,
+                            patientId: a.patient.patientId,
+                        },
+                        currentPhase: null,
+                    }));
+                return [...journeyRows, ...assignmentRows];
+            })(),
             groupSessions: groupSessionsTodayOnwards.map(s => ({
                 id: s.id,
                 title: s.title,

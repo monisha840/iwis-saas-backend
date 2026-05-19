@@ -40,7 +40,11 @@ const config = {
     refreshSecret: process.env.JWT_REFRESH_SECRET || (isProduction
       ? (() => { throw new Error('JWT_REFRESH_SECRET is required in production'); })()
       : 'dev-fallback-refresh-secret-do-not-use-in-production'),
-    expiresIn: process.env.JWT_EXPIRES_IN || '15m',
+    // 7 days keeps the user signed in across a normal working week. The
+    // previous 15m fallback caused silent logouts every quarter-hour when
+    // .env didn't override it, which was the default state of most local
+    // dev setups.
+    expiresIn: process.env.JWT_EXPIRES_IN || '7d',
     refreshExpiresIn: process.env.JWT_REFRESH_EXPIRES_IN || '30d',
   },
 

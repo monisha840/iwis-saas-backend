@@ -224,6 +224,14 @@ export class OperationsController {
             if (/already clocked in|leave/i.test(err?.message || '')) {
                 return res.status(409).json({ error: err.message });
             }
+            // P2002 = Prisma unique-constraint violation. Race condition
+            // when the same user double-clicks Clock In: both requests pass
+            // the `existing.clockIn` null-check, both call upsert, and the
+            // second one hits @@unique([userId, date]). Translate to the
+            // same friendly 409 the regex above produces. Audit fix #7.
+            if (err?.code === 'P2002') {
+                return res.status(409).json({ error: 'Already clocked in for today' });
+            }
             next(err);
         }
     }

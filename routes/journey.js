@@ -133,6 +133,21 @@ router.post('/',
             if (!req.body.patientId) {
                 return res.status(400).json({ error: 'PATIENT_REQUIRED', message: 'Select a patient before saving the journey.' });
             }
+            // The frontend now uses the searchable PatientPicker which emits
+            // Patient.id. TreatmentJourney.patientId however points at User.id
+            // (see service.js — the FK is on the User table). Normalise here
+            // by accepting either form: look the patient up via id-or-userId
+            // and pin the body to the user's id before the service call. This
+            // mirrors what forceBranchFromUser already does for branch
+            // resolution above so the two stay in lock-step.
+            const resolved = await prisma.patient.findFirst({
+                where: { OR: [{ id: req.body.patientId }, { userId: req.body.patientId }] },
+                select: { userId: true },
+            });
+            if (!resolved?.userId) {
+                return res.status(404).json({ error: 'PATIENT_NOT_FOUND', message: 'Selected patient could not be located.' });
+            }
+            req.body.patientId = resolved.userId;
             const journey = await JourneyService.createJourney(
                 req.user.id, req.body.patientId, req.body.branchId, req.body
             );

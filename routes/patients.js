@@ -87,7 +87,14 @@ router.post(
                         age: ageNum,
                         dob,
                         gender: gender.toUpperCase(),
-                        isGuest: true,
+                        // NOTE: Patient has no `isGuest` column today. The
+                        // walk-in source is preserved in onboardingData.source
+                        // = 'WALK_IN' and the unverified state is captured by
+                        // onboardingCompleted: false — that combination is the
+                        // authoritative "guest" signal. If we ever need a
+                        // first-class flag (e.g. for badges in patient search),
+                        // add `isGuest Boolean @default(false)` via prisma db
+                        // execute and reinstate the write here.
                         onboardingCompleted: false,
                         onboardingData: {
                             name,

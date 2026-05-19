@@ -257,19 +257,19 @@ export async function initializeWebSocket(httpServer) {
                                 // NotificationContext socket listener picks it up in real-time
                                 io.to(`user:${userId}`).emit('notification', notification);
 
-                                // Patient → clinician chat: also emit a dedicated
-                                // 'new_chat_message_notification' so the doctor's
-                                // notification bell can surface a toast with a
-                                // direct "Open Chat" action.
-                                if (socket.userRole === 'PATIENT') {
-                                    io.to(`user:${userId}`).emit('new_chat_message_notification', {
-                                        senderId: socket.userId,
-                                        senderName,
-                                        preview,
-                                        conversationId,
-                                        timestamp: new Date(),
-                                    });
-                                }
+                                // Rich chat-toast event with a dedicated CTA payload —
+                                // emitted to BOTH directions (patient → clinician and
+                                // clinician → patient). Drives the dashboard's animated
+                                // UnreadChatBanner + the global "Open Chat" toast.
+                                // (Was patient-only before; the asymmetry meant
+                                // doctors got a rich CTA toast but patients never did.)
+                                io.to(`user:${userId}`).emit('new_chat_message_notification', {
+                                    senderId: socket.userId,
+                                    senderName,
+                                    preview,
+                                    conversationId,
+                                    timestamp: new Date(),
+                                });
                             } catch (perUserErr) {
                                 // Non-critical per-recipient failure — log and continue
                                 logger.warn('[WebSocket] message notification failed', {

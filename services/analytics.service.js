@@ -6,8 +6,22 @@ import prisma from '../lib/prisma.js';
  */
 class AnalyticsService {
     /**
-     * Get patient progress analytics
-     * @param {Object} filters - Date range and other filters
+     * Get patient progress analytics.
+     *
+     * Source switched from the legacy `Journey` model (session-counting,
+     * Doctor.id-keyed) to `TreatmentJourney` (phase-based IWIS clinical
+     * journey, User.id-keyed) — bug-fix for the empty Patient Progress
+     * section. Existing product flows populate TreatmentJourney; the
+     * legacy table is mostly empty in current installs.
+     *
+     * Response shape kept identical so the frontend stays unchanged:
+     *   totalSessions      = total phases on the journey
+     *   completedSessions  = phases with status COMPLETED
+     *   progress           = completedPhases / totalPhases × 100
+     *
+     * `doctorId` filter accepts either Doctor.id or User.id — the column
+     * is User.id on TreatmentJourney, so we resolve once if the caller
+     * passed a Doctor.id by mistake.
      */
     async getPatientProgress(filters = {}) {
         const { startDate, endDate, doctorId, status, branchId } = filters;
@@ -18,32 +32,58 @@ class AnalyticsService {
             if (startDate) where.startDate.gte = new Date(startDate);
             if (endDate) where.startDate.lte = new Date(endDate);
         }
-        if (doctorId) where.doctorId = doctorId;
         if (status) where.status = status;
-        // Journey has no direct branchId — scope via the assigned doctor's branch.
-        if (branchId) where.doctor = { ...(where.doctor || {}), user: { branchId } };
+        // TreatmentJourney has its own branchId column — direct filter.
+        if (branchId) where.branchId = branchId;
+        if (doctorId) {
+            const docRow = await prisma.doctor.findFirst({
+                where:  { OR: [{ id: doctorId }, { userId: doctorId }] },
+                select: { userId: true },
+            });
+            // If caller passed an id that doesn't match either form, fall
+            // back to it as-is — the query will return nothing and the
+            // empty state surfaces, which is the correct response for an
+            // unknown doctor id.
+            where.doctorId = docRow?.userId || doctorId;
+        }
 
-        const journeys = await prisma.journey.findMany({
+        const journeys = await prisma.treatmentJourney.findMany({
             where,
             include: {
-                patient: { include: { user: true } },
-                doctor: { include: { user: true } },
+                // patientId is User.id — nested include reaches the Patient profile.
+                patient: { include: { patient: true } },
+                // doctorId is User.id — same hop.
+                doctor:  { include: { doctor: true } },
+                phases:  { select: { status: true } },
             },
             orderBy: { startDate: 'desc' },
         });
 
-        return journeys.map((journey) => ({
-            patientId: journey.patient.patientId,
-            patientName: journey.patient.fullName,
-            totalSessions: journey.totalSessions,
-            completedSessions: journey.completedSessions,
-            progress: journey.totalSessions > 0
-                ? Math.round((journey.completedSessions / journey.totalSessions) * 100)
-                : 0,
-            lastSession: journey.updatedAt,
-            status: journey.status,
-            doctorName: journey.doctor.fullName,
-        }));
+        return journeys.map((journey) => {
+            const totalPhases = journey.phases.length;
+            const completedPhases = journey.phases.filter((p) => p.status === 'COMPLETED').length;
+            const patientName = journey.patient?.patient?.fullName
+                || journey.patient?.email
+                || 'Unknown';
+            const doctorName = journey.doctor?.doctor?.fullName
+                || journey.doctor?.email
+                || 'Unknown';
+            return {
+                patientId: journey.patient?.patient?.patientId
+                    || journey.patient?.patient?.id
+                    || journey.patient?.id
+                    || null,
+                patientName,
+                totalSessions: totalPhases,
+                completedSessions: completedPhases,
+                progress: totalPhases > 0
+                    ? Math.round((completedPhases / totalPhases) * 100)
+                    : 0,
+                lastSession: journey.updatedAt,
+                status: journey.status,
+                doctorName,
+            };
+        });
     }
 
     /**
@@ -463,8 +503,19 @@ class AnalyticsService {
             }
         };
 
-        // Role-based filtering
-        if (role === 'DOCTOR' || role === 'ADMIN_DOCTOR') {
+        // Role-based filtering.
+        //
+        // DOCTOR / THERAPIST → personal scope (their own completed appointments).
+        // ADMIN / ADMIN_DOCTOR → org-wide oversight — NO personal-id filter.
+        //
+        // The previous code lumped ADMIN_DOCTOR in with DOCTOR, which
+        // restricted Dr. Saleem's "this month" report to only HIS personal
+        // completed appointments. Result: the Reports page showed an empty
+        // section whenever an admin doctor hadn't personally consulted that
+        // month, regardless of how many appointments the rest of the
+        // hospital had completed. ADMIN_DOCTORs are now treated like
+        // ADMIN here — they get the hospital-wide view.
+        if (role === 'DOCTOR') {
             const doctor = await prisma.doctor.findUnique({ where: { userId } });
             if (doctor) where.doctorId = doctor.id;
         } else if (role === 'THERAPIST') {

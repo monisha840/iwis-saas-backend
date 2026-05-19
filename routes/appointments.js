@@ -363,12 +363,20 @@ router.get('/available-slots', authMiddleware, roleMiddleware(['ADMIN', 'ADMIN_D
     if (!clinicianId || !date) {
       return res.status(400).json({ error: 'clinicianId and date are required' });
     }
-    // The service returns { slots, cacheStatus }. The booking flow expects a
-    // bare array — keep the cacheStatus reachable as a response header for
-    // ops + future client-side degraded-mode handling.
+    // The service returns { slots, cacheStatus, isToday, currentTime,
+    // nextAvailable }. We pass the full envelope to the client now (was a
+    // bare array) so the patient booking UI can render the "Next available
+    // slot today: HH:MM" banner and surface a clear empty-state for days
+    // where everything has passed. cacheStatus remains piggy-backed on
+    // the response header for ops + future degraded-mode handling.
     const result = await AppointmentService.getAvailableSlots(clinicianId, date);
     if (result?.cacheStatus) res.set('X-Slot-Cache-Status', result.cacheStatus);
-    res.json(result?.slots ?? []);
+    res.json({
+      slots: result?.slots ?? [],
+      isToday: result?.isToday ?? false,
+      currentTime: result?.currentTime ?? null,
+      nextAvailable: result?.nextAvailable ?? null,
+    });
   } catch (err) {
     next(err);
   }

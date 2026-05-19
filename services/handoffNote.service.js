@@ -256,7 +256,19 @@ export class HandoffNoteService {
       prisma.handoffNote.count({ where }),
     ]);
 
-    const data = rows.map((r) => ({ ...r, fromClinician: flattenUserName(r.fromClinician) }));
+    const data = rows.map((r) => {
+      const fromClinician = flattenUserName(r.fromClinician);
+      // Flat *Name fields mirror the HandoffNoteEntry TS type so the
+      // received-list card renders "From: Dr. Foo" / "Patient: Jane"
+      // instead of falling through to the raw UUIDs.
+      return {
+        ...r,
+        fromClinician,
+        patientName: r.patient?.fullName ?? null,
+        fromClinicianName: fromClinician?.name ?? null,
+        toBranchName: r.toBranch?.name ?? null,
+      };
+    });
 
     return {
       data,
@@ -294,7 +306,19 @@ export class HandoffNoteService {
       prisma.handoffNote.count({ where }),
     ]);
 
-    const data = rows.map((r) => ({ ...r, toClinician: flattenUserName(r.toClinician) }));
+    const data = rows.map((r) => {
+      const toClinician = flattenUserName(r.toClinician);
+      // Same flat-shape mirror as getReceivedHandoffs — the Sent tab
+      // shows "Patient: <name>" / "To: <name>" cards that read these
+      // *Name fields, not the nested objects.
+      return {
+        ...r,
+        toClinician,
+        patientName: r.patient?.fullName ?? null,
+        toClinicianName: toClinician?.name ?? null,
+        toBranchName: r.toBranch?.name ?? null,
+      };
+    });
 
     return {
       data,

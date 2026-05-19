@@ -2,12 +2,35 @@ import multer from 'multer';
 import { createClient } from '@supabase/supabase-js';
 import logger from '../lib/logger.js';
 
-// Supabase client (initialized lazily)
+// Supabase client (initialized lazily).
+// We require the service-key to *look* like a JWT (three dot-separated
+// base64url segments) before treating Supabase as configured. Without this,
+// a placeholder env var like "your-key-here" was accepted at startup but
+// failed inside the Supabase SDK on first upload with "Invalid Compact JWS"
+// (jose's parser rejecting the malformed JWT) — and the patient never got
+// a usable fallback. Failing the check early lets `uploadToSupabase` route
+// straight to disk storage instead.
 let supabase = null;
+let supabaseChecked = false;
+function looksLikeJwt(s) {
+    if (typeof s !== 'string') return false;
+    const parts = s.split('.');
+    if (parts.length !== 3) return false;
+    // Each segment must be non-empty base64url. Cheapest validation that
+    // catches placeholders without paying the cost of full JWT decode.
+    return parts.every((p) => /^[A-Za-z0-9_-]+$/.test(p));
+}
 function getSupabase() {
-    if (!supabase && process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY) {
-        supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+    if (supabase || supabaseChecked) return supabase;
+    supabaseChecked = true;
+    const url = process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_KEY;
+    if (!url || !key) return null;
+    if (!looksLikeJwt(key)) {
+        logger.warn('[Upload] SUPABASE_SERVICE_KEY is set but does not look like a JWT — falling back to disk storage');
+        return null;
     }
+    supabase = createClient(url, key);
     return supabase;
 }
 

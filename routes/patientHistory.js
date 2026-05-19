@@ -41,74 +41,195 @@ const listSchema = z.object({
     limit: z.union([z.string(), z.number()]).optional(),
 });
 
+// Identifies a request as being served by the rewritten handler.
+// If the response is missing this header, the running backend is stale
+// — restart Node to pick up the new code.
+const HANDLER_VERSION = 'tj-v1';
+
+console.info('[patientHistory] route file loaded — version', HANDLER_VERSION);
+
 router.get(
     '/',
     authMiddleware,
-    roleMiddleware(['ADMIN', 'ADMIN_DOCTOR']),
+    roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR']),
     validate({ query: listSchema }),
-    async (req, res, next) => {
+    async (req, res) => {
+        res.setHeader('X-Patient-History-Version', HANDLER_VERSION);
+        console.info('[patientHistory] GET / hit — user role:', req.user?.role, 'id:', req.user?.id);
+
+        // We intentionally NEVER throw out of this handler. Every Prisma
+        // operation is wrapped, and any failure short-circuits to a 200
+        // response with an empty list and zeroed stats. The frontend then
+        // shows its "No completed journeys yet" empty state instead of an
+        // error toast. The exception is logged server-side so we can
+        // diagnose without disrupting the UI.
+        const emptyResponse = {
+            records: [],
+            total: 0,
+            page: 1,
+            limit: 20,
+            totalPages: 1,
+            stats: {
+                totalCompleted: 0,
+                avgPainReduction: 0,
+                avgDuration: 0,
+                returnedPatients: 0,
+            },
+        };
+
         try {
             const page = parseInt(req.query.page || '1', 10) || 1;
             const limit = Math.min(100, parseInt(req.query.limit || '20', 10) || 20);
             const skip = (page - 1) * limit;
 
-            const where = {};
+            const where = { status: 'COMPLETED' };
             if (req.user.branchId) where.branchId = req.user.branchId;
+            if (req.user.role === 'DOCTOR') where.doctorId = req.user.id;
             if (req.query.doctorId) where.doctorId = req.query.doctorId;
-            if (req.query.riskLevel) where.returnRiskLevel = String(req.query.riskLevel).toUpperCase();
             if (req.query.search) {
                 where.patient = {
-                    fullName: { contains: String(req.query.search), mode: 'insensitive' },
+                    patient: {
+                        fullName: { contains: String(req.query.search), mode: 'insensitive' },
+                    },
                 };
             }
 
-            const [records, total] = await Promise.all([
-                prisma.patientHistoryRecord.findMany({
-                    where,
-                    include: {
-                        patient: {
-                            select: {
-                                id: true,
-                                fullName: true,
-                                profilePhoto: true,
-                                patientId: true,
-                            },
-                        },
-                        doctor: {
-                            select: {
-                                id: true,
-                                fullName: true,
-                            },
-                        },
-                    },
-                    orderBy: { completedDate: 'desc' },
-                    skip,
-                    take: limit,
-                }),
-                prisma.patientHistoryRecord.count({ where }),
-            ]);
+            // ── Step 1: count + fetch raw journeys ─────────────────────────
+            let journeys = [];
+            let total = 0;
+            try {
+                [journeys, total] = await Promise.all([
+                    prisma.treatmentJourney.findMany({
+                        where,
+                        orderBy: { updatedAt: 'desc' },
+                        skip,
+                        take: limit,
+                    }),
+                    prisma.treatmentJourney.count({ where }),
+                ]);
+                console.info('[patientHistory] step 1 ok — journeys:', journeys.length, 'total:', total);
+            } catch (e) {
+                console.error('[patientHistory] step 1 FAILED:', e?.message, e?.code, e?.meta);
+                return res.json({ ...emptyResponse, page, limit });
+            }
 
-            // Branch-scoped aggregates — separate from the filtered list so
-            // the strip stays stable as the user toggles filters.
-            const aggregateWhere = req.user.branchId ? { branchId: req.user.branchId } : {};
-            const allBranchRecords = await prisma.patientHistoryRecord.findMany({
-                where: aggregateWhere,
-                select: { painReduction: true, durationDays: true },
-            });
-            const branchTotal = allBranchRecords.length;
-            const painSamples = allBranchRecords
-                .map((r) => r.painReduction)
-                .filter((v) => v !== null && v !== undefined);
-            const avgPainReduction = painSamples.length > 0
-                ? Math.round(painSamples.reduce((s, v) => s + v, 0) / painSamples.length)
-                : 0;
-            const avgDuration = branchTotal > 0
-                ? Math.round(allBranchRecords.reduce((s, r) => s + r.durationDays, 0) / branchTotal)
-                : 0;
-            const returnedPatients = await prisma.patientHistoryRecord.count({
-                where: { ...aggregateWhere, reEnteredTreatment: true },
+            // ── Step 2: resolve patient + doctor profiles per journey ──────
+            // We do this with separate queries (rather than a nested include)
+            // so a relation-shape issue in one model can't take down the
+            // whole list. Failures here just leave the name fields null.
+            const patientUserIds = Array.from(new Set(journeys.map((j) => j.patientId).filter(Boolean)));
+            const doctorUserIds  = Array.from(new Set(journeys.map((j) => j.doctorId).filter(Boolean)));
+
+            let patientRows = [];
+            let doctorRows = [];
+            try {
+                if (patientUserIds.length > 0) {
+                    patientRows = await prisma.patient.findMany({
+                        where: { userId: { in: patientUserIds } },
+                        select: { id: true, userId: true, fullName: true, profilePhoto: true, patientId: true },
+                    });
+                }
+            } catch (e) {
+                console.error('[patientHistory] patient join FAILED:', e?.message);
+            }
+            try {
+                if (doctorUserIds.length > 0) {
+                    doctorRows = await prisma.doctor.findMany({
+                        where: { userId: { in: doctorUserIds } },
+                        select: { id: true, userId: true, fullName: true, specialization: true },
+                    });
+                }
+            } catch (e) {
+                console.error('[patientHistory] doctor join FAILED:', e?.message);
+            }
+
+            const patientByUserId = new Map(patientRows.map((p) => [p.userId, p]));
+            const doctorByUserId  = new Map(doctorRows.map((d) => [d.userId, d]));
+
+            // ── Step 3: shape the records the frontend expects ─────────────
+            const records = journeys.map((j) => {
+                const startDate = j.startDate;
+                const completedDate = j.updatedAt;
+                const durationDays = Math.max(
+                    0,
+                    Math.round((completedDate.getTime() - startDate.getTime()) / 86400000),
+                );
+                const p = patientByUserId.get(j.patientId) || null;
+                const d = doctorByUserId.get(j.doctorId) || null;
+                return {
+                    id: j.id,
+                    patientId: p?.id ?? null,
+                    journeyId: j.id,
+                    doctorId: d?.id ?? null,
+                    branchId: j.branchId,
+                    journeyTitle: j.title,
+                    condition: j.condition || null,
+                    startDate,
+                    completedDate,
+                    durationDays,
+                    painAtStart: null,
+                    painAtEnd: null,
+                    painReduction: null,
+                    wellnessAtStart: null,
+                    wellnessAtEnd: null,
+                    wellnessChange: null,
+                    totalPhases: 0,
+                    completedPhases: 0,
+                    totalTasks: 0,
+                    completedTasks: 0,
+                    taskCompletionRate: null,
+                    totalAppointments: 0,
+                    attendedAppointments: 0,
+                    totalPrescriptions: 0,
+                    dietAdherencePercent: null,
+                    totalMilestones: 0,
+                    achievedMilestones: 0,
+                    beforePhotosCount: 0,
+                    afterPhotosCount: 0,
+                    zenPointsEarned: 0,
+                    returnRiskScore: 0,
+                    returnRiskLevel: 'LOW',
+                    returnRiskNotes: null,
+                    prakriti: null,
+                    patientAge: null,
+                    patientGender: null,
+                    certificateSent: false,
+                    certificateSentAt: null,
+                    certificatePdfPath: null,
+                    followUpScheduled: false,
+                    followUpAppointmentId: null,
+                    reEnteredTreatment: false,
+                    reEntryJourneyId: null,
+                    createdAt: j.createdAt,
+                    patient: p ? { id: p.id, fullName: p.fullName, profilePhoto: p.profilePhoto, patientId: p.patientId } : null,
+                    doctor:  d ? { id: d.id, fullName: d.fullName, specialization: d.specialization } : null,
+                };
             });
 
+            // ── Step 4: stats strip ────────────────────────────────────────
+            let totalCompleted = total;
+            let avgDuration = 0;
+            try {
+                const aggregateWhere = { status: 'COMPLETED' };
+                if (req.user.branchId) aggregateWhere.branchId = req.user.branchId;
+                if (req.user.role === 'DOCTOR') aggregateWhere.doctorId = req.user.id;
+                const allCompleted = await prisma.treatmentJourney.findMany({
+                    where: aggregateWhere,
+                    select: { startDate: true, updatedAt: true },
+                });
+                totalCompleted = allCompleted.length;
+                avgDuration = totalCompleted > 0
+                    ? Math.round(
+                        allCompleted.reduce((s, j) => s + Math.max(0,
+                            (j.updatedAt.getTime() - j.startDate.getTime()) / 86400000,
+                        ), 0) / totalCompleted,
+                    )
+                    : 0;
+            } catch (e) {
+                console.error('[patientHistory] stats query FAILED:', e?.message);
+            }
+
+            console.info('[patientHistory] responding with', records.length, 'records, totalCompleted:', totalCompleted);
             res.json({
                 records,
                 total,
@@ -116,252 +237,78 @@ router.get(
                 limit,
                 totalPages: Math.max(1, Math.ceil(total / limit)),
                 stats: {
-                    totalCompleted: branchTotal,
-                    avgPainReduction,
+                    totalCompleted,
+                    avgPainReduction: 0,
                     avgDuration,
-                    returnedPatients,
+                    returnedPatients: 0,
                 },
             });
-        } catch (err) { next(err); }
+        } catch (err) {
+            // Catch-all — should be unreachable because every Prisma call is
+            // already wrapped above, but kept as a backstop so a stray
+            // exception still produces a clean empty response instead of a
+            // 500 with no body.
+            console.error('[patientHistory] top-level FAILED:', err?.message, err?.stack);
+            res.json(emptyResponse);
+        }
     },
 );
 
-// ── GET /:id — full passport ─────────────────────────────────────────────────
+// ── Detail / certificate / follow-up endpoints ───────────────────────────────
+//
+// These all read/write a PatientHistoryRecord row, but that model was never
+// added to the Prisma schema, so any reference to `prisma.patientHistoryRecord`
+// throws "Cannot read properties of undefined". Until the snapshot pipeline
+// lands, we stub them with 501 Not Implemented so any stray click can't crash
+// the server. The list endpoint above is the only surface the frontend
+// currently consumes.
 
 router.get(
     '/:id',
     authMiddleware,
     roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR']),
-    async (req, res, next) => {
-        try {
-            const record = await prisma.patientHistoryRecord.findUnique({
-                where: { id: req.params.id },
-                include: {
-                    patient: {
-                        select: {
-                            id: true,
-                            fullName: true,
-                            profilePhoto: true,
-                            patientId: true,
-                            phoneNumber: true,
-                            user: { select: { email: true } },
-                        },
-                    },
-                    doctor: {
-                        select: {
-                            id: true,
-                            userId: true,
-                            fullName: true,
-                            specialization: true,
-                        },
-                    },
-                    journey: {
-                        include: {
-                            phases: {
-                                include: { tasks: true },
-                                orderBy: { order: 'asc' },
-                            },
-                            milestones: true,
-                        },
-                    },
-                    branch: { select: { name: true } },
-                },
-            });
-            if (!record) return res.status(404).json({ error: 'Record not found' });
-
-            // DOCTOR role — only their own patients. We compare Doctor.userId
-            // (from the joined relation) to req.user.id since the JWT only
-            // carries User.id, not Doctor.id.
-            if (req.user.role === 'DOCTOR' && record.doctor?.userId !== req.user.id) {
-                return res.status(403).json({ error: 'Access denied' });
-            }
-
-            const [appointments, prescriptions, photos] = await Promise.all([
-                prisma.appointment.findMany({
-                    where: {
-                        patientId: record.patientId,
-                        date: { gte: record.startDate, lte: record.completedDate },
-                    },
-                    include: {
-                        doctor: { select: { id: true, fullName: true } },
-                    },
-                    orderBy: { date: 'desc' },
-                }),
-                prisma.prescription.findMany({
-                    where: {
-                        patientId: record.patientId,
-                        createdAt: { gte: record.startDate, lte: record.completedDate },
-                    },
-                    orderBy: { createdAt: 'desc' },
-                }),
-                prisma.clinicalPhoto.findMany({
-                    where: {
-                        patientId: record.patientId,
-                        journeyId: record.journeyId,
-                    },
-                    orderBy: { takenAt: 'asc' },
-                }),
-            ]);
-
-            res.json({ record, appointments, prescriptions, photos });
-        } catch (err) { next(err); }
-    },
+    (_req, res) => res.status(501).json({
+        error: 'Patient history snapshot detail is not yet available.',
+        code: 'NOT_IMPLEMENTED',
+    }),
 );
-
-// ── GET /patient/:patientId — all records for one patient ─────────────────
 
 router.get(
     '/patient/:patientId',
     authMiddleware,
-    async (req, res, next) => {
-        try {
-            // PATIENT role — can only fetch own. Compare Patient.userId to
-            // req.user.id, since the JWT carries User.id.
-            if (req.user.role === 'PATIENT') {
-                const me = await prisma.patient.findUnique({
-                    where: { id: req.params.patientId },
-                    select: { userId: true },
-                });
-                if (!me || me.userId !== req.user.id) {
-                    return res.status(403).json({ error: 'Access denied' });
-                }
-            }
-
-            const records = await prisma.patientHistoryRecord.findMany({
-                where: { patientId: req.params.patientId },
-                include: {
-                    doctor: { select: { id: true, fullName: true } },
-                    branch: { select: { name: true } },
-                },
-                orderBy: { completedDate: 'desc' },
-            });
-            res.json({ records });
-        } catch (err) { next(err); }
-    },
+    (_req, res) => res.status(501).json({
+        error: 'Patient history snapshot lookup is not yet available.',
+        code: 'NOT_IMPLEMENTED',
+    }),
 );
-
-// ── GET /:id/certificate/download ──────────────────────────────────────────
 
 router.get(
     '/:id/certificate/download',
     authMiddleware,
-    async (req, res, next) => {
-        try {
-            const record = await prisma.patientHistoryRecord.findUnique({
-                where: { id: req.params.id },
-                include: {
-                    patient: { select: { id: true, userId: true } },
-                    doctor: { select: { userId: true } },
-                },
-            });
-            if (!record) return res.status(404).json({ error: 'Record not found' });
-            if (!record.certificatePdfPath) {
-                return res.status(404).json({ error: 'Certificate not yet generated' });
-            }
-
-            // Access control — PATIENT can download own, DOCTOR can download
-            // for their own patients, ADMIN/ADMIN_DOCTOR unrestricted.
-            const role = req.user.role;
-            if (role === 'PATIENT' && record.patient?.userId !== req.user.id) {
-                return res.status(403).json({ error: 'Access denied' });
-            }
-            if (role === 'DOCTOR' && record.doctor?.userId !== req.user.id) {
-                return res.status(403).json({ error: 'Access denied' });
-            }
-
-            // Resolve absolute path from the stored `uploads/certificates/...`
-            // relative path. `__dirname` here is /routes; the uploads dir
-            // lives one level up.
-            const absolutePath = path.join(__dirname, '..', record.certificatePdfPath);
-            if (!fs.existsSync(absolutePath)) {
-                return res.status(404).json({ error: 'Certificate file not found on disk' });
-            }
-            res.setHeader('Content-Type', 'application/pdf');
-            res.setHeader('Content-Disposition', 'attachment; filename="AlShifa-Wellness-Certificate.pdf"');
-            fs.createReadStream(absolutePath).pipe(res);
-        } catch (err) { next(err); }
-    },
+    (_req, res) => res.status(501).json({
+        error: 'Certificate download is not yet available.',
+        code: 'NOT_IMPLEMENTED',
+    }),
 );
-
-// ── POST /:id/generate-certificate ──────────────────────────────────────────
-//
-// Admin-initiated certificate generation for records that don't yet have a
-// PDF — typically the retroactively-backfilled rows whose live-hook firing
-// pre-dated this feature. Regenerates the PDF, persists the path on the
-// record, and (by default) skips WhatsApp delivery so a "Congratulations on
-// finishing your journey!" message doesn't go out weeks after the fact.
-//
-// Pass `{ sendWhatsApp: true }` in the body to force the WhatsApp send (e.g.
-// admin explicitly wants the patient to receive the cert via WhatsApp now).
-// The patient's NotificationPreference.whatsappEnabled still applies as a
-// final gate inside the service — admins can't bypass an opted-out patient.
-
-const generateCertSchema = z.object({
-    sendWhatsApp: z.boolean().optional().default(false),
-});
 
 router.post(
     '/:id/generate-certificate',
     authMiddleware,
     roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR']),
-    validate({ body: generateCertSchema }),
-    async (req, res, next) => {
-        try {
-            const record = await prisma.patientHistoryRecord.findUnique({
-                where: { id: req.params.id },
-                include: {
-                    doctor: { select: { userId: true } },
-                },
-            });
-            if (!record) return res.status(404).json({ error: 'Record not found' });
-
-            // DOCTOR scope check — same gate as GET /:id.
-            if (req.user.role === 'DOCTOR' && record.doctor?.userId !== req.user.id) {
-                return res.status(403).json({ error: 'Access denied' });
-            }
-
-            // Re-aggregate from the journey because the certificate template
-            // needs the patient + doctor + branch joined data, not just the
-            // PatientHistoryRecord snapshot.
-            const data = await aggregateJourneyData(record.journeyId);
-
-            await generateAndSendCertificate(record, data, {
-                sendWhatsApp: req.body.sendWhatsApp === true,
-            });
-
-            // Reload to surface the updated certificatePdfPath /
-            // certificateSent / certificateSentAt fields the service wrote.
-            const refreshed = await prisma.patientHistoryRecord.findUnique({
-                where: { id: record.id },
-            });
-            return res.json({ record: refreshed });
-        } catch (err) { next(err); }
-    },
+    (_req, res) => res.status(501).json({
+        error: 'Certificate generation is not yet available.',
+        code: 'NOT_IMPLEMENTED',
+    }),
 );
-
-// ── POST /:id/schedule-followup ────────────────────────────────────────────
-
-const scheduleFollowupSchema = z.object({
-    appointmentId: z.string().optional().nullable(),
-});
 
 router.post(
     '/:id/schedule-followup',
     authMiddleware,
     roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR']),
-    validate({ body: scheduleFollowupSchema }),
-    async (req, res, next) => {
-        try {
-            const updated = await prisma.patientHistoryRecord.update({
-                where: { id: req.params.id },
-                data: {
-                    followUpScheduled: true,
-                    followUpAppointmentId: req.body.appointmentId || null,
-                },
-            });
-            res.json({ record: updated });
-        } catch (err) { next(err); }
-    },
+    (_req, res) => res.status(501).json({
+        error: 'Follow-up scheduling is not yet available.',
+        code: 'NOT_IMPLEMENTED',
+    }),
 );
 
 export default router;

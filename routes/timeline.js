@@ -40,6 +40,116 @@ router.get('/:id/timeline', authMiddleware, async (req, res, next) => {
 });
 
 /**
+ * GET /api/patients/:patientId/handoff-summary
+ * Powers the "Patient history (auto-loaded)" panel on the Create Handoff
+ * dialog. Aggregates the clinical context a receiving doctor needs — bio,
+ * primary doctor, active medications + conditions + diet, last/upcoming
+ * appointments, latest daily check-in. Read-only.
+ *
+ * Accessible by: ADMIN, ADMIN_DOCTOR, DOCTOR, THERAPIST. PATIENT cannot
+ * create handoffs, so no patient self-fetch path.
+ *
+ * Note: TreatmentJourney.patientId references User.id (not Patient.id),
+ * so we resolve Patient.userId before querying journeys.
+ */
+router.get(
+    '/:patientId/handoff-summary',
+    authMiddleware,
+    roleMiddleware(['ADMIN', 'ADMIN_DOCTOR', 'DOCTOR', 'THERAPIST']),
+    async (req, res, next) => {
+        try {
+            const { patientId } = req.params;
+
+            const patient = await prisma.patient.findUnique({
+                where: { id: patientId },
+                select: {
+                    id: true, userId: true, fullName: true,
+                    age: true, gender: true, phoneNumber: true,
+                },
+            });
+            if (!patient) return res.status(404).json({ error: 'Patient not found' });
+
+            const now = new Date();
+            const [
+                assignment, prescriptions, journeys, diet,
+                lastAppt, upcomingAppt, lastCheckin,
+            ] = await Promise.all([
+                prisma.patientAssignment.findFirst({
+                    where: { patientId, status: 'ACTIVE', type: 'PRIMARY' },
+                    include: { doctor: { select: { fullName: true, specialization: true } } },
+                }),
+                prisma.prescription.findMany({
+                    where: { patientId },
+                    orderBy: { createdAt: 'desc' },
+                    take: 10,
+                    select: { id: true, medicationName: true, dosage: true, frequency: true, duration: true },
+                }),
+                prisma.treatmentJourney.findMany({
+                    where: { patientId: patient.userId, status: 'ACTIVE' },
+                    select: { id: true, title: true, condition: true },
+                }),
+                prisma.dietPrescription.findFirst({
+                    where: { patientId, isActive: true },
+                    orderBy: { startDate: 'desc' },
+                    select: { id: true, title: true, doshaTarget: true },
+                }),
+                prisma.appointment.findFirst({
+                    where: {
+                        patientId,
+                        date: { lt: now },
+                        status: { notIn: ['CANCELLED', 'REJECTED', 'NO_SHOW'] },
+                    },
+                    orderBy: { date: 'desc' },
+                    select: {
+                        id: true, date: true, notes: true,
+                        doctor: { select: { fullName: true } },
+                    },
+                }),
+                prisma.appointment.findFirst({
+                    where: {
+                        patientId,
+                        date: { gte: now },
+                        status: { notIn: ['CANCELLED', 'REJECTED', 'COMPLETED'] },
+                    },
+                    orderBy: { date: 'asc' },
+                    select: {
+                        id: true, date: true, status: true,
+                        doctor: { select: { fullName: true } },
+                    },
+                }),
+                prisma.dailyCheckIn.findFirst({
+                    where: { patientId },
+                    orderBy: { createdAt: 'desc' },
+                    select: { painLevel: true, mood: true, sleepHours: true, createdAt: true },
+                }),
+            ]);
+
+            res.json({
+                data: {
+                    patient: {
+                        id: patient.id,
+                        name: patient.fullName,
+                        age: patient.age,
+                        gender: patient.gender,
+                        phone: patient.phoneNumber,
+                    },
+                    assignedDoctor: assignment?.doctor
+                        ? { fullName: assignment.doctor.fullName, specialization: assignment.doctor.specialization }
+                        : null,
+                    activeMedications: prescriptions,
+                    activeConditions: journeys.map((j) => j.condition).filter(Boolean),
+                    activeJourneys: journeys,
+                    activeDiet: diet,
+                    lastAppointment: lastAppt,
+                    upcomingAppointment: upcomingAppt,
+                    lastCheckIn: lastCheckin,
+                },
+            });
+        } catch (err) { next(err); }
+    },
+);
+
+/**
  * GET /api/patients/:id/pain-map
  * Latest pain-region snapshot for a patient — sourced from the most recent
  * DailyCheckIn that has a body-map array, falling back to the latest

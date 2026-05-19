@@ -106,6 +106,14 @@ const linkFoodSchema = z.object({
     message: 'Either foodId or foodNameFree is required',
 });
 
+// Recipe-link request — the recipe is expanded into multiple food-link rows
+// server-side. Only the recipe id + the eat/avoid bucket need to come from
+// the client; per-ingredient quantities are inherited from the recipe.
+const linkRecipeSchema = z.object({
+    recipeId: z.string().min(1),
+    isAvoid:  z.boolean().optional(),
+});
+
 // ── Multer (in-memory) for bulk import ───────────────────────────────────────
 const ALLOWED_BULK_MIME = new Set([
     'text/csv',
@@ -264,6 +272,20 @@ router.get('/recipes', roleMiddleware(RECIPE_VIEWER_ROLES), async (req, res) => 
     } catch (err) { sendServiceError(res, err); }
 });
 
+// IMPORTANT: /recipes/suggest must come BEFORE /recipes/:id, otherwise the
+// generic id matcher swallows "suggest" as an id and returns 404.
+router.get('/recipes/suggest', roleMiddleware(RECIPE_VIEWER_ROLES), async (req, res) => {
+    try {
+        const result = await svc.suggestRecipes({
+            query:       typeof req.query.query === 'string' ? req.query.query : '',
+            doshaTarget: typeof req.query.doshaTarget === 'string' ? req.query.doshaTarget : undefined,
+            branchId:    req.user.branchId,
+            limit:       req.query.limit ? Number(req.query.limit) : undefined,
+        });
+        res.json(result);
+    } catch (err) { sendServiceError(res, err); }
+});
+
 router.get('/recipes/:id', roleMiddleware(RECIPE_VIEWER_ROLES), async (req, res) => {
     try {
         res.json(await svc.getRecipeById(req.params.id));
@@ -307,6 +329,15 @@ router.post('/meals/:mealId/foods', roleMiddleware(MEAL_LINK_ROLES), validate({ 
     try {
         const link = await svc.linkFoodToMeal(req.params.mealId, req.body);
         res.status(201).json(link);
+    } catch (err) { sendServiceError(res, err); }
+});
+
+// Linking a recipe expands its ingredients into N food-link rows server-side.
+// No DietMealRecipeLink table — the recipe is a bulk-add shortcut.
+router.post('/meals/:mealId/recipes', roleMiddleware(MEAL_LINK_ROLES), validate({ body: linkRecipeSchema }), async (req, res) => {
+    try {
+        const result = await svc.linkRecipeToMeal(req.params.mealId, req.body);
+        res.status(201).json(result);
     } catch (err) { sendServiceError(res, err); }
 });
 

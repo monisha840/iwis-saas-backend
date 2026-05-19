@@ -20,6 +20,7 @@ import logger from '../lib/logger.js';
 import { ClinicianXPService } from './clinicianXP.service.js';
 import { notificationService } from './notification.service.js';
 import { emitToUser } from '../websocket/index.js';
+import { BadgeService } from './badge.service.js';
 
 const DEFAULT_XP_BY_PRIORITY = {
     LOW: 10,
@@ -305,6 +306,17 @@ export class TodoService {
         // XP + badge + anomaly pipeline on completion
         if (nextStatus === 'COMPLETED') {
             await this._awardCompletionXP(actor, updated);
+            // Event-driven badge re-evaluation for the assignee. Previously
+            // todo-completion badges (TASK_STARTER, TASK_MASTER_*, etc.)
+            // could only fire when the leaderboard cron ran — and even then,
+            // only if the badge stats had been wired in (they weren't —
+            // separate audit fix). Calling this here means the badge lights
+            // up immediately when a doctor / therapist completes a todo.
+            // Fire-and-forget; badge service failures must not block the
+            // todo update or its real-time emit below.
+            BadgeService.checkCumulativeBadgesForUser(actor.id).catch((err) => {
+                logger.warn(`[Todo] post-complete badge check failed for ${actor.id}: ${err.message}`);
+            });
         }
 
         // Real-time push to assignee (UI refresh)

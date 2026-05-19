@@ -568,10 +568,14 @@ export class UserService {
                         ...(dobDate !== undefined && { dob: dobDate }),
                         ...(age !== undefined && { age }),
                         ...(gender !== undefined && { gender: gender || null }),
-                        // String[] column: `undefined` skip, otherwise write
-                        // the array as-is (an empty array is a legitimate
-                        // "clear my preferences" signal from the profile page).
-                        ...(therapyTypes !== undefined && { therapyTypes: Array.isArray(therapyTypes) ? therapyTypes : [] }),
+                        // Patient.therapyType is String? (singular). `undefined`
+                        // skip (no change); empty array / empty string clears
+                        // the column; non-empty array writes the first entry.
+                        ...(therapyTypes !== undefined && {
+                            therapyType: Array.isArray(therapyTypes) && therapyTypes.length > 0
+                                ? therapyTypes[0]
+                                : (typeof therapyTypes === 'string' && therapyTypes.trim() ? therapyTypes.trim() : null),
+                        }),
 
                         ...(addressLine1     !== undefined && { addressLine1:     emptyToNull(addressLine1) }),
                         ...(addressLine2     !== undefined && { addressLine2:     emptyToNull(addressLine2) }),
@@ -606,13 +610,14 @@ export class UserService {
             where: { id: patient.id },
             data: {
                 gender: data.gender || patient.gender,
-                // Persist the patient's preferred therapy types into the
-                // dedicated column (this is new — previously the onboarding
-                // payload was only stashed inside the onboardingData JSON
-                // blob and the column stayed null). `undefined`-skipped so
-                // a partial submission doesn't wipe a previously-saved set.
+                // Persist the patient's preferred therapy into the dedicated
+                // `therapyType` column (singular String?). The onboarding
+                // payload submits an array (`therapyTypes`) from the
+                // multi-select chip group, so we collapse to the first entry
+                // here. `undefined` / empty-array skipped so a partial
+                // submission doesn't wipe a previously-saved value.
                 ...(Array.isArray(data.therapyTypes) && data.therapyTypes.length > 0
-                    && { therapyTypes: data.therapyTypes }),
+                    && { therapyType: data.therapyTypes[0] }),
                 onboardingCompleted: true,
                 onboardingData: data,
                 ...(isFirstCompletion && { zenPoints: { increment: 50 } }),
@@ -920,7 +925,17 @@ export class UserService {
                         dob: dobDate,
                         age,
                         gender: gender || null,
-                        therapyTypes: Array.isArray(therapyTypes) ? therapyTypes : [],
+                        // Patient model has `therapyType` (String?, singular),
+                        // not `therapyTypes`. Input from clients still arrives
+                        // as an array (multi-select form + zod array schema +
+                        // CSV importer), so we coerce to the first element here
+                        // — the canonical "preferred therapy" for the patient.
+                        // Older comments in this file claimed the column was
+                        // String[]; that was wrong and was the root cause of
+                        // every patient-create / update Prisma rejection.
+                        therapyType: Array.isArray(therapyTypes) && therapyTypes.length > 0
+                            ? therapyTypes[0]
+                            : (typeof therapyTypes === 'string' && therapyTypes.trim() ? therapyTypes.trim() : null),
                         patientId: resolvedPatientId,
                         // Medical history is stashed in the existing
                         // onboardingData JSON column so we don't need a

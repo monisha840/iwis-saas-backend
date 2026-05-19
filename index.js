@@ -57,6 +57,12 @@ import portalRoutes from './routes/portal.js';
 import enhancedDashboardRoutes from './routes/enhanced-dashboard.js';
 import prescribedVitalsRoutes from './routes/prescribed-vitals.js';
 import visitSummaryRoutes from './routes/visit-summary.js';
+import patientHistoryRoutes from './routes/patientHistory.js';
+// Walk-in guest-patient creation. Lives at /api/patients/guest and is
+// mounted alongside timelineRoutes (which uses /:id/timeline) under the
+// same /api/patients prefix — Express dispatches by path so the two
+// routers don't collide.
+import patientsRoutes from './routes/patients.js';
 import queueRoutes from './routes/queue.js';
 import consultationContextRoutes from './routes/consultation-context.js';
 import superAdminRoutes from './routes/super-admin.js';
@@ -81,6 +87,9 @@ import messageTemplateRoutes from './routes/message-templates.js';
 import reminderSettingRoutes from './routes/reminder-settings.js';
 // Critical-journey: admin view of at-risk patients
 import criticalJourneyRoutes from './routes/critical-journey.js';
+// Care Gap Dashboard read endpoint — same five detection signals as the
+// cron, but live and read-only (no notification writes).
+import careGapRoutes from './routes/careGaps.js';
 // Recent audit-log feed (admin dashboard activity widget)
 import auditLogRoutes from './routes/audit-logs.js';
 // Inbound webhooks (Daily.co room-ended, etc.)
@@ -227,6 +236,10 @@ app.use('/api/adherence', adherenceRoutes);
 app.use('/api/leaderboard', leaderboardRoutes);
 app.use('/api/gamification', gamificationRoutes);
 app.use('/api/patients', timelineRoutes);
+// Walk-in guest patient creation (POST /api/patients/guest). Must be
+// mounted before /api/patients/:patientId/* sub-prefixes so the literal
+// "guest" segment is matched here and not parsed as a patient id.
+app.use('/api/patients', patientsRoutes);
 app.use('/api/refills', refillRoutes);
 app.use('/api/feature-flags', featureFlagRoutes);
 app.use('/api/referrals', referralRoutes);
@@ -248,6 +261,10 @@ app.use('/api/queue', queueRoutes);
 // Consultation Room — single-shot patient history aggregate
 app.use('/api/patient', consultationContextRoutes);
 app.use('/api/visit-summary', visitSummaryRoutes);
+// Patient History — immutable health-passport snapshots of completed journeys.
+// Route file was previously orphaned (defined but never mounted), which made
+// /api/patient-history return a 404 on every request.
+app.use('/api/patient-history', patientHistoryRoutes);
 // Monday Motivation Card — patient-only endpoints (today / save / saved /
 // :id/read). Auth is enforced inside the route file via authMiddleware +
 // roleMiddleware(['PATIENT']), so we don't add a layer here.
@@ -286,6 +303,11 @@ app.use('/api/reminder-settings', reminderSettingRoutes);
 
 // Critical-journey — admin view of at-risk patients (feature-gated)
 app.use('/api/critical-journey', criticalJourneyRoutes);
+
+// Care Gap Dashboard — admin / admin-doctor read of all five gap signals.
+// Route was previously orphaned (file existed but never mounted), which
+// produced the "Cannot GET /api/care-gaps" toast on the frontend.
+app.use('/api/care-gaps', careGapRoutes);
 
 // Recent audit-log activity feed for the admin dashboard
 app.use('/api/audit-logs', auditLogRoutes);
@@ -358,7 +380,17 @@ try {
   logger.warn('Bull Board not mounted — queues unavailable');
 }
 
-// Redundant static serving removed for standalone architecture
+// Serve local file uploads (triage media, meal photos, health-report PDFs,
+// certificates). Supabase-hosted URLs come back as absolute https links and
+// bypass this handler entirely; only files that fell through to disk storage
+// (when Supabase isn't configured) need this route. The previous "removed
+// for standalone architecture" comment was wrong — without this handler the
+// Clinical Photos page (and any other consumer of /uploads/... paths) gets
+// 404s for every locally-stored file.
+app.use('/uploads', express.static(path.resolve(process.cwd(), 'uploads'), {
+    fallthrough: false,
+    maxAge: '7d',
+}));
 
 // Swagger API docs
 app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {

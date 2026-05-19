@@ -71,6 +71,11 @@ const JOB_DEFINITIONS = [
     // BullMQ took over, the cron never fired. Mirror it here so the
     // weekly nudge runs under whichever scheduler is active.
     { name: 'monday-motivation', cron: '0 10 * * 1', handler: 'mondayMotivation' },
+    // Mark ACTIVE Health Quests as EXPIRED once they pass their
+    // durationDays window. Runs daily at 03:00 (off-peak, no user-visible
+    // side effects). Without this, ACTIVE quests sit forever and the UI
+    // shows negative daysLeft.
+    { name: 'health-quest-expiry', cron: '0 3 * * *', handler: 'healthQuestExpiry' },
 ];
 
 async function processJob(job) {
@@ -137,6 +142,10 @@ async function processJob(job) {
             const { MotivationService } = await import('./motivation.service.js');
             return MotivationService.generateDailyCardsForAllPatients();
         },
+        healthQuestExpiry: async () => {
+            const { HealthQuestService } = await import('./healthQuest.service.js');
+            return HealthQuestService.checkExpiredQuests();
+        },
     };
 
     const fn = handlers[handler];
@@ -199,6 +208,15 @@ export async function initScheduledJobs() {
             schedulerService.seedBadges();
         } catch (err) {
             logger.error('[ScheduledJobs] Badge seeding failed:', err.message);
+        }
+
+        // Seed the 4 default Health Quest templates if the table is empty.
+        // Idempotent: the service early-returns when rows already exist.
+        try {
+            const { HealthQuestService } = await import('./healthQuest.service.js');
+            await HealthQuestService.seedDefaultQuests();
+        } catch (err) {
+            logger.error('[ScheduledJobs] HealthQuest seed failed:', err.message);
         }
 
         logger.info(`[ScheduledJobs] BullMQ scheduler initialized with ${JOB_DEFINITIONS.length} jobs`);

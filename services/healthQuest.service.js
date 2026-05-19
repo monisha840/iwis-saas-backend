@@ -25,8 +25,11 @@ export class HealthQuestService {
 
         const available = allQuests.filter(q => {
             const status = progressMap.get(q.id);
-            // Show if not started or currently active
-            return !status || status === 'ACTIVE';
+            // Available list = not-yet-started + retry-eligible states.
+            // ACTIVE belongs in the "Active" tab (not "Available"); otherwise
+            // the patient sees a "Start Quest" button that errors out with
+            // "Quest already in progress".
+            return !status || status === 'EXPIRED' || status === 'ABANDONED';
         });
 
         return available.map(q => ({

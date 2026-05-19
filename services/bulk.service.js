@@ -78,14 +78,24 @@ export class BulkService {
                         phoneNumber: data.phoneNumber,
                         age: data.age ? parseInt(data.age) : null,
                         gender: data.gender || null,
-                        // therapyTypes is now a String[] column. CSV import
-                        // accepts a single value, a comma-separated list, or
-                        // a pre-split array; falls back to [] when absent.
-                        therapyTypes: Array.isArray(data.therapyTypes)
-                            ? data.therapyTypes
-                            : (typeof data.therapyType === 'string' && data.therapyType.trim()
-                                ? data.therapyType.split(',').map((s) => s.trim()).filter(Boolean)
-                                : []),
+                        // Patient.therapyType is a singular String? column.
+                        // CSV rows may carry either `therapyType` (single) or
+                        // a comma-separated `therapyTypes` cell; both collapse
+                        // to the first non-empty entry. Falls back to null.
+                        therapyType: (() => {
+                            if (Array.isArray(data.therapyTypes) && data.therapyTypes.length > 0) {
+                                return String(data.therapyTypes[0]).trim() || null;
+                            }
+                            if (typeof data.therapyTypes === 'string' && data.therapyTypes.trim()) {
+                                const first = data.therapyTypes.split(',').map((s) => s.trim()).filter(Boolean)[0];
+                                return first || null;
+                            }
+                            if (typeof data.therapyType === 'string' && data.therapyType.trim()) {
+                                const first = data.therapyType.split(',').map((s) => s.trim()).filter(Boolean)[0];
+                                return first || null;
+                            }
+                            return null;
+                        })(),
                         branchId: branchId // Lockdown to the importer's branch
                     },
                 });

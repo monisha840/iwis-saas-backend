@@ -2,8 +2,19 @@ import prisma from '../lib/prisma.js';
 import logger from '../lib/logger.js';
 import { emitToUser } from '../websocket/index.js';
 import { userNameSelect, flattenUserName } from '../lib/userName.js';
+import { notificationService } from './notification.service.js';
 
 const BRANCH_SELECT = { select: { id: true, name: true } };
+
+// Announcement.priority ↔ Notification.priority are different enums
+// (announcement has URGENT, notification doesn't). Map explicitly so the
+// notification bell visually matches the announcement's intent.
+const ANNOUNCEMENT_TO_NOTIFICATION_PRIORITY = {
+  URGENT: 'HIGH',
+  HIGH:   'HIGH',
+  NORMAL: 'MEDIUM',
+  LOW:    'LOW',
+};
 
 export class AnnouncementService {
   /**
@@ -47,12 +58,61 @@ export class AnnouncementService {
       select: { id: true },
     });
 
+    // Persist a Notification row per targeted user — this is what the bell
+    // / NotificationPanel reads from. Before this, the service only fired a
+    // fire-and-forget WebSocket emit, so any user who wasn't online at the
+    // exact moment of creation never saw the announcement. Doctors had no
+    // dedicated announcements page either, so for them the announcement
+    // was invisible everywhere — fix surfaces it in the bell.
+    //
+    // Author is excluded — no point pushing a notification about your own
+    // post into your own bell.
+    //
+    // Promise.allSettled so one failure (e.g. a single user with a
+    // misconfigured account) doesn't abort the rest of the fan-out. The
+    // route handler still returns 201 to the admin even if some
+    // downstream notification creates fail — failures are logged.
+    const notifPriority = ANNOUNCEMENT_TO_NOTIFICATION_PRIORITY[announcement.priority] || 'MEDIUM';
+    const recipients = users.filter((u) => u.id !== authorId);
+    const fanout = await Promise.allSettled(
+      recipients.map((user) =>
+        notificationService.createNotification({
+          userId:    user.id,
+          type:      'ANNOUNCEMENT',
+          title:     announcement.title,
+          message:   announcement.message,
+          priority:  notifPriority,
+          relatedId: announcement.id,
+          // The notification panel's resolveNotificationRoute reads
+          // `data.link` as a fallback when no type-specific route is
+          // registered, so the click lands on the announcements page.
+          data: {
+            link: '/announcements',
+            announcementId: announcement.id,
+            announcementPriority: announcement.priority,
+          },
+        }),
+      ),
+    );
+    const notifFailed = fanout.filter((r) => r.status === 'rejected').length;
+    if (notifFailed > 0) {
+      logger.warn(`[Announcement] ${notifFailed}/${recipients.length} notification creates failed`, {
+        announcementId: announcement.id,
+      });
+    }
+
+    // WebSocket emit stays — frontends that already listen on
+    // 'new_announcement' (e.g. an announcements-page live ticker) keep
+    // working without changes. The new_notification emit inside
+    // createNotification handles the bell.
     for (const user of users) {
       emitToUser(user.id, 'new_announcement', announcement);
     }
 
     const flat = { ...announcement, author: flattenUserName(announcement.author) };
-    logger.info(`Announcement created and emitted to ${users.length} users`, { announcementId: announcement.id });
+    logger.info(`Announcement created — ${recipients.length} notifications fanned out (${notifFailed} failed), socket emit to ${users.length}`, {
+      announcementId: announcement.id,
+    });
     return flat;
   }
 

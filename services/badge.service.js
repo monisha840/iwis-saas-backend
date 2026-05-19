@@ -117,8 +117,11 @@ export class BadgeService {
                         message: `You earned the "${badge.name}" badge!`
                     });
                 } catch (err) {
-                    // Unique constraint — already awarded (race condition guard)
-                    if (!err.code?.includes('P2002')) {
+                    // Unique-constraint race (badge already awarded between the
+                    // earlier dedup read and our create). Strict equality —
+                    // .includes('P2002') silently swallowed unrelated codes
+                    // whose strings happened to contain that substring.
+                    if (err.code !== 'P2002') {
                         logger.error(`[BadgeService] Failed to award badge ${badge.code}:`, err.message);
                     }
                 }
@@ -133,27 +136,104 @@ export class BadgeService {
 
     /**
      * Gather all stats needed for badge evaluation.
+     *
+     * Inputs:
+     *   participantId — Doctor.id or Therapist.id (set by leaderboard.service).
+     *
+     * Output keys MUST match every `criteria.metric` referenced in
+     * seedDefaults() + seedTodoBadges() — _meetsThreshold returns false on
+     * an undefined value, so a missing key means that badge can NEVER fire.
+     * Audit fix: todosCompleted / todoStreak / todosCompletedAssigned /
+     * todosAssignedToOthers were missing entirely, leaving all six Task
+     * badges (TASK_STARTER, TASK_CONSISTENT_*, TASK_MASTER_*, DELEGATION_PRO)
+     * unreachable from this main award loop.
      */
     static async _gatherStats(participantId, metrics, score, rank) {
-        // Total lifetime appointments
+        // Resolve User.id from Doctor.id / Therapist.id — Todo and
+        // TreatmentJourney both key on User.id, not the profile id.
+        const [doctor, therapist] = await Promise.all([
+            prisma.doctor.findUnique({ where: { id: participantId }, select: { userId: true } }).catch(() => null),
+            prisma.therapist.findUnique({ where: { id: participantId }, select: { userId: true } }).catch(() => null),
+        ]);
+        const userId = doctor?.userId || therapist?.userId || null;
+
+        // Total lifetime completed appointments (Appointment.doctorId is
+        // Doctor.id, so participantId works directly).
         const totalAppointments = await prisma.appointment.count({
             where: {
                 OR: [{ doctorId: participantId }, { therapistId: participantId }],
-                status: 'COMPLETED'
-            }
+                status: 'COMPLETED',
+            },
         });
 
-        // Completed journeys
-        const completedJourneys = await prisma.journey.count({
-            where: {
-                OR: [{ doctorId: participantId }, { therapistId: participantId }],
-                status: 'COMPLETED'
-            }
-        });
+        // Completed journeys — switch to TreatmentJourney (canonical IWIS
+        // clinical model) for doctors. TreatmentJourney.doctorId is User.id,
+        // not Doctor.id, so we use the resolved userId. Therapists are
+        // currently not linked into TreatmentJourney; they remain on the
+        // legacy Journey table where therapistId = Therapist.id.
+        let completedJourneys = 0;
+        if (userId && doctor) {
+            completedJourneys += await prisma.treatmentJourney.count({
+                where: { doctorId: userId, status: 'COMPLETED' },
+            });
+        }
+        if (therapist) {
+            completedJourneys += await prisma.journey.count({
+                where: { therapistId: participantId, status: 'COMPLETED' },
+            });
+        }
 
-        // Current streak
+        // Todo metrics — keyed on User.id, not Doctor.id/Therapist.id.
+        // Without userId we can't query, so we report zeros (no false
+        // positives on badges that should require todo activity).
+        let todosCompleted = 0;
+        let todosCompletedAssigned = 0;
+        let todosAssignedToOthers = 0;
+        let todoStreak = 0;
+        if (userId) {
+            const COMPLETED = 'COMPLETED';
+            [todosCompleted, todosCompletedAssigned, todosAssignedToOthers] = await Promise.all([
+                prisma.todo.count({
+                    where: { assignedToId: userId, status: COMPLETED },
+                }),
+                prisma.todo.count({
+                    where: { assignedToId: userId, status: COMPLETED, createdById: { not: userId } },
+                }),
+                prisma.todo.count({
+                    where: { createdById: userId, assignedToId: { not: userId } },
+                }),
+            ]);
+
+            // todoStreak — current consecutive days (ending today or
+            // yesterday) on which the user completed ≥ 1 assigned todo.
+            // We look back at most 60 days; anything beyond that isn't
+            // realistic for the 7/30-day badges we evaluate against. The
+            // walk-back allows "today" to be empty (user might not have
+            // completed one yet) but breaks on the first missing prior day.
+            const sixtyDaysAgo = new Date(Date.now() - 60 * MS_IN_A_DAY);
+            const recent = await prisma.todo.findMany({
+                where: {
+                    assignedToId: userId,
+                    status: COMPLETED,
+                    completedAt: { not: null, gte: sixtyDaysAgo },
+                },
+                select: { completedAt: true },
+            });
+            const completedDays = new Set(
+                recent.map((r) => r.completedAt.toISOString().slice(0, 10)),
+            );
+            const today = new Date(); today.setHours(0, 0, 0, 0);
+            for (let i = 0; i < 60; i += 1) {
+                const probe = new Date(today.getTime() - i * MS_IN_A_DAY).toISOString().slice(0, 10);
+                if (completedDays.has(probe)) todoStreak += 1;
+                else if (i === 0) continue; // today's empty is OK — streak still continues from yesterday
+                else break;
+            }
+        }
+
+        // Current overall streak (clinician engagement, not todo-specific).
         const streak = await prisma.clinicianStreak.findUnique({
-            where: { participantId }
+            where: { participantId },
         }).catch(() => null);
 
         return {
@@ -166,6 +246,12 @@ export class BadgeService {
             journeysCompleted: completedJourneys,
             excellenceScore: score || 0,
             leaderboardRank: rank || 999,
+            // Todo-completion metrics — referenced by TASK_STARTER,
+            // TASK_CONSISTENT_*, TASK_MASTER_*, DELEGATION_PRO badge criteria.
+            todosCompleted,
+            todosCompletedAssigned,
+            todosAssignedToOthers,
+            todoStreak,
         };
     }
 
@@ -183,6 +269,80 @@ export class BadgeService {
         if (comparison === 'lt') return value < threshold;
         if (comparison === 'lte') return value <= threshold;
         return value >= threshold;
+    }
+
+    /**
+     * Event-driven re-evaluation of cumulative / streak / milestone badges
+     * for one clinician identified by their User.id. Unlike
+     * `checkAndAwardBadges` (which requires the full leaderboard metrics +
+     * score + rank and is invoked from the leaderboard cron), this entry
+     * point covers ONLY the badges whose criteria depend on
+     * `_gatherStats`-side counts that we can derive without a live
+     * leaderboard tick. Wire it into:
+     *
+     *   • Todo status → COMPLETED        (TASK_STARTER / TASK_CONSISTENT_* /
+     *                                     TASK_MASTER_* / DELEGATION_PRO)
+     *   • Appointment status → COMPLETED (APPOINTMENTS_25 / 100 / 500 / 1000)
+     *   • TreatmentJourney → COMPLETED   (FIRST_JOURNEY_COMPLETE / JOURNEYS_10)
+     *   • ClinicianStreak update         (STREAK_7 / 14 / 30)
+     *
+     * Rate / score badges (ADHERENCE_95, SCORE_90, TOP_3, etc.) require
+     * live leaderboard metrics and stay with the cron-driven
+     * `checkAndAwardBadges` path — we intentionally skip them here so a
+     * mid-day Todo completion doesn't accidentally award SCORE_90 with
+     * stale metrics.
+     */
+    static async checkCumulativeBadgesForUser(userId) {
+        if (!userId) return [];
+
+        // Find Doctor or Therapist profile keyed off this user.
+        const [doctor, therapist] = await Promise.all([
+            prisma.doctor.findUnique({ where: { userId }, select: { id: true } }).catch(() => null),
+            prisma.therapist.findUnique({ where: { userId }, select: { id: true } }).catch(() => null),
+        ]);
+        const participantId = doctor?.id || therapist?.id || null;
+        if (!participantId) return []; // user isn't a clinician
+
+        const stats = await this._gatherStats(participantId, null, null, null);
+
+        const badges = await prisma.badge.findMany({ where: { isActive: true } });
+        const existingAwards = await prisma.userBadge.findMany({
+            where: { userId },
+            select: { badgeId: true },
+        });
+        const awardedBadgeIds = new Set(existingAwards.map((a) => a.badgeId));
+
+        const newAwards = [];
+        for (const badge of badges) {
+            if (awardedBadgeIds.has(badge.id)) continue;
+            const c = badge.criteria || {};
+            // Skip rate/rank/score-type criteria — those need live metrics
+            // that we don't have outside the leaderboard tick.
+            if (c.type === 'rate' || c.type === 'rank') continue;
+
+            if (this._meetsThreshold(stats, c)) {
+                try {
+                    const award = await prisma.userBadge.create({
+                        data: { userId, badgeId: badge.id },
+                    });
+                    newAwards.push({ ...badge, awardId: award.id });
+                    emitToUser(userId, 'badge_earned', {
+                        badge: { code: badge.code, name: badge.name, icon: badge.icon, tier: badge.tier },
+                        message: `You earned the "${badge.name}" badge!`,
+                    });
+                } catch (err) {
+                    // Strict equality — substring matches were brittle.
+                    if (err.code !== 'P2002') {
+                        logger.error(`[BadgeService] Failed to award badge ${badge.code}:`, err.message);
+                    }
+                }
+            }
+        }
+
+        if (newAwards.length > 0) {
+            logger.info(`[BadgeService] Event-driven award: ${newAwards.length} badges to user ${userId}`);
+        }
+        return newAwards;
     }
 
     /**

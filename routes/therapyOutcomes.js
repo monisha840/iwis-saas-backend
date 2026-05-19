@@ -102,6 +102,33 @@ router.post(
     },
 );
 
+// ── GET /me ───────────────────────────────────────────────────────────────
+// Patient self-fetch — powers the "My Progress" tab on the patient portal.
+// Resolves patientId from the JWT (never the URL) so a caller can't read
+// another patient's outcomes by guessing the route. Must be declared BEFORE
+// `/:patientId` or Express will treat "me" as a patientId.
+router.get(
+    '/me',
+    authMiddleware,
+    roleMiddleware(['PATIENT']),
+    async (req, res, next) => {
+        try {
+            const patient = await prisma.patient.findUnique({
+                where: { userId: req.user.id },
+                select: { id: true },
+            });
+            if (!patient) return res.json({ data: { outcomes: [] } });
+
+            const outcomes = await prisma.therapyOutcome.findMany({
+                where: { patientId: patient.id },
+                select: OUTCOME_SELECT,
+                orderBy: { sessionDate: 'desc' },
+            });
+            res.json({ data: { outcomes } });
+        } catch (err) { next(err); }
+    },
+);
+
 // ── GET /:patientId ───────────────────────────────────────────────────────
 router.get(
     '/:patientId',
