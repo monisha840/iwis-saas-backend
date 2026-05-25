@@ -50,6 +50,14 @@ const includeDetails = {
         },
     },
     branch: { select: { id: true, name: true, address: true } },
+    // Room reached via the booking row, not directly — Appointment has no
+    // `therapyRoom` relation, only the booking that links to one.
+    therapyRoomBooking: {
+        select: {
+            id: true,
+            room: { select: { id: true, name: true, type: true } },
+        },
+    },
 };
 
 export class AppointmentService {

@@ -118,13 +118,24 @@ function bmiCategoryOf(bmi) {
 
 // onboardingData is JSON — clinicians enter Prakriti under different keys
 // across versions of the form. Try the common ones in order.
-function pickPrakriti(onboardingData) {
-    if (!onboardingData || typeof onboardingData !== 'object') return null;
-    return onboardingData.prakriti
-        || onboardingData.doshaType
-        || onboardingData.dosha
-        || onboardingData.constitution
-        || null;
+function pickPrakriti(patient) {
+    if (!patient) return null;
+    // Primary source: ConstitutionProfile row (PrakritiType enum, e.g. VATA_PITTA).
+    // Underscore-to-space so the PDF reads "Vata Pitta" not "VATA_PITTA".
+    const fromProfile = patient.constitutionProfile?.prakriti;
+    if (fromProfile && typeof fromProfile === 'string') {
+        return fromProfile.replace(/_/g, ' ');
+    }
+    // Legacy fallback: onboardingData blob (patient-side onboarding form).
+    const onboardingData = patient.onboardingData;
+    if (onboardingData && typeof onboardingData === 'object') {
+        return onboardingData.prakriti
+            || onboardingData.doshaType
+            || onboardingData.dosha
+            || onboardingData.constitution
+            || null;
+    }
+    return null;
 }
 
 function pickHeight(onboardingData) {
@@ -143,7 +154,12 @@ function pickChiefComplaint(triage) {
         const direct = r.chiefComplaint || r.chief_complaint || r.complaint || r.mainComplaint;
         if (direct && typeof direct === 'string') return direct;
     }
-    if (triage.triageNotes && typeof triage.triageNotes === 'string') return triage.triageNotes;
+    // Intentionally NO fallback to `triage.triageNotes` — that field stores
+    // clinical reasoning summary (incl. red-flag descriptions like "RED FLAG:
+    // Recorded vitals outside safe range"), not the patient's stated reason
+    // for the visit. Using it as a fallback would surface the warning string
+    // in the report's "Chief Complaint" row. Honest "Not recorded" is the
+    // right outcome when the patient never wrote a complaint.
     return null;
 }
 
@@ -218,6 +234,10 @@ export async function assembleReportData(appointmentId, patientId, doctorId) {
                     },
                 },
                 branch: true,
+                // Canonical Prakriti record (filled by self-quiz or by the
+                // clinician's Quick Intake modal). Used by pickPrakriti as
+                // the primary source — onboardingData is the legacy fallback.
+                constitutionProfile: true,
             },
         });
 
@@ -329,7 +349,7 @@ export async function assembleReportData(appointmentId, patientId, doctorId) {
             currentPhase,
             highestPainScore: painScore,
             chiefComplaint: pickChiefComplaint(triage),
-            prakriti: pickPrakriti(patient?.onboardingData),
+            prakriti: pickPrakriti(patient),
             painRegions,
         };
     } catch (err) {
@@ -633,10 +653,14 @@ export function generatePDF(reportData) {
                 doc.fillColor(BODY_TEXT).text(value, PAGE_MARGIN, leftY + 11, { width: colWidth - 10 });
                 leftY += 28;
             };
-            writeLeft('Pain Level',    v.PAIN,   '/10');
-            writeLeft('Weight',        v.WEIGHT, ' kg');
-            writeLeft('Sleep Quality', v.SLEEP,  '/5');
-            writeLeft('Mood',          v.MOOD,   '/5');
+            // Keys must match the VitalType enum values (PAIN_SCORE, SLEEP_HOURS,
+            // WEIGHT, MOOD). Previously read v.PAIN / v.SLEEP which never
+            // matched, so these rows printed "Not recorded" even after a
+            // doctor recorded the readings.
+            writeLeft('Pain Level',    v.PAIN_SCORE,  '/10');
+            writeLeft('Weight',        v.WEIGHT,      ' kg');
+            writeLeft('Sleep Hours',   v.SLEEP_HOURS, ' hrs');
+            writeLeft('Mood',          v.MOOD,        '/5');
 
             // Right column — lifestyle (from triage.lifestyleData)
             doc.fillColor(BRAND_TEAL).font('Helvetica-Bold').fontSize(10)
@@ -649,10 +673,13 @@ export function generatePDF(reportData) {
                 doc.fillColor(BODY_TEXT).text(value || 'Not recorded', PAGE_MARGIN + colWidth, rightY + 11, { width: colWidth - 10 });
                 rightY += 28;
             };
-            writeRight('Sleep Quality', lifestyle.sleepQuality);
-            writeRight('Stress Level',  lifestyle.stressLevel);
-            writeRight('Exercise',      lifestyle.exerciseFrequency);
-            writeRight('Diet Type',     lifestyle.dietQuality || lifestyle.dietType);
+            // "Sleep Rating (1-5)" disambiguates from the left column's
+            // measured "Sleep Hours" so the two adjacent sleep rows aren't
+            // confusingly both labelled "Sleep Quality".
+            writeRight('Sleep Rating (1-5)', lifestyle.sleepQuality);
+            writeRight('Stress Level',       lifestyle.stressLevel);
+            writeRight('Exercise',           lifestyle.exerciseFrequency);
+            writeRight('Diet Type',          lifestyle.dietQuality || lifestyle.dietType);
 
             // Push the cursor below whichever column ended lower.
             doc.y = Math.max(leftY, rightY);

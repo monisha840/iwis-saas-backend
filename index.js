@@ -1,6 +1,13 @@
+// MUST be the first import. ES module imports are hoisted above all
+// executable code, so a later `dotenv.config()` call runs AFTER every
+// other module has already evaluated — meaning any module that captured
+// process.env at top level (e.g. config/index.js → config.whatsapp) sees
+// empty values. The `dotenv/config` side-effect import populates
+// process.env during the import phase itself, before the rest of the
+// imports below evaluate.
+import 'dotenv/config';
+
 import { initSentry, Sentry } from './lib/sentry.js';
-import dotenv from 'dotenv';
-dotenv.config();
 initSentry();
 
 import express from 'express';
@@ -56,6 +63,8 @@ import handoffRoutes from './routes/handoff.js';
 import portalRoutes from './routes/portal.js';
 import enhancedDashboardRoutes from './routes/enhanced-dashboard.js';
 import prescribedVitalsRoutes from './routes/prescribed-vitals.js';
+import healthSummaryRoutes from './routes/healthSummary.js';
+import clinicalIntakeRoutes from './routes/clinicalIntake.js';
 import visitSummaryRoutes from './routes/visit-summary.js';
 import patientHistoryRoutes from './routes/patientHistory.js';
 // Walk-in guest-patient creation. Lives at /api/patients/guest and is
@@ -256,6 +265,12 @@ app.use('/api/handoff', handoffRoutes);
 app.use('/api/portal', portalRoutes);
 app.use('/api/patient/dashboard', enhancedDashboardRoutes);
 app.use('/api/patients/:patientId/prescribed-vitals', prescribedVitalsRoutes);
+// Patient health summary — single endpoint, two URL shapes (patient + clinician).
+// Mounted at /api so the router's own paths (/patient/health-summary and
+// /patients/:patientId/health-summary) resolve correctly.
+app.use('/api', healthSummaryRoutes);
+// Clinician-side intake writes: vitals, constitution (Prakriti), lifestyle.
+app.use('/api', clinicalIntakeRoutes);
 // Live Patient Queue Management (arrival, consultation lifecycle, board)
 app.use('/api/queue', queueRoutes);
 // Consultation Room — single-shot patient history aggregate
