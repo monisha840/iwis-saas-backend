@@ -91,8 +91,8 @@ export class WellnessService {
         });
         if (existingCheckIn) throw new Error('You have already checked in today.');
 
-        return prisma.$transaction(async (tx) => {
-            const checkIn = await tx.dailyCheckIn.create({
+        const checkIn = await prisma.$transaction(async (tx) => {
+            const created = await tx.dailyCheckIn.create({
                 data: {
                     patientId: patient.id,
                     painLevel: data.painLevel,
@@ -106,8 +106,39 @@ export class WellnessService {
                 where: { id: patient.id },
                 data: { zenPoints: { increment: 10 } }
             });
-            return checkIn;
+            return created;
         });
+
+        // F05 · Behavioural Nudge Engine feedback loop.
+        // Mark any outstanding NudgeLog rows from this patient's current
+        // weekly nudge window as completed. The motivation cron is weekly
+        // (Monday 10:00 IST), so a same-day window — which the spec drafted
+        // against an assumed daily cron — would only ever match Monday
+        // check-ins. The 7-day window captures the full check-in feedback
+        // surface for the most recent nudge.
+        //
+        // CRITICAL: this MUST NOT throw — the check-in save above is the
+        // source of truth and must succeed regardless of nudge-log state.
+        try {
+            const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+            await prisma.nudgeLog.updateMany({
+                where: {
+                    patientId: patient.id,
+                    sentAt: { gte: since },
+                    checkInCompleted: false,
+                },
+                data: {
+                    checkInCompleted: true,
+                    checkInAt: new Date(),
+                },
+            });
+        } catch (err) {
+            logger.warn('NudgeLog update failed — check-in unaffected', {
+                patientId: patient.id, err: err.message,
+            });
+        }
+
+        return checkIn;
     }
 
     static async getVideos() {

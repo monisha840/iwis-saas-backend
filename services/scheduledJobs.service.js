@@ -76,6 +76,11 @@ const JOB_DEFINITIONS = [
     // side effects). Without this, ACTIVE quests sit forever and the UI
     // shows negative daysLeft.
     { name: 'health-quest-expiry', cron: '0 3 * * *', handler: 'healthQuestExpiry' },
+    // F04 · Predictive Dosha Imbalance Engine — nightly at 02:00 IST
+    // (20:30 UTC). Per-hospital flag gate inside the handler so
+    // flag-off hospitals get skipped server-side without any wasted DB
+    // pull. Idempotent: same-day re-run is a no-op.
+    { name: 'dosha-forecast', cron: '30 20 * * *', handler: 'doshaForecast' },
 ];
 
 async function processJob(job) {
@@ -145,6 +150,10 @@ async function processJob(job) {
         healthQuestExpiry: async () => {
             const { HealthQuestService } = await import('./healthQuest.service.js');
             return HealthQuestService.checkExpiredQuests();
+        },
+        doshaForecast: async () => {
+            const { runDoshaForecastCron } = await import('./dosha/doshaCron.js');
+            return runDoshaForecastCron();
         },
     };
 

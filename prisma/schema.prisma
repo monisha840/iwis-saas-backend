@@ -484,6 +484,14 @@ model Patient {
   appointments         Appointment[]
   conversations        Conversation[]
   dailyCheckIns        DailyCheckIn[]
+  // Behavioural Nudge Engine (F05) — one row per outbound nudge with the
+  // resulting check-in completion stamped retroactively when the patient
+  // submits within the message window.
+  nudgeLogs            NudgeLog[]
+  // Predictive Dosha Engine (F04) — one row per nightly forecast run that
+  // crosses the alert threshold. History so clinicians can see whether
+  // predictions were borne out.
+  doshaForecasts       DoshaForecast[]
   documents            Document[]
   invoices             Invoice[]
   journeys             Journey[]
@@ -586,9 +594,13 @@ model Patient {
 }
 
 model DailyCheckIn {
-  id            String   @id @default(uuid())
-  patientId     String
-  painLevel     Int
+  id                String              @id @default(uuid())
+  patientId         String
+  // F03 — optional Jihva Pariksha attachment from the check-in wizard's
+  // Step 3. Nullable: most check-ins won't have one. 1:1 because the wizard
+  // only allows one photo per check-in.
+  tongueObservation TongueObservation?
+  painLevel         Int
   // Structured per-region pain log captured via the body-map step of the
   // 3-step daily check-in. Shape (JSON array): [{ regionId, regionLabel,
   // intensity (1-10), characters: string[], radiates: bool, radiatesTo? }].
@@ -2004,6 +2016,58 @@ model PatientStreak {
   updatedAt      DateTime  @updatedAt
 
   @@index([patientId])
+}
+
+// ── F04 · Predictive Dosha Imbalance Engine ─────────────────────────────────
+// One row per nightly forecast run that exceeded the alert threshold for a
+// patient. The cron writes through this table BEFORE upserting into
+// PatientCriticalFlag so we have a versioned history of predictions — the
+// PatientCriticalFlag carries the live state, this table carries the audit
+// trail of what was predicted when.
+model DoshaForecast {
+  id              String    @id @default(cuid())
+  patientId       String
+  patient         Patient   @relation(fields: [patientId], references: [id])
+  generatedAt     DateTime  @default(now())
+  daysUntilSymp   Int
+  confidence      Float
+  // VATA | PITTA | KAPHA — kept as String (not enum) since archetypes are
+  // expected to evolve as the scoring engine matures.
+  dominantDosha   String
+  // AGGRAVATION | DEPLETION (only AGGRAVATION fires today; depletion rules
+  // are placeholder for future work).
+  imbalanceType   String
+  triggerFactors  String[]
+  alertEmitted    Boolean   @default(false)
+  alertEmittedAt  DateTime?
+  resolved        Boolean   @default(false)
+  resolvedAt      DateTime?
+
+  @@index([patientId, generatedAt])
+}
+
+// ── F05 · Behavioural Nudge Engine ──────────────────────────────────────────
+// One row per outbound nudge produced by the LLM-driven nudge generator that
+// replaces the static motivation template when the BEHAVIOURAL_NUDGE_ENGINE
+// flag is on for the patient's hospital. The check-in feedback loop stamps
+// checkInCompleted/checkInAt when the patient submits a daily check-in within
+// the message window, which is what later analytics will use to score which
+// archetype actually drives engagement.
+model NudgeLog {
+  id               String    @id @default(cuid())
+  patientId        String
+  patient          Patient   @relation(fields: [patientId], references: [id])
+  sentAt           DateTime  @default(now())
+  // STREAK_MOTIVATED | PROGRESS_MOTIVATED | SOCIAL_MOTIVATED | LOSS_AVERSE
+  // (kept as String — adding an enum here would slow future tuning since
+  // archetypes are expected to evolve as we learn engagement patterns.)
+  archetype        String
+  messageText      String
+  checkInCompleted Boolean   @default(false)
+  checkInAt        DateTime?
+  createdAt        DateTime  @default(now())
+
+  @@index([patientId, sentAt])
 }
 
 // ── Gamification: Anti-Gaming Audit ─────────────────────────────────────────
@@ -3439,25 +3503,57 @@ model SymptomHistoryEntry {
   @@index([painZone])
 }
 
+// TongueObservation — shared between two capture paths:
+//   • Self-exam (pre-existing): clinician-led Jihva Pariksha as part of a
+//     multi-day SelfExamSubmission. Uses `coatingColor` + `coatingThickness`
+//     enum columns and the (submissionId, dayIndex) uniqueness constraint.
+//   • Daily check-in (F03): patient takes a tongue photo from the check-in
+//     wizard; GPT-4o vision analyses against Jihva Pariksha criteria. Uses
+//     `checkInId` + the `ai*` columns since the LLM's output vocabulary
+//     (BROWN / GREY / MODERATE / DRY / WET / TRIDOSHA / BALANCED) is wider
+//     than the existing enums and would cost a breaking enum extension.
+//
+// To accommodate both: submissionId / dayIndex / observedOn are nullable for
+// the check-in path, the enum columns are nullable, and the new ai* columns
+// are added side-by-side. The existing unique constraint is replaced with a
+// partial expression that only enforces uniqueness when submissionId is set.
 model TongueObservation {
-  id                  String                 @id @default(uuid())
-  submissionId        String
-  submission          SelfExamSubmission     @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  id                  String                  @id @default(uuid())
+  // Self-exam path (legacy).
+  submissionId        String?
+  submission          SelfExamSubmission?     @relation(fields: [submissionId], references: [id], onDelete: Cascade)
+  // Daily check-in path (F03). Optional — a clinician can still author a
+  // self-exam observation without a check-in.
+  checkInId           String?                 @unique
+  checkIn             DailyCheckIn?           @relation(fields: [checkInId], references: [id], onDelete: SetNull)
   patientId           String
-  patient             Patient                @relation(fields: [patientId], references: [id], onDelete: Cascade)
-  dayIndex            Int
-  observedOn          DateTime
+  patient             Patient                 @relation(fields: [patientId], references: [id], onDelete: Cascade)
+  dayIndex            Int?
+  observedOn          DateTime?
+  observedAt          DateTime                @default(now())
   photoUrl            String?
-  coatingColor        TongueCoatingColor
-  coatingThickness    TongueCoatingThickness
-  dryness             Boolean                @default(false)
-  cracks              Boolean                @default(false)
-  tremor              Boolean                @default(false)
+  // Legacy enum columns — populated only by the self-exam path.
+  coatingColor        TongueCoatingColor?
+  coatingThickness    TongueCoatingThickness?
+  dryness             Boolean                 @default(false)
+  cracks              Boolean                 @default(false)
+  tremor              Boolean                 @default(false)
   correlatedPainLevel Int?
   notes               String?
-  createdAt           DateTime               @default(now())
+  // F03 · AI analysis output (Jihva Pariksha via GPT-4o vision). All
+  // nullable so a partial analysis (or fallback path) still produces a
+  // valid record.
+  aiCoatingColour     String?
+  aiCoatingThickness  String?
+  aiMoisture          String?
+  doshaIndication     String?
+  confidence          Float?
+  analysisNotes       String?
+  rawAnalysis         String?
+  alertEmitted        Boolean                 @default(false)
+  createdAt           DateTime                @default(now())
 
-  @@unique([submissionId, dayIndex])
+  @@index([patientId, observedAt])
   @@index([patientId, observedOn])
 }
 

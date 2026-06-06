@@ -93,6 +93,50 @@ function requireRole(...allowed) {
     };
 }
 
+// F07 · Multi-Agent Orchestration — best-effort, post-response fan-out.
+// Mirror of the existing fireFollowUpFromTriage pattern: the triage POST
+// response is sent FIRST, then this fires the event registry. Wrapped in
+// try/catch so any agent failure stays in the log, never in the response.
+async function fireCriticalTriageAgents(triageSession, req) {
+    try {
+        // Spec says CRITICAL OR HIGH urgency — but the urgency enum used by
+        // computeTriageScore is CRITICAL / URGENT / MODERATE / ROUTINE. The
+        // *severity* enum is HIGH / MEDIUM / LOW. We trigger on the urgency
+        // values that semantically mean "high enough to mobilise" — that's
+        // CRITICAL and URGENT.
+        const trigger = triageSession?.urgencyLevel === 'CRITICAL'
+                     || triageSession?.urgencyLevel === 'URGENT';
+        if (!trigger) return;
+
+        // Feature flag gate — disabled hospitals see zero behaviour change.
+        const [{ isFeatureAvailable }, { emitEvent }] = await Promise.all([
+            import('../utils/featureGate.js'),
+            import('../services/agents/index.js'),
+        ]);
+        const enabled = await isFeatureAvailable(
+            req.user?.hospitalId,
+            req.user?.branchId,
+            'MULTI_AGENT_ORCHESTRATION',
+            req.user?.role,
+        );
+        if (!enabled) return;
+
+        await emitEvent('triage.critical.submitted', {
+            triageSessionId: triageSession.id,
+            patientId:       triageSession.patientId,
+            patientUserId:   req.user?.id,                // see schema gotchas
+            urgencyLevel:    triageSession.urgencyLevel,
+            hospitalId:      req.user?.hospitalId ?? null,
+            branchId:        triageSession.branchId ?? req.user?.branchId ?? null,
+        });
+    } catch (err) {
+        // Should be unreachable — emitEvent uses Promise.allSettled and the
+        // imports above are stable. Log defensively anyway.
+        // eslint-disable-next-line no-console
+        console.warn('[triage] fireCriticalTriageAgents swallowed', err?.message ?? err);
+    }
+}
+
 // ── Patient endpoints ──────────────────────────────────────────────────────
 router.post('/', authMiddleware, validate({ body: submitSchema }), async (req, res, next) => {
     try {
@@ -103,6 +147,8 @@ router.post('/', authMiddleware, validate({ body: submitSchema }), async (req, r
         import('../services/followUpTask.service.js').then(({ fireFollowUpFromTriage }) => {
             fireFollowUpFromTriage(triageSession);
         }).catch(() => { /* swallow — never block triage submission */ });
+        // F07 — multi-agent orchestration fan-out for CRITICAL/URGENT triage.
+        fireCriticalTriageAgents(triageSession, req);
     } catch (err) { next(err); }
 });
 
@@ -115,6 +161,8 @@ router.post('/submit', authMiddleware, validate({ body: submitSchema }), async (
         import('../services/followUpTask.service.js').then(({ fireFollowUpFromTriage }) => {
             fireFollowUpFromTriage(triageSession);
         }).catch(() => { /* swallow — never block triage submission */ });
+        // F07 — mirror the agents fan-out on the legacy alias too.
+        fireCriticalTriageAgents(triageSession, req);
     } catch (err) { next(err); }
 });
 

@@ -26,6 +26,13 @@ import logger from './lib/logger.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { requestLogger } from './middleware/requestLogger.js';
 import { globalLimiter } from './middleware/rateLimiter.js';
+// F07 · Multi-Agent Orchestration — side-effect import. The agents/index.js
+// module registers four handlers against the 'triage.critical.submitted'
+// event at load time, so it must be imported before any route can fire.
+// Placed after Prisma + Redis init (which run earlier in this same module's
+// import graph via lib/prisma.js and services/queue.service.js) and before
+// the route imports below.
+import './services/agents/index.js';
 import authRoutes from './routes/auth.js';
 // ... other imports
 import userRoutes from './routes/user.js';
@@ -64,6 +71,12 @@ import portalRoutes from './routes/portal.js';
 import enhancedDashboardRoutes from './routes/enhanced-dashboard.js';
 import prescribedVitalsRoutes from './routes/prescribed-vitals.js';
 import healthSummaryRoutes from './routes/healthSummary.js';
+// F04 · Predictive Dosha Imbalance Engine — read API.
+import doshaForecastRoutes from './routes/doshaForecast.js';
+// F03 · Multimodal Diagnostic AI — Jihva Pariksha photo + trend endpoints.
+import tongueAnalysisRoutes from './routes/tongueAnalysis.js';
+// F01 · Patient Digital Twin — aggregated twin endpoint.
+import digitalTwinRoutes from './routes/digitalTwin.js';
 import clinicalIntakeRoutes from './routes/clinicalIntake.js';
 import visitSummaryRoutes from './routes/visit-summary.js';
 import patientHistoryRoutes from './routes/patientHistory.js';
@@ -269,6 +282,12 @@ app.use('/api/patients/:patientId/prescribed-vitals', prescribedVitalsRoutes);
 // Mounted at /api so the router's own paths (/patient/health-summary and
 // /patients/:patientId/health-summary) resolve correctly.
 app.use('/api', healthSummaryRoutes);
+// F04 mount — /api/patients/:patientId/dosha-forecast
+app.use('/api', doshaForecastRoutes);
+// F03 mount — /api/wellness/check-in/tongue-photo + /api/patients/:patientId/tongue-observations
+app.use('/api', tongueAnalysisRoutes);
+// F01 mount — /api/patients/:patientId/digital-twin
+app.use('/api', digitalTwinRoutes);
 // Clinician-side intake writes: vitals, constitution (Prakriti), lifestyle.
 app.use('/api', clinicalIntakeRoutes);
 // Live Patient Queue Management (arrival, consultation lifecycle, board)

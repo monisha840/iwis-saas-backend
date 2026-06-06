@@ -111,6 +111,10 @@ export class CareGapService {
                     detail: `Triage started ${daysSince} days ago, no appointment booked`,
                     assignedDoctorName: '—',
                     suggestedAction: 'Reach out to schedule consultation',
+                    // F08 popover support — surfaced so the frontend Care Gaps
+                    // table can render an inline "Why?" trigger pointing at
+                    // the originating triage session.
+                    triageSessionId: s.id,
                 });
             }
         }
