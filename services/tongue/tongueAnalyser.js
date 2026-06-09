@@ -68,24 +68,49 @@ function tryParseAnalysis(raw) {
 }
 
 /**
- * @param {string} imageUrl  publicly-readable URL the LLM can fetch (Supabase Storage public URL)
- * @param {string|null} prakriti  the patient's known prakriti, or null
- * @returns {Promise<null | {
- *   coatingColour: string|null,
- *   coatingThickness: string|null,
- *   moisture: string|null,
- *   cracks: boolean,
- *   doshaIndication: string|null,
- *   confidence: number|null,
- *   analysisNotes: string|null,
- *   rawAnalysis: string,
- * }>}
+ * @param {object} input
+ * @param {string} [input.imageUrl]    publicly-readable URL the LLM can fetch
+ * @param {Buffer} [input.imageBuffer] in-memory image bytes — preferred when
+ *   the file isn't (or isn't yet) hosted at a public URL. Sent inline as a
+ *   base64 data URL so the LLM never has to make an outbound fetch. Works
+ *   regardless of Supabase Storage configuration.
+ * @param {string} [input.mimeType='image/jpeg'] MIME of the buffer
+ * @param {string|null} input.prakriti  the patient's known prakriti, or null
+ * @returns {Promise<null | object>}    null on any failure
  */
-export async function analyseTongue(imageUrl, prakriti) {
-    if (!imageUrl) {
-        logger.warn('[tongueAnalyser] imageUrl missing — skipping');
+export async function analyseTongue(input, prakritiArg) {
+    // Back-compat: allow the old (url, prakriti) signature too.
+    let imageUrl, imageBuffer, mimeType, prakriti;
+    if (typeof input === 'string' || input == null) {
+        imageUrl = input;
+        prakriti = prakritiArg ?? null;
+    } else {
+        imageUrl    = input.imageUrl ?? null;
+        imageBuffer = input.imageBuffer ?? null;
+        mimeType    = input.mimeType ?? 'image/jpeg';
+        prakriti    = input.prakriti ?? null;
+    }
+
+    // Prefer the inline base64 path — works without public storage.
+    let llmImageUrl = null;
+    if (imageBuffer) {
+        const b64 = Buffer.isBuffer(imageBuffer)
+            ? imageBuffer.toString('base64')
+            : Buffer.from(imageBuffer).toString('base64');
+        llmImageUrl = `data:${mimeType};base64,${b64}`;
+    } else if (imageUrl && /^https?:\/\//i.test(imageUrl)) {
+        // Only public http(s) URLs are fetchable by OpenAI vision. A local
+        // `/uploads/...` path would fail server-side, so skip in that case.
+        llmImageUrl = imageUrl;
+    }
+
+    if (!llmImageUrl) {
+        logger.warn('[tongueAnalyser] no fetchable image source — skipping', {
+            hasBuffer: !!imageBuffer, hasUrl: !!imageUrl,
+        });
         return null;
     }
+
     const c = client();
     if (!c) {
         logger.warn('[tongueAnalyser] OPENAI_API_KEY missing — skipping');
@@ -105,7 +130,7 @@ export async function analyseTongue(imageUrl, prakriti) {
                     role: 'user',
                     content: [
                         { type: 'text', text: userText },
-                        { type: 'image_url', image_url: { url: imageUrl } },
+                        { type: 'image_url', image_url: { url: llmImageUrl } },
                     ],
                 },
             ],

@@ -45,6 +45,20 @@ const STRESS_MOODS = new Set([
     'WORRIED', 'TENSE', 'AGITATED',
 ]);
 
+// Free-text mood strings can arrive as "stressed out", "Stressed_Out",
+// "a bit anxious", etc. Normalise + substring-match so we don't miss real
+// distress because of casing or whitespace. Returns true if any stress
+// keyword appears in the (uppercased, whitespace-normalised) input.
+function isStressMood(mood) {
+    if (mood == null) return false;
+    const s = String(mood).toUpperCase().replace(/[\s_]+/g, ' ').trim();
+    if (STRESS_MOODS.has(s)) return true;
+    for (const m of STRESS_MOODS) {
+        if (s.includes(m.replace(/_/g, ' '))) return true;
+    }
+    return false;
+}
+
 /**
  * Score a patient. Pure — never reads from DB, never throws.
  * @param {ScoringInput} data
@@ -89,14 +103,32 @@ export function scorePatient(data) {
     const last14 = sorted.filter((c) => now - c._t <= 14 * day);
     const prior14 = sorted.filter((c) => now - c._t > 14 * day && now - c._t <= 28 * day);
 
-    const mean = (arr, key) =>
-        arr.length === 0 ? 0 : arr.reduce((s, x) => s + (Number(x[key]) || 0), 0) / arr.length;
+    // Skip entries where the key is null/undefined so an all-null cohort
+    // produces null (not 0). Otherwise comparisons like `mean(last7, 'mobilityScore') < mean(prior7, 'mobilityScore')`
+    // would silently fire for patients who simply stopped logging that field.
+    const mean = (arr, key) => {
+        const nums = [];
+        for (const x of arr) {
+            const raw = x?.[key];
+            if (raw == null) continue;
+            const n = Number(raw);
+            if (Number.isFinite(n)) nums.push(n);
+        }
+        if (nums.length === 0) return null;
+        return nums.reduce((s, n) => s + n, 0) / nums.length;
+    };
+    // Treat a missing window-mean as zero ONLY at the comparison boundary
+    // where the rule has explicitly checked the window has entries — never
+    // upstream where it could mask a "no data" case.
+    const meanOrZero = (arr, key) => mean(arr, key) ?? 0;
 
     // ── Vata aggravation signals ─────────────────────────────────────────
     // 1. Pain trend rising. The spec says "+0.5 per day avg over last 7d vs
     //    prior 7d". Interpreted as: delta-of-means / 7 — the per-day rate
-    //    of climb. Any positive rate ≥ 0.5/day fires the rule.
-    const painDelta = mean(last7, 'painLevel') - mean(prior7, 'painLevel');
+    //    of climb. Any positive rate ≥ 0.5/day fires the rule. painLevel is
+    //    a required Int in the schema so meanOrZero is safe — null only
+    //    appears when the window is empty, which the length check filters.
+    const painDelta = meanOrZero(last7, 'painLevel') - meanOrZero(prior7, 'painLevel');
     if (last7.length > 0 && prior7.length > 0 && painDelta >= 0.5 * 7) {
         // delta-of-means >= 3.5 ⇒ ~0.5/day rise. Threshold preserved.
         vataScore += 0.6;
@@ -108,29 +140,33 @@ export function scorePatient(data) {
         triggerFactors.push(`Pain trending up by ${painDelta.toFixed(1)} over 7 days`);
     }
 
-    // 2. Sleep declining (avg drop > 0.5h between windows).
-    const sleepDeltaVP = mean(last7, 'sleepHours') - mean(prior7, 'sleepHours');
-    if (last7.length > 0 && prior7.length > 0 && sleepDeltaVP < -0.5) {
+    // 2. Sleep declining (avg drop > 0.5h between windows). sleepHours is
+    //    required Float in the schema → meanOrZero is safe.
+    const sleepLast  = meanOrZero(last7, 'sleepHours');
+    const sleepPrior = meanOrZero(prior7, 'sleepHours');
+    if (last7.length > 0 && prior7.length > 0 && sleepLast - sleepPrior < -0.5) {
         vataScore += 0.4;
         triggerFactors.push(
-            `Sleep declined ${mean(prior7, 'sleepHours').toFixed(1)} → ${mean(last7, 'sleepHours').toFixed(1)} hrs`,
+            `Sleep declined ${sleepPrior.toFixed(1)} → ${sleepLast.toFixed(1)} hrs`,
         );
     }
 
     // 3. Mood worsening. Mood is a free-text string; we score by counting
     //    stress-coded moods per window and comparing rates.
     const stressRate = (arr) =>
-        arr.length === 0 ? 0 : arr.filter((c) => STRESS_MOODS.has(String(c.mood || '').toUpperCase())).length / arr.length;
+        arr.length === 0 ? 0 : arr.filter((c) => isStressMood(c.mood)).length / arr.length;
     const moodDelta = stressRate(last7) - stressRate(prior7);
     if (last7.length > 0 && prior7.length > 0 && moodDelta > 0.1) {
         vataScore += 0.3;
         triggerFactors.push(`Mood worsening — stress markers rose ${Math.round(moodDelta * 100)}% over 7 days`);
     }
 
-    // 4. Mobility declining.
-    const mobLast = mean(last7, 'mobilityScore');
+    // 4. Mobility declining. mobilityScore is nullable Int → use raw mean()
+    //    so an all-null window returns null and the rule is skipped (instead
+    //    of falsely firing because mean returned 0 against a populated prior).
+    const mobLast  = mean(last7,  'mobilityScore');
     const mobPrior = mean(prior7, 'mobilityScore');
-    if (last7.length > 0 && prior7.length > 0 && mobLast < mobPrior) {
+    if (mobLast != null && mobPrior != null && mobLast < mobPrior) {
         const drop = mobPrior - mobLast;
         if (drop >= 0.5) {
             vataScore += 0.3;
@@ -165,7 +201,7 @@ export function scorePatient(data) {
     }
 
     // 8. Stress / anxious mood for 5+ of last 7 days.
-    const stressDays = last7.filter((c) => STRESS_MOODS.has(String(c.mood || '').toUpperCase())).length;
+    const stressDays = last7.filter((c) => isStressMood(c.mood)).length;
     if (stressDays >= 5) {
         pittaScore += 0.5;
         triggerFactors.push(`Stress/anxiety markers on ${stressDays} of last 7 days`);
@@ -184,16 +220,17 @@ export function scorePatient(data) {
 
     // ── Kapha aggravation signals ────────────────────────────────────────
     // 11. Sleep > 9 hours avg over last 7 days.
-    const sleepLastAvg = mean(last7, 'sleepHours');
+    const sleepLastAvg = meanOrZero(last7, 'sleepHours');
     if (last7.length > 0 && sleepLastAvg > 9) {
         kaphaScore += 0.6;
         triggerFactors.push(`Excessive sleep — averaging ${sleepLastAvg.toFixed(1)} hrs/night`);
     }
 
     // 12. Mobility declining over 14 days (broader window than Vata's 7d rule).
-    const mob14  = mean(last14, 'mobilityScore');
+    //     Same null-handling as rule #4.
+    const mob14      = mean(last14,  'mobilityScore');
     const mobPrior14 = mean(prior14, 'mobilityScore');
-    if (last14.length > 0 && prior14.length > 0 && mob14 < mobPrior14) {
+    if (mob14 != null && mobPrior14 != null && mob14 < mobPrior14) {
         const drop14 = mobPrior14 - mob14;
         if (drop14 >= 0.5) {
             kaphaScore += 0.4;

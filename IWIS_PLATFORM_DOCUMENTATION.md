@@ -168,14 +168,16 @@ requireFeature('EXPLAINABLE_AI')                // Hospital-level feature flag
 |---|---|---|
 | `AMBIENT_VOICE_TO_NOTE` | 2 | ✅ Shipped |
 | `AYURVEDIC_VOICE_COACH` | 3 → 2 ↓ | ✅ Shipped at `/api/voice-coach` |
-| `BEHAVIOURAL_NUDGE_ENGINE` | 2 | Partially shipped (DailyMotivationCard cron exists; AI layer pending) |
-| `EXPLAINABLE_AI` | 2 | Pending (data already computed; only UI surface missing) |
-| `MULTI_AGENT_ORCHESTRATION` | 3 → 2 ↓ | Pending |
-| `PREDICTIVE_DOSHA_ENGINE` | 3 | Pending |
+| `BEHAVIOURAL_NUDGE_ENGINE` | 2 | ✅ Shipped — LLM-personalised Monday Motivation + NudgeLog feedback loop |
+| `EXPLAINABLE_AI` | 2 | ✅ Shipped — "Why?" popover on Appointments page + Care Gaps table |
+| `MULTI_AGENT_ORCHESTRATION` | 3 → 2 ↓ | ✅ Shipped — 4 agents fan out on `triage.critical.submitted` |
+| `PREDICTIVE_DOSHA_ENGINE` | 3 | ✅ Shipped — nightly cron at 02:00 IST emits DoshaForecast + alert |
+| `MULTIMODAL_DIAGNOSTIC_AI` | 3 | ✅ Shipped — Jihva Pariksha step in daily check-in + GPT-4o vision |
+| `PATIENT_DIGITAL_TWIN` | 4 → 2 ↑ | ✅ Shipped — consolidated panel on ConsultationRoom right column |
 | `AI_REVENUE_CYCLE` | 3 | Pending (blocked on ABDM API) |
-| `MULTIMODAL_DIAGNOSTIC_AI` | 3 | Pending |
-| `PATIENT_DIGITAL_TWIN` | 4 | Pending (data substrate ready; needs outcome history) |
 | `FEDERATED_LEARNING` | 4 | Pending (no Python ML stack yet) |
+
+**6 features shipped in the 2026-06-09 sprint.** All gated by hospital-level `HospitalFeatureFlag`, defaultEnabled=false. Test plan + verification log in `_sprint_2026-06-09_AI_features.md` (if present), or run `npm test` in both repos for 360 unit tests.
 
 ## 5. Backend API Reference (organized by domain)
 
@@ -247,9 +249,10 @@ requireFeature('EXPLAINABLE_AI')                // Hospital-level feature flag
 - `PUT /api/refills/:id/{approve,fulfill}` (PHARMACIST, DOCTOR)
 
 ### Wellness & daily tracking
-- `POST /api/wellness/check-in` (PATIENT) — 3-step daily
+- `POST /api/wellness/check-in` (PATIENT) — 3-step daily, also flips NudgeLog feedback flag
 - `GET /api/wellness/check-in/today`
 - `GET /api/wellness/stats`
+- `POST /api/wellness/check-in/tongue-photo` (PATIENT, **feature MULTIMODAL_DIAGNOSTIC_AI**) — F03 Jihva Pariksha; multipart `photo` + `checkInId`, ≤5 MB JPEG/PNG/WEBP; runs GPT-4o vision analysis inline; creates TongueObservation row; upserts PatientCriticalFlag when non-balanced + confidence > 0.6
 - `POST /api/daily-tracking/{water,measurements,activity,meal-photos,full-day-bonus}` (PATIENT)
 - `GET /api/daily-tracking/summary`
 
@@ -303,25 +306,36 @@ requireFeature('EXPLAINABLE_AI')                // Hospital-level feature flag
 
 ### Admin / audit / super-admin
 - `GET /api/audit-logs` (ADMIN_DOCTOR, ADMIN)
-- `GET/PUT /api/feature-flags` (ADMIN_DOCTOR, ADMIN)
+- `GET/PUT /api/feature-flags` (ADMIN_DOCTOR, ADMIN) — branch/role-scoped `FeatureFlag` table
 - `GET/POST /api/super-admin/hospitals` (SUPER_ADMIN)
-- `PUT /api/super-admin/hospitals/:id/features/:flag`
+- `PUT /api/super-admin/hospitals/:id/features/:flag` (SUPER_ADMIN) — **hospital-scoped `HospitalFeatureFlag` table — this is what `useTenantFeatures.has()` reads**
 - `GET /api/super-admin/audit`
 - `/admin/queues` — Bull-Board UI
 - `/api/docs` — Swagger UI
+
+### AI feature endpoints (sprint 2026-06-09)
+All gated by `HospitalFeatureFlag` per feature key.
+
+- `GET /api/triage/sessions/:id` — F08 explainability surface (compositeScore, urgencyLevel, redFlagsMatched, redFlagForced, confidenceScore, inputCompleteness, routingMatchStrength, alternativeSpecialties, triageNotes). Auth-only — patients can read own, clinicians can read any.
+- `GET /api/patients/:patientId/dosha-forecast` (DOCTOR/ADMIN_DOCTOR, **feature PREDICTIVE_DOSHA_ENGINE**) — F04, returns last 10 forecasts ordered by `generatedAt desc`. Hospital-scoped.
+- `GET /api/patients/:patientId/tongue-observations` (DOCTOR/ADMIN_DOCTOR, **feature MULTIMODAL_DIAGNOSTIC_AI**) — F03, last 30 observations newest-first.
+- `GET /api/patients/:patientId/digital-twin` (DOCTOR/ADMIN_DOCTOR, **feature PATIENT_DIGITAL_TWIN**) — F01, single-call payload with painTrend/sleepTrend/moodTrend/mobilityTrend (30 d), doshaBalance (sum=100), latest forecast, tongue summary, active medication count + first 3, journey + cohort count with privacy floor 5.
+- (Side-effect channel) `POST /api/triage` and `/api/triage/submit` — F07; on URGENT/CRITICAL urgency + **feature MULTI_AGENT_ORCHESTRATION**, emits `triage.critical.submitted` event after the response. 4 agents fan out in parallel via Promise.allSettled.
 
 ## 6. BullMQ Jobs & Background Workers
 
 | Queue / Worker | Trigger | What it does |
 |---|---|---|
-| `notification` | Per-event publish | Fan-out to NotificationDelivery records |
+| `notification` | Per-event publish | Fan-out to Notification rows + socket emit (`emitToUser`) |
 | `whatsapp` | Per-message publish | Rate-limited send via Evolution API; idempotent on `whatsappSentAt` |
-| `daily-cards` | Cron 07:00 IST | DailyMotivationCard per patient (prakriti × season) + WhatsApp |
+| `monday-motivation` | Cron `0 10 * * 1` (10:00 IST Mondays) | F05 — per-patient LLM-personalised nudge when BEHAVIOURAL_NUDGE_ENGINE on; falls back to static AYURVEDIC_TIPS template otherwise. Writes NudgeLog row. |
+| `dosha-forecast` | Cron `30 20 * * *` (02:00 IST nightly) | F04 — scans every active patient at flag-enabled hospitals; writes DoshaForecast + upserts PatientCriticalFlag + notifies assigned doctor when score > 1.5. **IST-aware day boundary** for idempotency. |
 | `health-report` | Generate Report button | Branded PDF → Supabase → WhatsApp |
 | `attendance-roll` | Cron daily | Marks LATE / ABSENT per clinician |
 | `cleanup-uploads` | Cron nightly | Removes orphaned Supabase files |
 | `consultation-feedback-request` | 30s after appt.complete | Triggers feedback prompt |
 | `home-therapy-brief` | Cron 07:00 IST | Home-therapy brief + WhatsApp to therapists |
+| `eventRegistry` (in-process) | `emitEvent('triage.critical.submitted', …)` from triage route | F07 — fans out to careGapAgent + pharmacyAgent + slotHoldAgent + dashboardSummariser via Promise.allSettled. Never throws. |
 
 ## 7. Frontend pages by role
 
@@ -423,18 +437,33 @@ requireFeature('EXPLAINABLE_AI')                // Hospital-level feature flag
 
 ## 10. AI Features Roadmap
 
-| # | Feature | Existing % | Phase | Status |
-|---|---|---|---|---|
-| 02 | Ambient Voice-to-Note | 70% | 2 | ✅ Shipped |
-| 06 | Voice Health Coach | 65% | 2 ↓ | ✅ Shipped; v2 upgrade pending |
-| 05 | Behavioural Nudge Engine | 75% | 2 | Partially shipped (cron exists; AI layer pending) |
-| 07 | Multi-Agent Orchestration | 70% | 2 ↓ | Pending |
-| 08 | Explainable AI | 65% | 2 | Pending |
-| 04 | Predictive Dosha | 65% | 3 | Pending (extends Care Gaps stream) |
-| 10 | AI Revenue Cycle | 40% | 3 | Pending (blocked on ABDM external API) |
-| 03 | Multimodal Diagnostic | 50% | 3 | Pending |
-| 01 | Patient Digital Twin | 55% | 4 | Pending (needs outcome history) |
-| 09 | Federated Learning | 25% | 4 | Pending (no Python ML stack) |
+| # | Feature | Phase | Status |
+|---|---|---|---|
+| 02 | Ambient Voice-to-Note | 2 | ✅ Shipped |
+| 06 | Voice Health Coach | 2 | ✅ Shipped |
+| 05 | Behavioural Nudge Engine | 2 | ✅ Shipped (2026-06-09) — LLM personalised + NudgeLog feedback |
+| 07 | Multi-Agent Orchestration | 2 | ✅ Shipped (2026-06-09) — 4 agents on `triage.critical.submitted` |
+| 08 | Explainable AI | 2 | ✅ Shipped (2026-06-09) — "Why?" popover on Appointments + Care Gaps |
+| 04 | Predictive Dosha | 3 | ✅ Shipped (2026-06-09) — nightly DoshaForecast cron |
+| 03 | Multimodal Diagnostic | 3 | ✅ Shipped (2026-06-09) — Jihva Pariksha step in daily check-in |
+| 01 | Patient Digital Twin | 4 | ✅ Shipped (2026-06-09) — consolidated panel on ConsultationRoom |
+| 10 | AI Revenue Cycle | 3 | Pending (blocked on ABDM external API) |
+| 09 | Federated Learning | 4 | Pending (no Python ML stack yet) |
+
+### Sprint 2026-06-09 follow-ups (filed, not blocking)
+
+| # | Item | Where |
+|---|---|---|
+| F09 | PatientCriticalFlag.reasons race condition | `careGapAgent`, `doshaCron`, `tongueAnalysis` route all read-modify-write the same JSON column. Needs row-level lock or atomic JSON ops. |
+| F10 | `buildTongueSummary` IMPROVING branch logic | Re-balance trajectories (BALANCED→VATA→BALANCED) currently fall through to STABLE. Needs product input on correct rules. |
+| F13 | `dashboardSummariser` rich card payload | autoActions object is computed but never persisted on the Notification row. Extend `enqueueInAppNotification` to accept `data` payload. |
+| F14 | CareGapDashboard `hasDoshaForecast` chip | Backend never populates this on care-gap rows; chip never renders. Add per-row dosha-forecast presence check in CareGapService.listGaps. |
+| Reuse | DOSHA_COLOUR duplicated in 5 frontend files | Consolidate to `src/lib/doshaTheme.ts`. |
+| Reuse | PatientCriticalFlag reasons-merge in 3 services | Extract to `services/patientCriticalFlag.service.js`. |
+| Reuse | `makeFeatureCache` duplicates `featureGate.isFeatureAvailable` with subtly different fail modes | Add a `makeCachedFeatureGate(featureKey)` to `utils/featureGate.js`. |
+| Altitude | Two DailyCheckIn components (wellness + patient) | Consolidate; F03 Step 5 copy-pasted between them and one had a 401 bug the other didn't. |
+| Altitude | NotificationPanel 30-case switch + `data.link` short-circuit | Retire the switch; require emitters to set `data.link`. |
+| Altitude | TongueObservation half-extended schema | Migrate legacy enum columns to strings or split into two tables. |
 
 ## 11. Operational gotchas (lessons learned)
 
@@ -451,9 +480,16 @@ requireFeature('EXPLAINABLE_AI')                // Hospital-level feature flag
 
 ## 12. Documentation maintenance
 
-State as of **2026-05-23**, drawing from:
+State as of **2026-06-09** (sprint commit), drawing from:
 - IWIS Platform Reference v2026-05-19 (covering fixes 1–39)
-- Live Prisma schema (80+ models, 90+ enums, 35 feature flags)
-- Live route inventory (67 route files, ~500 endpoints)
+- Sprint 2026-06-09 — 6 AI features shipped (F01, F03, F04, F05, F07, F08)
+- Live Prisma schema (82+ models including `NudgeLog`, `DoshaForecast`, extended `TongueObservation`)
+- Live route inventory (67+ route files, ~500 endpoints + 4 new AI endpoints)
+- Code review pass: 9-angle review surfaced 15 findings, 11 critical fixes shipped in same sprint commit
 
 When schema or routes change meaningfully, refresh the affected section.
+
+### Test surface
+- Backend: `cd alshifa-backend && npm test` → 319 unit tests across 25 files (Vitest), 80% coverage threshold on `services/**`
+- Frontend: `cd alshifa-frontend && npm test` → 41 unit tests including aiFeatures.test.tsx component tests
+- Combined: **360 unit tests** passing at commit. No real OpenAI / Supabase / Evolution traffic in tests.

@@ -37,8 +37,17 @@ const MOOD_SCALE = {
 
 function moodToNumeric(mood) {
     if (mood == null) return null;
-    const key = String(mood).toUpperCase().trim();
-    return MOOD_SCALE[key] ?? 3;
+    // Free-text moods may arrive as "Stressed out", "stressed_out", "a bit
+    // anxious", etc. Collapse internal whitespace + underscores so common
+    // variants land on the same key as our scale. Substring-match also
+    // catches "feeling stressed" → STRESSED (since STRESSED is in MOOD_SCALE).
+    const key = String(mood).toUpperCase().replace(/[\s_]+/g, ' ').trim();
+    if (MOOD_SCALE[key] !== undefined) return MOOD_SCALE[key];
+    // Last resort: scan for any known mood word inside the string.
+    for (const known of Object.keys(MOOD_SCALE)) {
+        if (key.includes(known)) return MOOD_SCALE[known];
+    }
+    return 3;
 }
 
 /**
@@ -280,12 +289,24 @@ function deriveDoshaBalance({ prakriti, checkIns, tongueObservations, forecast }
         if (dom === 'KAPHA') k += 10;
     }
 
-    // Normalise to 100.
+    // Normalise to 100. Rounding can push the residual kN below zero when
+    // both vN and pN round up. Subtract the overshoot from whichever
+    // component has the most slack so we never inflate a bar past its true
+    // share or pin the residual to the wrong dosha.
     const total = v + p + k;
     let vN = Math.round((v / total) * 100);
     let pN = Math.round((p / total) * 100);
-    let kN = 100 - vN - pN; // ensures exact 100
-    if (kN < 0) { kN = 0; pN = Math.max(0, 100 - vN - kN); }
+    let kN = 100 - vN - pN;
+    if (kN < 0) {
+        // Trim the overshoot from the larger of vN/pN.
+        const overshoot = -kN;
+        if (vN >= pN) vN = Math.max(0, vN - overshoot);
+        else          pN = Math.max(0, pN - overshoot);
+        kN = 100 - vN - pN;
+        // Guard against a (rare) second-order underflow when both vN and pN
+        // collapsed to zero in pathological inputs.
+        if (kN < 0) kN = 0;
+    }
     return { vata: vN, pitta: pN, kapha: kN };
 }
 

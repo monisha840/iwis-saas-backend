@@ -27,19 +27,33 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // IST is UTC+5:30 — derive season from the IST month so a non-IST host
 // (Render, Vercel) still gets the right Indian-calendar bucket.
+//
+// Vocabulary aligned with doshaScorer.js: WINTER / SPRING / SUMMER / MONSOON /
+// AUTUMN. SUMMER (May-Jun peak Indian heat) was previously absent — the
+// scorer's `season === 'SUMMER'` Pitta-aggravation rule was dead all year
+// because the cron never emitted that label.
 function currentSeasonIST(now = new Date()) {
     const istMs = now.getTime() + (5.5 * 60 * 60 * 1000);
     const month = new Date(istMs).getUTCMonth(); // 0..11
-    if (month === 11 || month <= 1) return 'WINTER'; // Dec, Jan, Feb
-    if (month >= 2 && month <= 4)   return 'SPRING'; // Mar, Apr, May
-    if (month >= 5 && month <= 7)   return 'MONSOON';// Jun, Jul, Aug
+    if (month === 11 || month <= 1) return 'WINTER';  // Dec, Jan, Feb
+    if (month >= 2 && month <= 3)   return 'SPRING';  // Mar, Apr
+    if (month >= 4 && month <= 5)   return 'SUMMER';  // May, Jun — peak Pitta
+    if (month >= 6 && month <= 7)   return 'MONSOON'; // Jul, Aug
     return 'AUTUMN'; // Sep, Oct, Nov
 }
 
+// IST-aware day boundary. We need this for cron idempotency: a manual re-run
+// at 01:30 UTC (07:00 IST same Indian day) must still find the original
+// 20:30 UTC (02:00 IST) forecast as "today". Using server-local setHours
+// drifts the boundary on UTC hosts and produces duplicate forecasts.
+const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
+
 function startOfDay(d = new Date()) {
-    const x = new Date(d);
-    x.setHours(0, 0, 0, 0);
-    return x;
+    // Shift to IST, zero the time-of-day in that frame, then shift back.
+    const istMs = d.getTime() + IST_OFFSET_MS;
+    const istMidnight = new Date(istMs);
+    istMidnight.setUTCHours(0, 0, 0, 0);
+    return new Date(istMidnight.getTime() - IST_OFFSET_MS);
 }
 
 export async function runDoshaForecastCron() {

@@ -11,6 +11,7 @@
  */
 
 import express from 'express';
+import { readFileSync } from 'node:fs';
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
 import { requireFeature } from '../utils/featureGate.js';
 import { getUploadMiddleware, uploadToSupabase } from '../middleware/upload.js';
@@ -73,7 +74,16 @@ router.post(
             // 'tongue-photos' for clearer ops segregation. If the bucket
             // doesn't exist yet, the helper logs and falls back to local
             // disk — the upload always returns a usable URL.
-            let photoUrl;
+            // Try to upload to Supabase Storage. If the bucket doesn't exist
+            // or storage is otherwise unreachable, we DON'T fail the whole
+            // request — we save the observation row anyway with photoUrl=null
+            // and skip the analysis. The amber "Photo saved — analysis
+            // unavailable" surface the frontend shows is for HTTP failures;
+            // a graceful "no photo url but row exists" still returns 201 so
+            // the patient sees the friendlier "Analysis unavailable" notes
+            // card instead of an error.
+            let photoUrl = null;
+            let storageFailed = false;
             try {
                 const renamed = {
                     ...req.file,
@@ -84,8 +94,10 @@ router.post(
                 };
                 photoUrl = await uploadToSupabase(renamed, 'tongue-photos');
             } catch (err) {
-                logger.error('[tongue] storage upload failed', { err: err.message });
-                return res.status(502).json({ error: 'Photo storage temporarily unavailable. Please try again.' });
+                logger.warn('[tongue] storage upload failed — saving observation without photo', {
+                    err: err.message,
+                });
+                storageFailed = true;
             }
 
             // Fetch ConstitutionProfile so the LLM gets the right context.
@@ -94,8 +106,28 @@ router.post(
             }).catch(() => null);
             const prakriti = constitution?.prakriti ?? null;
 
-            // Run analysis. NEVER throws — returns null on any failure.
-            const analysis = await analyseTongue(photoUrl, prakriti);
+            // Recover the image bytes regardless of storage outcome:
+            //   - memory storage path: req.file.buffer is already in memory
+            //   - disk-fallback path:  req.file.path points at the temp file
+            // analyseTongue sends the image inline as a base64 data URL so
+            // the LLM never has to GET a public URL. This makes the analysis
+            // step independent of Supabase bucket configuration.
+            let imageBuffer = null;
+            try {
+                imageBuffer = req.file.buffer
+                    ?? (req.file.path ? readFileSync(req.file.path) : null);
+            } catch (err) {
+                logger.warn('[tongue] failed to read uploaded image bytes', { err: err.message });
+            }
+
+            const analysis = imageBuffer
+                ? await analyseTongue({
+                    imageBuffer,
+                    mimeType: req.file.mimetype,
+                    imageUrl: photoUrl,    // kept as a fallback / for logging
+                    prakriti,
+                })
+                : null;
 
             const observation = await prisma.tongueObservation.create({
                 data: {

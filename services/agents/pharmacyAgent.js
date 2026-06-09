@@ -22,7 +22,7 @@
 
 import prisma from '../../lib/prisma.js';
 import logger from '../../lib/logger.js';
-import { enqueueInAppNotification } from '../queue.service.js';
+import { notificationService } from '../notification.service.js';
 
 /**
  * @param {{ triageSessionId: string, patientId: string, branchId?: string|null }} payload
@@ -120,46 +120,24 @@ export async function pharmacyAgent(payload) {
         }
     }
 
-    // 4) Notify pharmacists at this branch — one notification per flagged
-    //    medicine. We don't fan out to every pharmacist for every flagged
-    //    medicine because that would spam; one notification per medicine
-    //    lets the pharmacist queue deduplicate naturally.
+    // 4) Notify pharmacists + admin doctors via the existing platform helper.
+    //    NotificationService.sendLowStockAlert already resolves the right
+    //    audience for the branch, uses the canonical type 'LOW_STOCK_ALERT',
+    //    and lives in one place — so this agent doesn't drift its own
+    //    notification vocabulary from the rest of the platform.
     let notifiedCount = 0;
-    if (flagged.length > 0) {
-        let pharmacistUserIds = [];
+    for (const f of flagged) {
         try {
-            const pharmacists = await prisma.user.findMany({
-                where: {
-                    role: 'PHARMACIST',
-                    branchId,
-                    status: 'ACTIVE',
-                },
-                select: { id: true },
-            });
-            pharmacistUserIds = pharmacists.map((u) => u.id);
+            await notificationService.sendLowStockAlert(
+                f.medicationName,
+                f.quantity,
+                branchId,
+            );
+            notifiedCount += 1;
         } catch (err) {
-            logger.warn('[agent:pharmacy] pharmacist lookup failed', {
-                branchId, err: err.message,
+            logger.warn('[agent:pharmacy] sendLowStockAlert failed', {
+                medicineId: f.medicineId, err: err.message,
             });
-        }
-
-        for (const f of flagged) {
-            for (const uid of pharmacistUserIds) {
-                try {
-                    await enqueueInAppNotification({
-                        userId: uid,
-                        title: 'Low stock — patient on critical-triage Rx',
-                        body:  `${f.medicationName} is at ${f.quantity} (min ${f.minStock}). Critical patient needs this in stock.`,
-                        type:  'LOW_STOCK',
-                        relatedId: triageSessionId,
-                    });
-                    notifiedCount += 1;
-                } catch (err) {
-                    logger.warn('[agent:pharmacy] notification enqueue failed', {
-                        userId: uid, err: err.message,
-                    });
-                }
-            }
         }
     }
 

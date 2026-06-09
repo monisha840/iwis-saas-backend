@@ -26,9 +26,20 @@ import prisma from '../../lib/prisma.js';
 import logger from '../../lib/logger.js';
 
 const SLOT_DURATION_MIN = 30;
-const WORK_START_HOUR   = 8;   // 08:00
-const WORK_END_HOUR     = 18;  // last slot starts at 17:30
+const SLOT_DURATION_MS  = SLOT_DURATION_MIN * 60 * 1000;
+const WORK_START_HOUR   = 8;   // 08:00 IST — clinic morning open
+const WORK_END_HOUR     = 18;  // last slot starts at 17:30 IST
 const SEARCH_WINDOW_HRS = 24;
+// IST = UTC+5:30. We compare working hours in IST regardless of the host
+// timezone so a Render/Vercel UTC deploy still files slots into the actual
+// Indian clinic window.
+const IST_OFFSET_MS = (5 * 60 + 30) * 60 * 1000;
+
+// Returns the hour-of-day (0-23) in IST for a given Date instance, host
+// timezone be damned.
+function istHour(date) {
+    return new Date(date.getTime() + IST_OFFSET_MS).getUTCHours();
+}
 
 /**
  * @param {{ triageSessionId: string, patientId: string, branchId?: string|null }} payload
@@ -81,7 +92,18 @@ export async function slotHoldAgent(payload) {
         return { slotHeld: false, reason: 'appt_lookup_failed' };
     }
 
-    const taken = new Set(existingAppts.map((a) => new Date(a.date).getTime()));
+    // Existing appointment ranges as half-open intervals [start, start + 30min).
+    // An existing 09:15-09:45 collides with proposed 09:00-09:30 AND 09:30-10:00
+    // — the previous exact-ms Set match missed both. Range overlap is
+    // proposed.start < existing.end  &&  existing.start < proposed.end.
+    const takenRanges = existingAppts.map((a) => {
+        const start = new Date(a.date).getTime();
+        return { start, end: start + SLOT_DURATION_MS };
+    });
+    const overlapsTaken = (proposedStart) => {
+        const proposedEnd = proposedStart + SLOT_DURATION_MS;
+        return takenRanges.some((r) => proposedStart < r.end && r.start < proposedEnd);
+    };
 
     let chosenSlot = null;
     const cursor = new Date(now);
@@ -90,9 +112,9 @@ export async function slotHoldAgent(payload) {
     cursor.setMinutes(Math.ceil(cursor.getMinutes() / SLOT_DURATION_MIN) * SLOT_DURATION_MIN, 0, 0);
 
     while (cursor < windowEnd) {
-        const hour = cursor.getHours();
+        const hour = istHour(cursor);
         const insideWindow = hour >= WORK_START_HOUR && hour < WORK_END_HOUR;
-        if (insideWindow && !taken.has(cursor.getTime())) {
+        if (insideWindow && !overlapsTaken(cursor.getTime())) {
             chosenSlot = new Date(cursor);
             break;
         }
