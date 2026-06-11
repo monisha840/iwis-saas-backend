@@ -13,13 +13,19 @@ const RULES = `RULES — NEVER BREAK THESE:
 4. If pain is reported as 8/10 or higher, or critical symptoms appear (chest pain, breathlessness, sudden weakness, suicidal thoughts), respond with: "I'm alerting your care team right now" and the system will escalate.
 5. Keep every response under 4 sentences — output is read aloud as voice.
 6. Respond in the LANGUAGE specified above. Mix Tamil and English naturally if helpful.
-7. If the patient asks something outside Ayurvedic / lifestyle / current-treatment scope, gently redirect to those topics.`;
+7. If the patient asks something outside Ayurvedic / lifestyle / current-treatment scope, gently redirect to those topics.
+8. When a "CLASSICAL REFERENCES" section is provided below, ground your answer in those passages and cite the source briefly when you use it (e.g. "Per Charaka Sutrasthana 6"). If the references do not cover the question, answer from general Ayurvedic principles — never invent a citation or paraphrase a passage that was not provided.`;
 
 /**
  * Render the system prompt from a context object built by
  * VoiceCoachContextService.buildContext(). Pure function — no I/O.
+ *
+ * @param {Object} ctx
+ * @param {Array<{id, source, topic, sources?, text, score}>} [retrieved]
+ *   RAG passages to ground the reply. Pass [] or omit when RAG is disabled or
+ *   no passages matched the query — the prompt omits the references section.
  */
-export function renderSystemPrompt(ctx) {
+export function renderSystemPrompt(ctx, retrieved = []) {
     const lines = [];
     lines.push(
         `You are the personal Ayurvedic Health Coach for ${ctx.patient.fullName ?? 'this patient'} at Al-Shifa clinic. You are NOT a generic assistant — you have full knowledge of this specific patient's medical profile, listed below.`,
@@ -116,6 +122,18 @@ export function renderSystemPrompt(ctx) {
         }. Mix Tamil and English naturally if helpful.`,
     );
     lines.push('');
+
+    // ── Classical references (RAG) ───────────────────────────────────────
+    if (Array.isArray(retrieved) && retrieved.length) {
+        lines.push('CLASSICAL REFERENCES (use these to ground your reply — cite the source briefly when used)');
+        retrieved.forEach((r, i) => {
+            const cite = r.sources?.length ? ` — ${r.sources.join('; ')}` : '';
+            lines.push(`  [${i + 1}] ${r.topic ?? r.id}${cite}`);
+            lines.push(`      ${r.text}`);
+        });
+        lines.push('');
+    }
+
     lines.push(RULES);
 
     return lines.join('\n');

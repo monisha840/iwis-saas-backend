@@ -19,6 +19,7 @@ import OpenAI from 'openai';
 import logger from '../../lib/logger.js';
 import { VoiceCoachContextService } from './context.service.js';
 import { renderSystemPrompt } from './prompts.js';
+import { retrievePassages } from './ragRetriever.js';
 
 const MODEL = 'gpt-4o-mini';
 const MAX_OUTPUT_TOKENS = 400; // ~4 sentences of voice-friendly Tamil/English
@@ -72,7 +73,13 @@ export class VoiceCoachLLMService {
         }
         const languageUsed = ctx.patient.preferredCoachLang;
 
-        const systemPrompt = renderSystemPrompt(ctx);
+        // Retrieve grounding passages from the Ayurvedic corpus. Never throws —
+        // returns [] if RAG is disabled, the corpus is missing, or the OpenAI
+        // embedding call fails. The prompt simply omits the references section
+        // in those cases and the voice coach behaves as before.
+        const retrieved = await retrievePassages(userTranscript).catch(() => []);
+
+        const systemPrompt = renderSystemPrompt(ctx, retrieved);
         const messages = this._buildMessageHistory(systemPrompt, ctx.recentMessages, userTranscript);
 
         const t0 = Date.now();
@@ -117,6 +124,7 @@ export class VoiceCoachLLMService {
             model: MODEL,
             ...usage,
             length: text.length,
+            retrievedPassageIds: retrieved.map(r => r.id),
         });
 
         return {
@@ -124,10 +132,12 @@ export class VoiceCoachLLMService {
             model: MODEL,
             usage,
             languageUsed,
+            retrievedPassages: retrieved.map(r => ({ id: r.id, score: r.score })),
             contextSnapshot: {
                 hasPrescriptions: ctx.prescriptions.length > 0,
                 hasActiveJourney: !!ctx.activePhase,
                 memoryTurns: ctx.recentMessages.length,
+                retrievedCount: retrieved.length,
             },
         };
     }
