@@ -9,6 +9,7 @@
 
 import express from 'express';
 import multer from 'multer';
+import prisma from '../lib/prisma.js';
 import { authMiddleware, roleMiddleware, resolvePatientId } from '../middleware/auth.js';
 import { validate } from '../middleware/validate.js';
 import { requireFeature } from '../utils/featureGate.js';

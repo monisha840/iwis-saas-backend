@@ -31,6 +31,7 @@ const FEATURES = [
   { key: 'PREDICTIVE_DOSHA_ENGINE', displayName: 'Predictive Dosha engine',   phase: 'PHASE_3', minPlan: 'PROFESSIONAL', isCore: false, defaultEnabled: false, description: 'AI-assisted Ayurvedic Dosha typing and drift detection.' },
   { key: 'MULTI_AGENT_ORCHESTRATION',displayName: 'Multi-agent orchestration',phase: 'PHASE_3', minPlan: 'PROFESSIONAL', isCore: false, defaultEnabled: false, description: 'Coordinated AI agents (triage, dosing, follow-up).' },
   { key: 'AYURVEDIC_VOICE_COACH',   displayName: 'Ayurvedic voice coach (Tamil)', phase: 'PHASE_3', minPlan: 'PROFESSIONAL', isCore: false, defaultEnabled: false, description: 'Tamil-language patient coaching via voice.' },
+  { key: 'VOICE_COACH_EXTRACTIVE_ONLY', displayName: 'Voice coach extractive RAG (no LLM)', phase: 'PHASE_3', minPlan: 'PROFESSIONAL', isCore: false, defaultEnabled: false, description: 'When enabled, voice coach answers via templated extractive RAG with no LLM call. Default off; flip per hospital for cutover.' },
   { key: 'AI_REVENUE_CYCLE',        displayName: 'AI revenue cycle (AYUSH billing)', phase: 'PHASE_3', minPlan: 'PROFESSIONAL', isCore: false, defaultEnabled: false, description: 'Automated AYUSH claim coding and submission.' },
   { key: 'MULTIMODAL_DIAGNOSTIC_AI',displayName: 'Multimodal diagnostic AI',  phase: 'PHASE_3', minPlan: 'PROFESSIONAL', isCore: false, defaultEnabled: false, description: 'Image + text + vitals fused diagnostic assist.' },
 

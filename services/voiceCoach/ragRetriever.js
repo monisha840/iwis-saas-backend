@@ -133,23 +133,51 @@ export function cosineSimilarity(a, b) {
     return dot / denom;
 }
 
+// Topic passages are clinically-reviewed classical references with sources;
+// tips are short daily-living one-liners without citations. We prefer topic
+// passages over tips when both score similarly so the patient gets an
+// authoritative, cited answer instead of a random matching tip.
+const TOPIC_PASSAGE_BONUS = 0.05;
+
+function effectiveScore(passage, rawScore) {
+    if (passage.source === 'TOPIC_PASSAGES') return rawScore + TOPIC_PASSAGE_BONUS;
+    return rawScore;
+}
+
+// Detect dosha keywords in the query (English or Tamil) so we can prefer
+// passages tagged with that dosha. Soft-filter: we drop non-matching
+// passages only if matching ones exist; otherwise fall through to scoring
+// the whole corpus.
+function detectDoshaTag(queryText) {
+    const lower = (queryText || '').toLowerCase();
+    if (/\b(vata|வாட்டா|வாதா)\b/u.test(lower)) return 'vata';
+    if (/\b(pitta|பித்தா)\b/u.test(lower)) return 'pitta';
+    if (/\b(kapha|கபா|கபம்)\b/u.test(lower)) return 'kapha';
+    return null;
+}
+
 export function topK(queryVec, passages, k, minSimilarity) {
     if (!queryVec || !passages?.length) return [];
     const scored = [];
     for (const p of passages) {
         const score = cosineSimilarity(queryVec, p.embedding);
-        if (score >= minSimilarity) scored.push({ passage: p, score });
+        if (score >= minSimilarity) {
+            scored.push({ passage: p, score, adjusted: effectiveScore(p, score) });
+        }
     }
-    scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, k);
+    scored.sort((a, b) => b.adjusted - a.adjusted);
+    return scored.slice(0, k).map(({ passage, score }) => ({ passage, score }));
 }
 
 /**
  * Retrieve the top-K passages most relevant to the patient query.
  *
  * @param {string} queryText
- * @param {{ topK?: number, minSimilarity?: number }} [opts]
- * @returns {Promise<Array<{ id, source, topic, sources?, tags?, text, score }>>}
+ * @param {{ topK?: number, minSimilarity?: number, language?: 'en'|'ta' }} [opts]
+ *   When `language` is set, only passages tagged with that language are
+ *   scored. When omitted, all passages in the corpus are eligible (back-
+ *   compat with the pre-bilingual corpus).
+ * @returns {Promise<Array<{ id, source, topic, sources?, tags?, language?, text, score }>>}
  *   Empty array when RAG is disabled, the corpus is missing, or the query is
  *   blank — callers MUST treat empty as "fall back to no-RAG prompt".
  */
@@ -157,21 +185,42 @@ export async function retrievePassages(queryText, opts = {}) {
     if (!queryText || !queryText.trim()) return [];
     const k = opts.topK ?? DEFAULT_TOP_K;
     const minSim = opts.minSimilarity ?? DEFAULT_MIN_SIMILARITY;
+    const language = opts.language;
 
     const corpus = loadCorpus();
     if (!corpus) return [];
 
+    // Filter by language when requested. Pre-bilingual corpora have no
+    // language field on passages; in that case we keep all of them so the
+    // retriever still works during the cutover window.
+    let filtered = language
+        ? corpus.filter(p => !p.language || p.language === language)
+        : corpus;
+    if (!filtered.length) return [];
+
+    // Soft dosha-tag filter. When the query explicitly names a dosha,
+    // restrict to passages tagged with that dosha so a Vata question can't
+    // retrieve a Pitta watermelon tip. If the filter would empty the
+    // candidate set, fall through to scoring the unfiltered subset.
+    const doshaTag = detectDoshaTag(queryText);
+    if (doshaTag) {
+        const doshaSubset = filtered.filter(p => Array.isArray(p.tags) && p.tags.includes(doshaTag));
+        if (doshaSubset.length > 0) filtered = doshaSubset;
+    }
+
     const queryVec = await embedQuery(queryText.trim());
     if (!queryVec) return [];
 
-    const hits = topK(queryVec, corpus, k, minSim);
+    const hits = topK(queryVec, filtered, k, minSim);
 
     // Always log the top-3 raw scores (no threshold) so we can tune from real
-    // data even when the threshold filtered everything. Cheap — k=3 over ~600
-    // passages is microseconds and we already computed every score.
-    const top3Raw = topK(queryVec, corpus, 3, -1);
+    // data even when the threshold filtered everything. Cheap — k=3 over the
+    // language-filtered subset is microseconds and we already computed scores.
+    const top3Raw = topK(queryVec, filtered, 3, -1);
     logger.info('[RagRetriever] retrieval scores', {
         queryPreview: queryText.slice(0, 60),
+        language: language ?? 'any',
+        candidateCount: filtered.length,
         top3: top3Raw.map(r => ({ id: r.passage.id, score: Number(r.score.toFixed(4)) })),
         kept: hits.length,
         threshold: minSim,
@@ -183,6 +232,7 @@ export async function retrievePassages(queryText, opts = {}) {
         topic: passage.topic,
         sources: passage.sources,
         tags: passage.tags,
+        language: passage.language,
         text: passage.text,
         score: Number(score.toFixed(4)),
     }));

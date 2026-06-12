@@ -182,7 +182,9 @@ describe('retrievePassages — happy path', () => {
             },
         });
 
-        const out = await retrievePassages('vata in winter', { topK: 2, minSimilarity: -1 });
+        // 'cold winter morning' avoids the dosha-tag soft filter so all
+        // three corpus passages remain candidates and topK=2 returns 2.
+        const out = await retrievePassages('cold winter morning', { topK: 2, minSimilarity: -1 });
         expect(out).toHaveLength(2);
         expect(out[0].id).toBe('vata-winter');
         expect(out[0].topic).toBe('Vata in winter');
@@ -192,6 +194,21 @@ describe('retrievePassages — happy path', () => {
         expect(typeof out[0].score).toBe('number');
         // No embedding is leaked to callers.
         expect('embedding' in out[0]).toBe(false);
+    });
+
+    it('soft-filters by dosha tag when query names a dosha', async () => {
+        __setCorpusForTests(corpus);
+        __setClientForTests({
+            embeddings: {
+                create: vi.fn().mockResolvedValue({ data: [{ embedding: makeVec(2) }] }),
+            },
+        });
+        // Query mentions pitta — even though our query vector is most similar
+        // to vata-winter, the dosha filter should restrict candidates to the
+        // single pitta-summer passage.
+        const out = await retrievePassages('pitta summer heat', { topK: 3, minSimilarity: -1 });
+        expect(out).toHaveLength(1);
+        expect(out[0].id).toBe('pitta-summer');
     });
 
     it('caches the query embedding so a second call within TTL only calls OpenAI once', async () => {

@@ -60,12 +60,6 @@ export class VoiceCoachSTTService {
                 file,
                 response_format: 'verbose_json',
                 temperature: 0,
-                // Light context priming. Whisper biases toward terms that
-                // appeared in the prompt, so naming the domain reduces
-                // drift toward generic YouTube hallucinations on noisy
-                // input. We don't restate the patient's question — that
-                // would bias the transcription toward something already
-                // said.
                 prompt:
                     'An Ayurvedic patient is asking their health coach a question. ' +
                     'They may speak Tamil or English about pain, sleep, mood, ' +
@@ -93,11 +87,26 @@ export class VoiceCoachSTTService {
             });
             return { transcript, language, durationMs };
         } catch (err) {
+            // Enhanced logging — surface the OpenAI body so we can see WHY the
+            // call failed (quota, bad audio, region, etc.) instead of just
+            // "Whisper failed".
+            let bodySnippet = null;
+            try {
+                if (err?.response?.text) {
+                    bodySnippet = (await err.response.text()).slice(0, 500);
+                } else if (err?.error) {
+                    bodySnippet = JSON.stringify(err.error).slice(0, 500);
+                }
+            } catch (_) { /* ignore body read errors */ }
             logger.error('[VoiceCoachSTT] Whisper call failed', err, {
                 bytes: audioBuffer.length,
                 filename,
+                mimeType,
                 openaiStatus: err?.status,
+                openaiCode: err?.code,
+                openaiType: err?.type,
                 openaiMessage: err?.message,
+                openaiBody: bodySnippet,
             });
             const wrapped = new Error(
                 err?.status === 429
@@ -151,17 +160,50 @@ function isLikelyHallucination(text) {
 }
 
 /**
- * Catch Whisper's classic token-repetition collapse — patterns like
- * "H-h-h-h-h-h-h" or "ka ka ka ka ka ka". Triggered when more than 60% of
- * the text is the same 1-3 character token repeated. We strip whitespace
- * and punctuation first so spaces don't let real text through.
+ * Catch Whisper's repetition-collapse failure modes. Two layers:
+ *
+ *   Layer 1 — char-level: covers ASCII-tokenized collapses like
+ *     "H-h-h-h-h" or "ka ka ka ka". Checks 1-3 char n-grams.
+ *
+ *   Layer 2 — phrase-level: covers Tamil and English phrase repeats like
+ *     "தூக்கமும் வர மாட்டாது, தூக்கமும் வர மாட்டாது, தூக்கமும் வர மாட்டாது"
+ *     where the unit being repeated is many characters long. The char-
+ *     level check misses these because n=3 isn't long enough to catch
+ *     the unit. We detect them with a regex on comma-separated chunks
+ *     and a "consecutive identical token" sweep.
  */
 function isRepetitionCollapse(text) {
     if (text.length < 20) return false;
+
+    // Layer 2a — comma-separated chunk repeated 3+ times in a row.
+    // Catches "X, X, X, X," directly.
+    if (/([^,]{3,}),\s*\1,\s*\1/u.test(text)) return true;
+
+    // Layer 2b — same word/phrase repeated 4+ times consecutively (no
+    // comma separator). Catches "X X X X" style collapses.
+    const tokens = text.split(/\s+/).filter(Boolean);
+    if (tokens.length >= 6) {
+        // Try unit sizes 1..4 words. For each, scan for >= 4 consecutive
+        // identical units. Strip trailing punctuation when comparing.
+        const normalize = (s) => s.replace(/[.,!?…]+$/u, '').toLowerCase();
+        for (const unit of [1, 2, 3, 4]) {
+            let run = 1;
+            for (let i = unit; i + unit <= tokens.length; i += unit) {
+                const prev = tokens.slice(i - unit, i).map(normalize).join(' ');
+                const here = tokens.slice(i, i + unit).map(normalize).join(' ');
+                if (prev && prev === here) {
+                    run++;
+                    if (run >= 4) return true;
+                } else {
+                    run = 1;
+                }
+            }
+        }
+    }
+
+    // Layer 1 — original char-level n-gram check.
     const stripped = text.replace(/[\s\-.,!?…]+/g, '').toLowerCase();
     if (stripped.length < 20) return false;
-    // Try short n-grams; if any single n-gram makes up >60% of the text we
-    // treat the transcript as a collapse.
     for (const n of [1, 2, 3]) {
         const counts = new Map();
         for (let i = 0; i + n <= stripped.length; i += n) {

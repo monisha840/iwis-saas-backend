@@ -19,6 +19,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
 const CORPUS_DIR = path.join(REPO_ROOT, 'data', 'ragCorpus');
 const TOPIC_FILE = path.join(CORPUS_DIR, 'topic-passages.md');
+const TOPIC_FILE_TA = path.join(CORPUS_DIR, 'topic-passages-ta.md');
+const TIPS_FILE_TA = path.join(CORPUS_DIR, 'seed-tips-ta.json');
 const OUTPUT_FILE = path.join(CORPUS_DIR, 'corpus.json');
 
 const EMBED_MODEL = 'text-embedding-3-small';
@@ -37,6 +39,7 @@ function flattenTipsAsPassages() {
         out.push({
           id: `tip-general-${String(i + 1).padStart(3, '0')}`,
           source: 'AYURVEDIC_TIPS',
+          language: 'en',
           topic: 'General Ayurvedic daily-life guidance',
           tags: ['general', 'dinacharya', 'tip'],
           text: tip,
@@ -49,6 +52,7 @@ function flattenTipsAsPassages() {
         out.push({
           id: `tip-${dosha.toLowerCase()}-${ritu.toLowerCase()}-${String(i + 1).padStart(2, '0')}`,
           source: 'AYURVEDIC_TIPS',
+          language: 'en',
           topic: `${dosha} guidance in ${ritu}`,
           tags: [dosha.toLowerCase(), ritu.toLowerCase(), 'ritucharya', 'tip'],
           text: tip,
@@ -59,13 +63,33 @@ function flattenTipsAsPassages() {
   return out;
 }
 
-function parseTopicPassages(rawMd) {
+function loadTamilTips() {
+  if (!fs.existsSync(TIPS_FILE_TA)) return [];
+  try {
+    const arr = JSON.parse(fs.readFileSync(TIPS_FILE_TA, 'utf8'));
+    return arr.map(p => ({
+      id: `${p.id}-ta`,
+      source: 'AYURVEDIC_TIPS',
+      language: 'ta',
+      topic: p.topic,
+      tags: p.tags,
+      text: p.text,
+    }));
+  } catch (err) {
+    console.warn(`[buildRagIndex] could not parse ${TIPS_FILE_TA}: ${err.message} — skipping Tamil tips.`);
+    return [];
+  }
+}
+
+function parseTopicPassages(rawMd, language) {
   const passages = [];
   const blocks = rawMd.split(/^---id:\s*/m).slice(1);
   for (const block of blocks) {
     const lines = block.split('\n');
     const id = lines.shift().trim();
-    const meta = { id, source: 'TOPIC_PASSAGES' };
+    // Tamil passages get a "-ta" id suffix so they don't collide with English.
+    const finalId = language === 'ta' ? `${id}-ta` : id;
+    const meta = { id: finalId, source: 'TOPIC_PASSAGES', language };
     let bodyStart = 0;
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
@@ -77,6 +101,8 @@ function parseTopicPassages(rawMd) {
         meta[key] = val.split(',').map(s => s.trim()).filter(Boolean);
       } else if (key === 'unreviewed') {
         meta.unreviewed = val.trim() === 'true';
+      } else if (key === 'id') {
+        // Skip — we already used the id from the `---id:` line.
       } else {
         meta[key] = val.trim();
       }
@@ -100,16 +126,24 @@ async function embedBatch(openai, inputs) {
 async function main() {
   if (!fs.existsSync(CORPUS_DIR)) fs.mkdirSync(CORPUS_DIR, { recursive: true });
 
-  const tipPassages = flattenTipsAsPassages();
+  const tipPassagesEn = flattenTipsAsPassages();
+  const tipPassagesTa = loadTamilTips();
 
-  let topicPassages = [];
+  let topicPassagesEn = [];
   if (fs.existsSync(TOPIC_FILE)) {
     const raw = fs.readFileSync(TOPIC_FILE, 'utf8');
-    topicPassages = parseTopicPassages(raw);
+    topicPassagesEn = parseTopicPassages(raw, 'en');
   } else {
-    console.warn(`[buildRagIndex] No topic-passages.md found at ${TOPIC_FILE} — proceeding with tips only.`);
+    console.warn(`[buildRagIndex] No topic-passages.md found at ${TOPIC_FILE} — proceeding without English topic passages.`);
   }
 
+  let topicPassagesTa = [];
+  if (fs.existsSync(TOPIC_FILE_TA)) {
+    const raw = fs.readFileSync(TOPIC_FILE_TA, 'utf8');
+    topicPassagesTa = parseTopicPassages(raw, 'ta');
+  }
+
+  let topicPassages = [...topicPassagesEn, ...topicPassagesTa];
   if (!INCLUDE_UNREVIEWED) {
     const before = topicPassages.length;
     topicPassages = topicPassages.filter(p => !p.unreviewed);
@@ -119,14 +153,16 @@ async function main() {
     }
   }
 
-  const all = [...tipPassages, ...topicPassages];
+  const all = [...tipPassagesEn, ...tipPassagesTa, ...topicPassages];
   const totalTokens = all.reduce((sum, p) => sum + estimateTokens(p.text), 0);
   const costUsd = (totalTokens / 1_000_000) * 0.02;
+  const enCount = all.filter(p => p.language === 'en').length;
+  const taCount = all.filter(p => p.language === 'ta').length;
 
   console.log('\n[buildRagIndex] Corpus summary');
-  console.log(`  Seed tips:        ${tipPassages.length}`);
-  console.log(`  Topic passages:   ${topicPassages.length}`);
-  console.log(`  Total passages:   ${all.length}`);
+  console.log(`  Seed tips:        ${tipPassagesEn.length} (en) + ${tipPassagesTa.length} (ta) = ${tipPassagesEn.length + tipPassagesTa.length}`);
+  console.log(`  Topic passages:   ${topicPassagesEn.length} (en) + ${topicPassagesTa.length} (ta) = ${topicPassages.length}`);
+  console.log(`  Total passages:   ${all.length} (${enCount} en, ${taCount} ta)`);
   console.log(`  Estimated tokens: ${totalTokens.toLocaleString()}`);
   console.log(`  Embed model:      ${EMBED_MODEL}`);
   console.log(`  Estimated cost:   $${costUsd.toFixed(4)} (one-time)`);

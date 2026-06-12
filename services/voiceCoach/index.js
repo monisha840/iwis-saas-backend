@@ -20,6 +20,7 @@ registerCacheInvalidationMiddleware();
 export { VoiceCoachContextService } from './context.service.js';
 export { VoiceCoachSessionService } from './session.service.js';
 export { VoiceCoachLLMService } from './llm.service.js';
+export { ExtractiveResponderService } from './extractiveResponder.js';
 export { VoiceCoachEscalationService, evaluate as evaluateSeverity } from './escalation.service.js';
 export { VoiceCoachSTTService } from './stt.service.js';
 export { VoiceCoachTTSService } from './tts.service.js';

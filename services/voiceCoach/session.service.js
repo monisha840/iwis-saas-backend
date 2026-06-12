@@ -15,9 +15,39 @@ import prisma from '../../lib/prisma.js';
 import logger from '../../lib/logger.js';
 import { VoiceCoachContextService } from './context.service.js';
 import { VoiceCoachLLMService } from './llm.service.js';
+import { ExtractiveResponderService } from './extractiveResponder.js';
 import { VoiceCoachEscalationService } from './escalation.service.js';
 import { SAFETY_REPLY, PROFILE_INCOMPLETE_REPLY } from './prompts.js';
 import { DeliveryService } from '../delivery.service.js';
+
+const EXTRACTIVE_FLAG_KEY = 'VOICE_COACH_EXTRACTIVE_ONLY';
+
+/**
+ * Per-turn check: should this hospital use the extractive responder instead
+ * of the LLM? Direct query (not via featureGate.isFeatureAvailable) because
+ * the gate's fail-open behaviour for unregistered keys is the wrong default
+ * here — we want to use the LLM until the flag is explicitly enabled.
+ */
+async function shouldUseExtractive(patientId) {
+    try {
+        const patient = await prisma.patient.findUnique({
+            where: { id: patientId },
+            select: { user: { select: { hospitalId: true } } },
+        });
+        const hospitalId = patient?.user?.hospitalId;
+        if (!hospitalId) return false;
+        const flag = await prisma.hospitalFeatureFlag.findUnique({
+            where: { hospitalId_featureKey: { hospitalId, featureKey: EXTRACTIVE_FLAG_KEY } },
+            select: { enabled: true },
+        });
+        return flag?.enabled === true;
+    } catch (err) {
+        // Fail closed (use LLM) on any error so a flag-lookup glitch can't
+        // silently break the voice coach.
+        logger.warn('[VoiceCoachSession] extractive flag lookup failed', { error: err.message });
+        return false;
+    }
+}
 
 export class VoiceCoachSessionService {
     static async startSession({ patientId, language }) {
@@ -267,7 +297,11 @@ export class VoiceCoachSessionService {
             }
         } else {
             try {
-                const llm = await VoiceCoachLLMService.generateReply({
+                const useExtractive = await shouldUseExtractive(patientId);
+                const responder = useExtractive
+                    ? ExtractiveResponderService
+                    : VoiceCoachLLMService;
+                const llm = await responder.generateReply({
                     patientId,
                     userTranscript: text,
                     languageOverride: effectiveOverride,
@@ -275,7 +309,7 @@ export class VoiceCoachSessionService {
                 assistantText = llm.transcript;
                 replyLanguage = llm.languageUsed;
                 assistantMeta = {
-                    source: 'llm',
+                    source: useExtractive ? 'extractive' : 'llm',
                     model: llm.model,
                     usage: llm.usage,
                 };
