@@ -19,7 +19,10 @@
  * a global sentinel so HMR and repeated module loads don't stack handlers.
  */
 
-import prisma from '../../lib/prisma.js';
+// Use the BASE client: `$use` (legacy middleware) is not available on the
+// tenant-scoped ($extends) default export. Base middleware still fires for
+// queries issued through the scoped client.
+import { prismaBase as prisma } from '../../lib/prisma.js';
 import logger from '../../lib/logger.js';
 import { VoiceCoachContextService } from './context.service.js';
 

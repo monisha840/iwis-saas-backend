@@ -4,6 +4,7 @@ import logger from '../lib/logger.js';
 import prisma from '../lib/prisma.js';
 import { AuthService } from '../services/auth.service.js';
 import { checkHospitalStatus } from './checkHospitalStatus.js';
+import { runWithTenant } from '../lib/tenantContext.js';
 
 export function authMiddleware(req, res, next) {
   const authHeader = req.headers['authorization'];
@@ -54,7 +55,13 @@ export function authMiddleware(req, res, next) {
 
     req.user = user;
     // Hospital status gate — SUPER_ADMIN bypasses; suspended tenants 403.
-    checkHospitalStatus(req, res, next);
+    // Then bind the resolved hospitalId to the async context so the Prisma
+    // extension auto-scopes every downstream query. SUPER_ADMIN leaves
+    // hospitalId unset → runWithTenant(null) → unscoped (sees all hospitals).
+    // The wrapper forwards errors so checkHospitalStatus's error path isn't lost.
+    checkHospitalStatus(req, res, (err) =>
+      err ? next(err) : runWithTenant(req.user.hospitalId ?? null, next)
+    );
   });
 }
 
