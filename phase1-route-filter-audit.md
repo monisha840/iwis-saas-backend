@@ -35,6 +35,17 @@ therapyOutcomes, timeline, todos, visit-summary, voice-coach, webhooks, wellness
 
 (`auth`, `webhooks` are intentionally pre-/non-tenant; `voice-coach` etc. self-scope by the caller's own id.)
 
+## ✅ UPDATE (Phase 1.5) — branchId gap now CLOSED
+
+The gap below has been **resolved**. The Prisma tenant-scoping extension was
+extended to also auto-filter the **31 branchId-only models** (have `branchId`,
+not `hospitalId`) by `branchId IN (SELECT id FROM Branch WHERE hospitalId =
+currentTenant)`. Verified by the isolation proof test (`scripts/p1-isolation-test.mjs`),
+which now asserts cross-tenant reads on `Patient` (a branchId model) return zero
+rows, incl. `findUnique`-by-id. Creates are not auto-stamped (branch is ambiguous
+within a hospital); rows with a null/foreign branchId fail closed on reads.
+The original finding is kept below for history.
+
 ## 🚩 KEY FINDING — branchId / Bucket-4 data is NOT covered by the automatic filter
 
 The Prisma extension auto-scopes **only the 40 models that have a `hospitalId`
