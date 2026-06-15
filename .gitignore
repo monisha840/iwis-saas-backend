@@ -19,7 +19,8 @@ logs
 # Prisma
 /prisma/generated-client
 query-engine*
-migration_lock.toml
+# migration_lock.toml is intentionally committed (Prisma best practice — pins the
+# migration provider so a fresh clone's `migrate deploy` is self-contained).
 
 # OS Files
 .DS_Store
