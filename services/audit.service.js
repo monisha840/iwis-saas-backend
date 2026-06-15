@@ -16,6 +16,7 @@
 
 import prisma from '../lib/prisma.js';
 import logger from '../lib/logger.js';
+import { getCurrentTenant } from '../lib/tenantContext.js';
 
 export class AuditService {
   /**
@@ -30,8 +31,13 @@ export class AuditService {
    * @param {object|null}  opts.newData     - Snapshot after mutation (or diff)
    * @param {object}       opts.meta        - Extra context (IP, userAgent, etc.)
    */
-  static async log({ userId = null, action, entityType, entityId = null, oldData = null, newData = null, meta = {} }) {
+  static async log({ userId = null, action, entityType, entityId = null, oldData = null, newData = null, meta = {}, hospitalId = undefined }) {
     try {
+      // Always stamp the tenant for a complete per-hospital audit trail
+      // (healthcare compliance). Prefer an explicit hospitalId (e.g. a
+      // SUPER_ADMIN acting on a specific hospital); otherwise use the current
+      // request tenant. Stays null for genuine system/no-tenant actions.
+      const tenantId = hospitalId ?? getCurrentTenant() ?? undefined;
       await prisma.auditLog.create({
         data: {
           userId,
@@ -40,6 +46,7 @@ export class AuditService {
           entityId,
           oldData: oldData ?? undefined,
           newData: newData ?? undefined,
+          hospitalId: tenantId,
         },
       });
 
