@@ -1,7 +1,19 @@
 -- ── Triage v2: red-flags, split confidence, re-triage, clinician override, DB-backed specialty routing
 
 -- TriageSession: new columns
+-- [IWIS fork fix] These 8 columns exist in schema.prisma but were never written
+-- into any migration in the upstream history (added via `prisma db push` upstream),
+-- so a fresh-DB `migrate deploy` lacked them and the urgencyLevel index below failed.
+-- Added here, before the indexes that depend on them, so a fresh build matches the schema.
 ALTER TABLE "TriageSession"
+  ADD COLUMN "compositeScore"         DOUBLE PRECISION,
+  ADD COLUMN "urgencyLevel"           TEXT,
+  ADD COLUMN "confidenceScore"        DOUBLE PRECISION,
+  ADD COLUMN "alternativeSpecialties" TEXT[]         NOT NULL DEFAULT ARRAY[]::TEXT[],
+  ADD COLUMN "flags"                  TEXT[]         NOT NULL DEFAULT ARRAY[]::TEXT[],
+  ADD COLUMN "triageNotes"            TEXT,
+  ADD COLUMN "painRegions"            JSONB,
+  ADD COLUMN "lifestyleData"          JSONB,
   ADD COLUMN "inputCompleteness"      DOUBLE PRECISION,
   ADD COLUMN "routingMatchStrength"   DOUBLE PRECISION,
   ADD COLUMN "redFlagsMatched"        TEXT[]         NOT NULL DEFAULT ARRAY[]::TEXT[],
