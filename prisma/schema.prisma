@@ -280,6 +280,9 @@ model QueueEntry {
 }
 
 model AuditLog {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id         String   @id @default(uuid())
   userId     String?
   action     String
@@ -299,6 +302,9 @@ model AuditLog {
 }
 
 model Doctor {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id                   String                 @id @default(uuid())
   userId               String                 @unique
   createdAt            DateTime               @default(now())
@@ -347,6 +353,9 @@ model Doctor {
 //
 // Rows are never deleted — status transitions preserve the audit trail.
 model PatientAssignment {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id           String           @id @default(cuid())
   patientId    String
   patient      Patient          @relation(fields: [patientId], references: [id], onDelete: Cascade)
@@ -379,6 +388,9 @@ enum AssignmentStatus {
 }
 
 model BlockedSlot {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id          String     @id @default(uuid())
   doctorId    String?
   therapistId String?
@@ -407,6 +419,9 @@ model BlockedSlot {
 }
 
 model Therapist {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id                  String               @id @default(uuid())
   userId              String               @unique
   createdAt           DateTime             @default(now())
@@ -449,6 +464,9 @@ model Therapist {
 }
 
 model Pharmacist {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id              String         @id @default(uuid())
   userId          String         @unique
   fullName        String?
@@ -840,6 +858,9 @@ model Prescription {
 }
 
 model Availability {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id          String    @id @default(uuid())
   therapistId String
   dayOfWeek   Int
@@ -856,6 +877,9 @@ model Availability {
 }
 
 model Notification {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id         String                 @id @default(uuid())
   userId     String
   type       String
@@ -879,6 +903,9 @@ model Notification {
 }
 
 model NotificationDelivery {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id             String       @id @default(uuid())
   notificationId String
   channel        String // PUSH, WEBHOOK, IN_APP, WHATSAPP
@@ -904,6 +931,9 @@ enum NotificationPriority {
 }
 
 model NotificationPreference {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id                   String  @id @default(uuid())
   userId               String  @unique
   pushEnabled          Boolean @default(true)
@@ -939,6 +969,9 @@ model Document {
 }
 
 model Journey {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id                String          @id @default(uuid())
   patientId         String
   doctorId          String
@@ -983,6 +1016,9 @@ model MedicationLog {
 }
 
 model BulkOperation {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id               String    @id @default(uuid())
   type             String
   initiatedBy      String
@@ -1307,6 +1343,9 @@ model Conversation {
 }
 
 model Message {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id             String       @id @default(uuid())
   conversationId String
   senderId       String
@@ -1371,6 +1410,9 @@ model StaffThread {
 }
 
 model StaffThreadMember {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id             String                @id @default(uuid())
   threadId       String
   userId         String
@@ -1396,6 +1438,9 @@ model StaffThreadMember {
 }
 
 model StaffMessage {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id        String           @id @default(uuid())
   threadId  String
   // Null for SYSTEM messages (member-add / member-remove notices).
@@ -1480,6 +1525,9 @@ model RefillRequest {
 }
 
 model Referral {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id            String   @id @default(uuid())
   referrerId    String
   referredId    String?
@@ -1497,6 +1545,9 @@ model Referral {
 }
 
 model LeaderboardAudit {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id              String   @id @default(uuid())
   participantId   String
   participantRole Role
@@ -1914,6 +1965,9 @@ model UserBadge {
 // ── Gamification: Clinician Streaks ─────────────────────────────────────────
 
 model ClinicianStreak {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id                String    @id @default(cuid())
   participantId     String    @unique // Doctor or Therapist profile ID
   participantRole   Role
@@ -2073,6 +2127,9 @@ model NudgeLog {
 // ── Gamification: Anti-Gaming Audit ─────────────────────────────────────────
 
 model GamificationAnomaly {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id              String   @id @default(cuid())
   participantId   String
   participantRole Role
@@ -2090,6 +2147,9 @@ model GamificationAnomaly {
 // ── Gamification: Adaptive Targets ──────────────────────────────────────────
 
 model AdaptiveTarget {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id               String    @id @default(cuid())
   participantId    String
   participantRole  Role
@@ -2224,6 +2284,9 @@ enum StaffPresenceStatus {
 // ── Feature 8: Performance Scorecards ───────────────────────────────────────
 
 model PerformanceScorecard {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id                      String   @id @default(cuid())
   clinicianId             String
   clinicianRole           Role
@@ -2364,6 +2427,9 @@ model SeasonalChallenge {
 }
 
 model SeasonalChallengeProgress {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id            String            @id @default(cuid())
   challengeId   String
   challenge     SeasonalChallenge @relation(fields: [challengeId], references: [id], onDelete: Cascade)
@@ -2568,6 +2634,9 @@ model ContentUnlock {
 // ── Feature 33: Intra-Branch Announcements ──────────────────────────────────
 
 model Announcement {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id          String               @id @default(cuid())
   authorId    String
   author      User                 @relation("Announcements", fields: [authorId], references: [id])
@@ -2788,6 +2857,35 @@ model Hospital {
 
   @@index([status])
   @@index([plan])
+  // Phase 1 tenant-isolation reverse relations (anchor tables)
+  doctors Doctor[]
+  therapists Therapist[]
+  pharmacists Pharmacist[]
+  journeys Journey[]
+  auditLogEntries AuditLog[]
+  notifications Notification[]
+  notificationDeliveries NotificationDelivery[]
+  notificationPreferences NotificationPreference[]
+  announcements Announcement[]
+  messages Message[]
+  staffMessages StaffMessage[]
+  staffThreadMembers StaffThreadMember[]
+  voiceConversations VoiceConversation[]
+  voiceMessages VoiceMessage[]
+  dietPrescriptions DietPrescription[]
+  clinicalPhotos ClinicalPhoto[]
+  packageEnrolments PackageEnrolment[]
+  referrals Referral[]
+  bulkOperations BulkOperation[]
+  availabilities Availability[]
+  blockedSlots BlockedSlot[]
+  patientAssignments PatientAssignment[]
+  leaderboardAudits LeaderboardAudit[]
+  clinicianStreaks ClinicianStreak[]
+  gamificationAnomalies GamificationAnomaly[]
+  adaptiveTargets AdaptiveTarget[]
+  performanceScorecards PerformanceScorecard[]
+  seasonalChallengeProgresses SeasonalChallengeProgress[]
 }
 
 enum HospitalStatus {
@@ -2908,6 +3006,9 @@ model TherapyRoomBooking {
 
 // Feature 2: Diet Prescription
 model DietPrescription {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id          String       @id @default(cuid())
   patientId   String
   patient     Patient      @relation(fields: [patientId], references: [id], onDelete: Cascade)
@@ -3054,6 +3155,9 @@ model DietAdherenceLog {
 
 // Feature 3: Clinical Photo
 model ClinicalPhoto {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id           String            @id @default(cuid())
   patientId    String
   patient      Patient           @relation(fields: [patientId], references: [id], onDelete: Cascade)
@@ -3149,6 +3253,9 @@ model TreatmentPackage {
 }
 
 model PackageEnrolment {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id            String           @id @default(cuid())
   packageId     String
   package       TreatmentPackage @relation(fields: [packageId], references: [id])
@@ -4048,6 +4155,9 @@ model HomeTherapyFeedback {
 // expires. Audio is not persisted by default — see plan §8.
 
 model VoiceConversation {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id             String         @id @default(cuid())
   patientId      String
   patient        Patient        @relation(fields: [patientId], references: [id], onDelete: Cascade)
@@ -4066,6 +4176,9 @@ model VoiceConversation {
 }
 
 model VoiceMessage {
+  // Phase 1 tenant-isolation: hospital anchor
+  hospitalId  String?
+  hospital    Hospital? @relation(fields: [hospitalId], references: [id])
   id              String            @id @default(cuid())
   conversationId  String
   conversation    VoiceConversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
