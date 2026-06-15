@@ -6,7 +6,9 @@
  * focused on business rules (weights, scoring) while the repo owns query shapes.
  */
 
+import { Prisma } from '@prisma/client';
 import prisma from '../lib/prisma.js';
+import { getCurrentTenant } from '../lib/tenantContext.js';
 import { BaseRepository } from './base.repository.js';
 
 const LOOKBACK_DAYS = 30;
@@ -69,11 +71,16 @@ export class LeaderboardRepository extends BaseRepository {
 
   /** Get latest snapshot per clinician for display (no recalculation) */
   async getLatestSnapshots(limit = 50) {
+    // Phase 1 tenant scope: LeaderboardAudit has hospitalId; never return
+    // another hospital's snapshots. Unscoped (null tenant) for SUPER_ADMIN/jobs.
+    const tenant = getCurrentTenant();
+    const tenantClause = tenant ? Prisma.sql`WHERE "hospitalId" = ${tenant}` : Prisma.empty;
     // Use raw SQL for the lateral/distinct-on pattern (not natively in Prisma)
     return prisma.$queryRaw`
       SELECT DISTINCT ON ("participantId")
         id, "participantId", "participantRole", score, metrics, rank, "calculationDate"
       FROM "LeaderboardAudit"
+      ${tenantClause}
       ORDER BY "participantId", "calculationDate" DESC
       LIMIT ${limit}
     `;

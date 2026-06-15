@@ -4,7 +4,9 @@
  * Centralises all inventory + dispensing queries to a single low-coupling layer.
  */
 
+import { Prisma } from '@prisma/client';
 import prisma from '../lib/prisma.js';
+import { getCurrentTenant } from '../lib/tenantContext.js';
 import { BaseRepository } from './base.repository.js';
 
 export class PharmacyRepository extends BaseRepository {
@@ -49,12 +51,20 @@ export class PharmacyRepository extends BaseRepository {
   }
 
   async findLowStock(branchId = null) {
+    // Phase 1 tenant scope: when a request tenant is set, never return stock
+    // outside the caller's hospital (a null branchId must NOT mean all hospitals).
+    const tenant = getCurrentTenant();
+    const branchClause = branchId ? Prisma.sql`AND ms."branchId" = ${branchId}` : Prisma.empty;
+    const tenantClause = tenant
+      ? Prisma.sql`AND ms."branchId" IN (SELECT id FROM "Branch" WHERE "hospitalId" = ${tenant})`
+      : Prisma.empty;
     return prisma.$queryRaw`
       SELECT ms.*, m.name, m.brand
       FROM "MedicineStock" ms
       JOIN "Medicine" m ON ms."medicineId" = m.id
       WHERE ms.quantity <= ms."minStock"
-        ${branchId ? prisma.$raw`AND ms."branchId" = ${branchId}` : prisma.$raw``}
+        ${branchClause}
+        ${tenantClause}
       ORDER BY (ms.quantity::float / NULLIF(ms."minStock", 0)) ASC
     `;
   }

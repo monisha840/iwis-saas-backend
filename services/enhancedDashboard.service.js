@@ -146,13 +146,13 @@ export class EnhancedDashboardService {
         where: { patientId, completedAt: { gte: startOfToday() } },
         select: { challengeId: true },
       }).catch(() => []),
-      prisma.$queryRawUnsafe(
-        `SELECT DISTINCT ON ("type") "type", "value", "unit", "recordedAt"
-         FROM "PatientVital"
-         WHERE "patientId" = $1
-         ORDER BY "type", "recordedAt" DESC`,
-        userId,
-      ).catch(() => []),
+      // Self-scoped: userId is the authenticated caller's own User id (own dashboard).
+      // Parameterised tagged template (no string interpolation).
+      prisma.$queryRaw`
+        SELECT DISTINCT ON ("type") "type", "value", "unit", "recordedAt"
+        FROM "PatientVital"
+        WHERE "patientId" = ${userId}
+        ORDER BY "type", "recordedAt" DESC`.catch(() => []),
       prisma.patientVital.count({
         where: { patientId: userId, recordedAt: { gte: new Date(now.getTime() - MS_DAY) } },
       }).catch(() => 0),
@@ -990,13 +990,15 @@ export class EnhancedDashboardService {
       // balance going negative under concurrent taps. We could also CAS on
       // totalQuantity since onConsumption keeps it in sync, but gating on the
       // authoritative counters is clearer.
-      const rows = await tx.$executeRawUnsafe(
-        `UPDATE "Prescription"
+      // Parameterised tagged template. Defense-in-depth: also pin patientId
+      // (already validated as the caller's prescription above) so a by-id write
+      // can never touch another patient's row.
+      const rows = await tx.$executeRaw`
+        UPDATE "Prescription"
            SET "consumedQty" = "consumedQty" + 1,
                "totalQuantity" = "totalQuantity" - 1
-         WHERE "id" = $1 AND "dispensedQty" > "consumedQty" AND "discontinuedAt" IS NULL`,
-        prescriptionId,
-      );
+         WHERE "id" = ${prescriptionId} AND "patientId" = ${patientId}
+           AND "dispensedQty" > "consumedQty" AND "discontinuedAt" IS NULL`;
       if (rows === 0) {
         throw Object.assign(new Error('No remaining quantity'), { status: 400 });
       }

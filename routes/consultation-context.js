@@ -20,8 +20,10 @@
  */
 
 import express from 'express';
+import { Prisma } from '@prisma/client';
 import { authMiddleware, roleMiddleware } from '../middleware/auth.js';
 import prisma from '../lib/prisma.js';
+import { getCurrentTenant } from '../lib/tenantContext.js';
 import logger from '../lib/logger.js';
 
 const router = express.Router();
@@ -54,6 +56,8 @@ router.get(
         },
       });
       if (!patient) return res.status(404).json({ error: 'Patient not found' });
+
+      const tenant = getCurrentTenant();
 
       const [
         prescriptions,
@@ -138,15 +142,16 @@ router.get(
         // patient share a 1:1 relation; vitals are written under
         // PatientVital.patientId = User.id (matches enhancedDashboard
         // service convention), so we look up via the user.
-        prisma.$queryRawUnsafe(
-          `SELECT DISTINCT ON ("type") "type", "value", "unit", "recordedAt"
-           FROM "PatientVital"
-           WHERE "patientId" IN (
-             SELECT "userId" FROM "Patient" WHERE "id" = $1
-           )
-           ORDER BY "type", "recordedAt" DESC`,
-          patientId,
-        ).catch(() => []),
+        // Parameterised (no string interpolation). Tenant guard: when a request
+        // tenant is set, restrict to vitals whose owning User is in that hospital.
+        prisma.$queryRaw`
+          SELECT DISTINCT ON ("type") "type", "value", "unit", "recordedAt"
+          FROM "PatientVital"
+          WHERE "patientId" IN (SELECT "userId" FROM "Patient" WHERE "id" = ${patientId})
+          ${tenant
+            ? Prisma.sql`AND "patientId" IN (SELECT "id" FROM "User" WHERE "hospitalId" = ${tenant})`
+            : Prisma.empty}
+          ORDER BY "type", "recordedAt" DESC`.catch(() => []),
 
         prisma.treatmentJourney.findFirst({
           where: { patientId, status: 'ACTIVE' },
