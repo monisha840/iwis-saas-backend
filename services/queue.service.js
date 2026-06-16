@@ -67,10 +67,10 @@ async function ensureQueues() {
     // ── Workers ──────────────────────────────────────────────────────────────
     const notificationWorker = new Worker('notifications', async (job) => {
       if (job.name === 'whatsapp') {
-        const { number, text, appointmentId } = job.data;
-        logger.info('[Queue:notifications] Processing WhatsApp job', { jobId: job.id, appointmentId });
+        const { number, text, appointmentId, hospitalId } = job.data;
+        logger.info('[Queue:notifications] Processing WhatsApp job', { jobId: job.id, appointmentId, hospitalId });
         const { WhatsAppService } = await import('./whatsapp.service.js');
-        const result = await WhatsAppService.sendText(number, text);
+        const result = await WhatsAppService.sendText(number, text, hospitalId);
         if (result.status === 'FAILED') {
           throw new Error(`WhatsApp send failed: ${result.error || 'unknown'}`);
         }
@@ -148,13 +148,13 @@ export const reportQueue = { add: (...args) => _reportQueue?.add(...args) };
 
 // ── Helper functions ────────────────────────────────────────────────────────
 
-export async function enqueueAppointmentWhatsApp(appointmentId, { number, text }) {
+export async function enqueueAppointmentWhatsApp(appointmentId, { number, text, hospitalId }) {
   if (!_notificationQueue) {
     logger.warn('[QueueService] Queue unavailable — skipping WhatsApp enqueue');
     return null;
   }
   const job = await _notificationQueue.add('whatsapp', {
-    number, text, appointmentId,
+    number, text, appointmentId, hospitalId,
   }, { ...defaultJobOptions, jobId: `whatsapp:${appointmentId}` });
   logger.info('[QueueService] Enqueued appointment WhatsApp', { jobId: job.id, appointmentId });
   return job.id;

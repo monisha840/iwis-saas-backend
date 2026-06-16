@@ -308,6 +308,7 @@ router.post(
                     await WhatsAppService.sendText(
                         phone,
                         `Hello ${patientName}! Your appointment at Al-Shifa has been confirmed for ${dateLabel} at ${time}. Please arrive 10 minutes early. Thank you!`,
+                        req.user.hospitalId,
                     );
                 }
             } catch (smsErr) {

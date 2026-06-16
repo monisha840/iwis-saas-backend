@@ -109,7 +109,7 @@ export class DeliveryService {
                     if (!whatsappNumber) throw new Error('no whatsapp number on file');
                     const digits = normalizePhoneForWhatsApp(whatsappNumber);
                     if (!digits) throw new Error('whatsapp number invalid');
-                    const result = await WhatsAppService.sendText(digits, body);
+                    const result = await WhatsAppService.sendText(digits, body, hospitalId);
                     if (result.status === 'SKIPPED') {
                         // Service not configured — record and fall through
                         attempts.push(await this._record({ hospitalId, userId, appointmentId, templateId, kind, channel, status: 'SKIPPED', target: digits, errorMessage: 'evolution api not configured', body }));

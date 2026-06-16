@@ -210,7 +210,7 @@ export class NotificationService {
                 return false;
             }
             logger.info(`[NotificationService] Enqueueing WhatsApp for ${appointmentId}`, { number: message.number });
-            await enqueueAppointmentWhatsApp(appointmentId, { number: message.number, text: message.text });
+            await enqueueAppointmentWhatsApp(appointmentId, { number: message.number, text: message.text, hospitalId });
             await prisma.appointment.update({ where: { id: appointmentId }, data: { notificationSent: true } });
             return true;
         } catch (error) {

@@ -548,6 +548,7 @@ router.post(
             try {
                 const result = await WhatsAppService.sendDocument({
                     phone:    whatsappNumber,
+                    hospitalId: req.user.hospitalId,
                     document: pdfBuffer.toString('base64'),
                     filename: `AlShifa-Health-Report-${reportDate}.pdf`,
                     caption:  `📋 *Your Al-Shifa Health Report*\n\n`
