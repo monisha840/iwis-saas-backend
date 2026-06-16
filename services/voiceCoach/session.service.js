@@ -17,6 +17,8 @@ import { VoiceCoachContextService } from './context.service.js';
 import { VoiceCoachLLMService } from './llm.service.js';
 import { ExtractiveResponderService } from './extractiveResponder.js';
 import { VoiceCoachEscalationService } from './escalation.service.js';
+import { logUsage } from '../aiMetering.service.js';
+import { getCurrentTenant } from '../../lib/tenantContext.js';
 import { SAFETY_REPLY, PROFILE_INCOMPLETE_REPLY } from './prompts.js';
 import { DeliveryService } from '../delivery.service.js';
 
@@ -313,6 +315,11 @@ export class VoiceCoachSessionService {
                     model: llm.model,
                     usage: llm.usage,
                 };
+                // Phase 2c — the LLM path is metered inside llm.service.js; log the
+                // extractive (no-LLM) path here for adoption tracking (0 cost).
+                if (useExtractive) {
+                    logUsage({ hospitalId: getCurrentTenant(), feature: 'voice_coach', model: llm.model || 'extractive-rag-v1', metadata: { patientId, extractive: true } });
+                }
             } catch (err) {
                 // Profile-incomplete short-circuit: the patient has no
                 // PRIMARY active doctor assignment, so context.service

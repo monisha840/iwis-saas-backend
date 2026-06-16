@@ -15,6 +15,7 @@ import logger from '../lib/logger.js';
 // Approximate per-unit prices (USD). The point is to have *a* number, not
 // perfection — adjust as provider prices change.
 const PRICES = {
+  'gpt-4o':                 { inPerTok: 2.50 / 1e6, outPerTok: 10.00 / 1e6 },
   'gpt-4o-mini':            { inPerTok: 0.15 / 1e6, outPerTok: 0.60 / 1e6 },
   'text-embedding-3-small': { inPerTok: 0.02 / 1e6, outPerTok: 0 },
   'whisper-1':              { perMinute: 0.006 },

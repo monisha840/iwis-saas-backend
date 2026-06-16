@@ -19,6 +19,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import OpenAI from 'openai';
 import logger from '../../lib/logger.js';
+import { logUsage } from '../aiMetering.service.js';
+import { getCurrentTenant } from '../../lib/tenantContext.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CORPUS_FILE = path.resolve(__dirname, '..', '..', 'data', 'ragCorpus', 'corpus.json');
@@ -105,6 +107,8 @@ async function embedQuery(queryText) {
     if (!oai) return null;
     try {
         const res = await oai.embeddings.create({ model: EMBED_MODEL, input: queryText });
+        // Phase 2c — meter this AI call (fire-and-forget; no-op without a tenant)
+        logUsage({ hospitalId: getCurrentTenant(), feature: 'voice_coach', model: EMBED_MODEL, inputTokens: res?.usage?.prompt_tokens ?? res?.usage?.total_tokens ?? 0 });
         const vec = res?.data?.[0]?.embedding;
         if (!vec || vec.length !== EMBED_DIM) {
             logger.warn('[RagRetriever] unexpected embedding shape', { length: vec?.length });

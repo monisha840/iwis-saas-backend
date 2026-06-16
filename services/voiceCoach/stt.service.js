@@ -14,6 +14,8 @@
 
 import OpenAI, { toFile } from 'openai';
 import logger from '../../lib/logger.js';
+import { logUsage } from '../aiMetering.service.js';
+import { getCurrentTenant } from '../../lib/tenantContext.js';
 
 const MODEL = 'whisper-1';
 
@@ -65,6 +67,8 @@ export class VoiceCoachSTTService {
                     'They may speak Tamil or English about pain, sleep, mood, ' +
                     'medication (Triphala, Ashwagandha, kashayam, etc.), or daily check-ins.',
             });
+            // Phase 2c — meter this AI call (fire-and-forget; cost from audio minutes)
+            logUsage({ hospitalId: getCurrentTenant(), feature: 'voice_coach', model: MODEL, metadata: { minutes: (result?.duration ?? 0) / 60 } });
             const rawTranscript = (result?.text ?? '').trim();
             const detectedFull = (result?.language ?? '').toLowerCase();
             const language = mapLanguageToIso(detectedFull);

@@ -17,6 +17,8 @@
 
 import OpenAI from 'openai';
 import logger from '../../lib/logger.js';
+import { logUsage } from '../aiMetering.service.js';
+import { getCurrentTenant } from '../../lib/tenantContext.js';
 import { VoiceCoachContextService } from './context.service.js';
 import { renderSystemPrompt } from './prompts.js';
 import { retrievePassages } from './ragRetriever.js';
@@ -118,6 +120,9 @@ export class VoiceCoachLLMService {
                 response.usage?.prompt_tokens_details?.cached_tokens ?? 0,
             latencyMs: Date.now() - t0,
         };
+
+        // Phase 2c — meter this AI call (fire-and-forget; no-op without a tenant)
+        logUsage({ hospitalId: getCurrentTenant(), feature: 'voice_coach', model: MODEL, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens, metadata: { patientId } });
 
         logger.info('[VoiceCoachLLM] reply generated', {
             patientId,

@@ -18,6 +18,8 @@
  */
 
 import logger from '../../lib/logger.js';
+import { logUsage } from '../aiMetering.service.js';
+import { getCurrentTenant } from '../../lib/tenantContext.js';
 
 const ENDPOINT = 'https://texttospeech.googleapis.com/v1/text:synthesize';
 
@@ -103,6 +105,8 @@ export class VoiceCoachTTSService {
         }
 
         const durationMs = Date.now() - t0;
+        // Phase 2c — meter this AI call (fire-and-forget; cost from character count)
+        logUsage({ hospitalId: getCurrentTenant(), feature: 'tts', model: voice?.name?.includes('Wavenet') ? 'google-tts-wavenet' : 'google-tts', metadata: { characters: text.length } });
         logger.info('[VoiceCoachTTS] synthesized', {
             language,
             voice: voice.name,

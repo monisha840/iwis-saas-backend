@@ -14,6 +14,8 @@
 
 import OpenAI from 'openai';
 import logger from '../../lib/logger.js';
+import { logUsage } from '../aiMetering.service.js';
+import { getCurrentTenant } from '../../lib/tenantContext.js';
 
 const MODEL = 'gpt-4o';
 const MAX_OUTPUT_TOKENS = 300;
@@ -135,6 +137,8 @@ export async function analyseTongue(input, prakritiArg) {
                 },
             ],
         });
+        // Phase 2c — meter this AI call (fire-and-forget; no-op without a tenant)
+        logUsage({ hospitalId: getCurrentTenant(), feature: 'tongue', model: MODEL, inputTokens: response?.usage?.prompt_tokens ?? 0, outputTokens: response?.usage?.completion_tokens ?? 0 });
         const rawAnalysis = response?.choices?.[0]?.message?.content ?? '';
         const parsed = tryParseAnalysis(rawAnalysis);
         if (!parsed) {

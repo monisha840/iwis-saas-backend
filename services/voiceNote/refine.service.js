@@ -21,6 +21,8 @@
 
 import OpenAI from 'openai';
 import prisma from '../../lib/prisma.js';
+import { logUsage } from '../aiMetering.service.js';
+import { getCurrentTenant } from '../../lib/tenantContext.js';
 
 // ───────────────────────────────────────────────────────────────────────────
 // Medicine catalog cache
@@ -491,6 +493,8 @@ async function refineWithOpenAI(transcript, language) {
     ],
   });
 
+  // Phase 2c — meter this AI call (fire-and-forget; no-op without a tenant)
+  logUsage({ hospitalId: getCurrentTenant(), feature: 'voice_note', model: 'gpt-4o-mini', inputTokens: response.usage?.prompt_tokens ?? 0, outputTokens: response.usage?.completion_tokens ?? 0 });
   const text = response.choices?.[0]?.message?.content ?? '';
   let structured;
   try {

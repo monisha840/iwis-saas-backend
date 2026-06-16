@@ -17,6 +17,8 @@
 
 import OpenAI from 'openai';
 import logger from '../../lib/logger.js';
+import { logUsage } from '../aiMetering.service.js';
+import { getCurrentTenant } from '../../lib/tenantContext.js';
 import {
     AYURVEDIC_TIPS,
     getCurrentSeason,
@@ -147,6 +149,8 @@ export async function generateNudgeMessage(input) {
                 { role: 'user',   content: userPrompt },
             ],
         });
+        // Phase 2c — meter this AI call (fire-and-forget; no-op without a tenant)
+        logUsage({ hospitalId: getCurrentTenant(), feature: 'nudge', model: MODEL, inputTokens: response?.usage?.prompt_tokens ?? 0, outputTokens: response?.usage?.completion_tokens ?? 0 });
         const text = response?.choices?.[0]?.message?.content?.trim();
         if (!text) {
             logger.warn('[nudge] OpenAI returned empty content — falling back', {
