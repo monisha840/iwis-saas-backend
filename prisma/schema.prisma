@@ -2886,6 +2886,21 @@ model Hospital {
   adaptiveTargets AdaptiveTarget[]
   performanceScorecards PerformanceScorecard[]
   seasonalChallengeProgresses SeasonalChallengeProgress[]
+  // Phase 2a — per-hospital WhatsApp sender config
+  whatsappConfig HospitalWhatsappConfig?
+}
+
+model HospitalWhatsappConfig {
+  id              String    @id @default(cuid())
+  hospitalId      String    @unique
+  hospital        Hospital  @relation(fields: [hospitalId], references: [id])
+  instanceName    String
+  apiUrl          String
+  apiKey          String
+  status          String    @default("DISCONNECTED") // CONNECTED / DISCONNECTED / ERROR
+  connectedAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 }
 
 enum HospitalStatus {
