@@ -1,3 +1,7 @@
+// DEPRECATED (Phase 2c): manages the legacy global FeatureFlag table. Feature
+// decisions are per-hospital via FeatureRegistry + HospitalFeatureFlag
+// (utils/featureGate.js Layer 1, services/superAdmin.feature.service.js). This
+// service now only backs the legacy Layer-2 branch/role gate + its admin CRUD.
 import prisma from '../lib/prisma.js';
 import logger from '../lib/logger.js';
 import { cacheService } from './cache.service.js';

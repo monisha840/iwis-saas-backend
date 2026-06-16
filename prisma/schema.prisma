@@ -1492,6 +1492,11 @@ model LeaderboardConfig {
   updatedAt          DateTime @updatedAt
 }
 
+// DEPRECATED (Phase 2c): legacy global feature-flag table. The canonical
+// per-hospital system is FeatureRegistry + HospitalFeatureFlag (see
+// utils/featureGate.js Layer 1). This table is retained only as the Layer-2
+// branch/role refinement (allowedBranches/allowedRoles, default-OPEN) and is
+// slated for removal once that granularity moves into the per-hospital model.
 model FeatureFlag {
   id              String   @id @default(uuid())
   key             String   @unique

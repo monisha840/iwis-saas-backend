@@ -43,7 +43,11 @@ export async function isFeatureAvailable(hospitalId, branchId, featureKey, role)
     }
   }
 
-  // Layer 2: branch/role gate (existing FeatureFlag model).
+  // Layer 2: branch/role gate (legacy FeatureFlag model).
+  // DEPRECATED (Phase 2c): the per-hospital decision is Layer 1 above
+  // (FeatureRegistry + HospitalFeatureFlag). This legacy read only adds
+  // branch/role refinement (allowedBranches/allowedRoles), defaults OPEN, and is
+  // slated for removal once that granularity moves into the per-hospital model.
   // If no branch-level flag row exists, default to OPEN (existing behavior).
   const branchFlag = await prisma.featureFlag.findUnique({ where: { key: featureKey } });
   if (!branchFlag) return true;
