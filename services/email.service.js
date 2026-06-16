@@ -1,5 +1,27 @@
 import nodemailer from 'nodemailer';
 import logger from '../lib/logger.js';
+import { prismaBase } from '../lib/prisma.js';
+import { getCurrentTenant } from '../lib/tenantContext.js';
+
+// Phase 2d — per-hospital email "from" name. When a request/job tenant is set,
+// emails are sent under that hospital's name; otherwise fall back to the global
+// APP_NAME. Cached briefly so we don't query Hospital on every send.
+const _nameCache = new Map(); // hospitalId -> { name, expires }
+const NAME_TTL_MS = 5 * 60 * 1000;
+async function resolveFromName() {
+  const fallback = process.env.APP_NAME || 'IWIS Healthcare';
+  const tenant = getCurrentTenant();
+  if (!tenant) return fallback;
+  const cached = _nameCache.get(tenant);
+  if (cached && cached.expires > Date.now()) return cached.name || fallback;
+  try {
+    const h = await prismaBase.hospital.findUnique({ where: { id: tenant }, select: { name: true } });
+    _nameCache.set(tenant, { name: h?.name, expires: Date.now() + NAME_TTL_MS });
+    return h?.name || fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 /**
  * Email service using Nodemailer
@@ -25,8 +47,9 @@ class EmailService {
     try {
       const html = this.getNotificationTemplate(title, message, data);
 
+      const fromName = await resolveFromName();
       const mailOptions = {
-        from: `"${process.env.APP_NAME || 'IWIS Healthcare'}" <${process.env.SMTP_FROM || process.env.SMTP_USER}>`,
+        from: `"${fromName}" <${process.env.SMTP_FROM || process.env.SMTP_USER}>`,
         to,
         subject: title,
         html,
