@@ -83,6 +83,24 @@ const JOB_DEFINITIONS = [
     { name: 'dosha-forecast', cron: '30 20 * * *', handler: 'doshaForecast' },
 ];
 
+// Phase 2d — job tenancy classification.
+// GLOBAL: system-wide (Bucket 1) / maintenance — run once, unscoped.
+const GLOBAL_JOBS = new Set([
+    'cleanup-old-notifications',
+    'feature-registry-sync',
+    'health-quest-expiry',
+]);
+// SELF_SCOPED: handler already iterates per hospital/branch internally — run
+// once, unscoped (wrapping would double-scope).
+const SELF_SCOPED_JOBS = new Set([
+    'daily-checkin-reminder',
+    'dosha-forecast',
+    'home-therapy-daily-brief',
+]);
+// Everything else is patient/clinician-facing and loops per ACTIVE hospital
+// inside runWithTenant(), so the Phase 1 tenant filter auto-scopes every query
+// and no hospital ever sees another's data.
+
 async function processJob(job) {
     const { handler } = job.data;
     logger.info(`[ScheduledJobs] Running: ${job.name} (handler: ${handler})`);
@@ -158,12 +176,35 @@ async function processJob(job) {
     };
 
     const fn = handlers[handler];
-    if (fn) {
+    if (!fn) {
+        logger.warn(`[ScheduledJobs] Unknown handler: ${handler}`);
+        return;
+    }
+
+    // System-wide or already-self-scoping jobs run once, unscoped.
+    if (GLOBAL_JOBS.has(job.name) || SELF_SCOPED_JOBS.has(job.name)) {
         await fn();
         logger.info(`[ScheduledJobs] Completed: ${job.name}`);
-    } else {
-        logger.warn(`[ScheduledJobs] Unknown handler: ${handler}`);
+        return;
     }
+
+    // Per-hospital jobs: run the handler once per ACTIVE hospital inside its
+    // tenant context. The async-callback form keeps the AsyncLocalStorage frame
+    // open so Phase 1 auto-scoping applies to every query in the handler.
+    const { prismaBase } = await import('../lib/prisma.js');
+    const { runWithTenant } = await import('../lib/tenantContext.js');
+    const hospitals = await prismaBase.hospital.findMany({
+        where: { status: 'ACTIVE' },
+        select: { id: true },
+    });
+    for (const h of hospitals) {
+        try {
+            await runWithTenant(h.id, async () => { await fn(); });
+        } catch (err) {
+            logger.error(`[ScheduledJobs] ${job.name} failed for hospital ${h.id}`, { error: err.message });
+        }
+    }
+    logger.info(`[ScheduledJobs] Completed: ${job.name} across ${hospitals.length} hospital(s)`);
 }
 
 export async function initScheduledJobs() {
