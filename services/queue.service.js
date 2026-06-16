@@ -78,10 +78,17 @@ async function ensureQueues() {
       }
 
       if (job.name === 'in-app') {
-        const { userId, title, body, type, relatedId, idempotencyKey } = job.data;
-        logger.info('[Queue:notifications] Processing in-app notification', { jobId: job.id, userId });
+        const { userId, title, body, type, relatedId, idempotencyKey, hospitalId } = job.data;
+        logger.info('[Queue:notifications] Processing in-app notification', { jobId: job.id, userId, hospitalId });
         const { default: prisma } = await import('../lib/prisma.js');
         const { emitToUser } = await import('../websocket/index.js');
+
+        // Phase 2d — stamp the recipient's hospital so the Notification (a
+        // Phase 1 hospitalId model) is tenant-scoped. Prefer the payload value;
+        // otherwise derive from the recipient user.
+        const hosp = hospitalId
+          ?? (await prisma.user.findUnique({ where: { id: userId }, select: { hospitalId: true } }))?.hospitalId
+          ?? undefined;
 
         // Retry-safe: if a previous attempt already created the row, short-circuit.
         if (idempotencyKey) {
@@ -102,6 +109,7 @@ async function ensureQueues() {
             priority: 'INFO',
             data: idempotencyKey ? { idempotencyKey } : {},
             ...(relatedId && { relatedId }),
+            ...(hosp && { hospitalId: hosp }),
           },
         });
         emitToUser(userId, 'notification', notification);
@@ -110,11 +118,16 @@ async function ensureQueues() {
     }, { connection: redisConnection, concurrency: config.queue.concurrency });
 
     const reportWorker = new Worker('report-exports', async (job) => {
-      const { type, filters, requestedBy } = job.data;
-      logger.info(`[Queue:reports] Processing ${job.name} export`, { jobId: job.id, type, requestedBy });
+      const { type, filters, requestedBy, hospitalId } = job.data;
+      logger.info(`[Queue:reports] Processing ${job.name} export`, { jobId: job.id, type, requestedBy, hospitalId });
       const { ExportService } = await import('./export.service.js');
-      if (job.name === 'pdf') return ExportService.generatePdfReport(type, filters, requestedBy);
-      return ExportService.generateCsvReport(type, filters, requestedBy);
+      const { runWithTenant } = await import('../lib/tenantContext.js');
+      // Phase 2d — run the export inside the requester's tenant so its queries
+      // are auto-scoped to that hospital (no-op when hospitalId is absent).
+      const run = () => (job.name === 'pdf'
+        ? ExportService.generatePdfReport(type, filters, requestedBy)
+        : ExportService.generateCsvReport(type, filters, requestedBy));
+      return hospitalId ? runWithTenant(hospitalId, async () => run()) : run();
     }, { connection: redisConnection, concurrency: 2 });
 
     // Attach error handlers so unhandled rejections don't crash the process
@@ -160,14 +173,15 @@ export async function enqueueAppointmentWhatsApp(appointmentId, { number, text, 
   return job.id;
 }
 
-export async function enqueueInAppNotification({ userId, title, body, type, relatedId }) {
+export async function enqueueInAppNotification({ userId, title, body, type, relatedId, hospitalId }) {
   if (!_notificationQueue) return null;
-  return _notificationQueue.add('in-app', { userId, title, body, type, relatedId }, defaultJobOptions);
+  // hospitalId optional — the worker derives it from the recipient if omitted.
+  return _notificationQueue.add('in-app', { userId, title, body, type, relatedId, hospitalId }, defaultJobOptions);
 }
 
-export async function enqueueReport({ format = 'pdf', type, filters, requestedBy }) {
+export async function enqueueReport({ format = 'pdf', type, filters, requestedBy, hospitalId }) {
   if (!_reportQueue) return null;
-  return _reportQueue.add(format, { type, filters, requestedBy }, defaultJobOptions);
+  return _reportQueue.add(format, { type, filters, requestedBy, hospitalId }, defaultJobOptions);
 }
 
 // ── Bull Board Integration ──────────────────────────────────────────────────

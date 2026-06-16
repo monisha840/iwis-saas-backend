@@ -58,6 +58,7 @@ async function notifyPatientOfDietAssignment(prescription) {
             userId: true,
             user: {
                 select: {
+                    hospitalId: true,
                     notificationPreference: { select: { whatsappEnabled: true, whatsappNumber: true } },
                 },
             },
@@ -108,6 +109,7 @@ async function notifyPatientOfDietAssignment(prescription) {
             await notificationQueue.add('whatsapp', {
                 number: prefs.whatsappNumber,
                 text: message,
+                hospitalId: patient.user?.hospitalId,
             });
         } catch (err) {
             logger.warn('[DietPrescription] whatsapp enqueue failed', { err: err.message });
