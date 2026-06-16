@@ -89,6 +89,7 @@ import queueRoutes from './routes/queue.js';
 import consultationContextRoutes from './routes/consultation-context.js';
 import superAdminRoutes from './routes/super-admin.js';
 import adminWhatsappRoutes from './routes/admin.whatsapp.js';
+import { adminAiUsageRouter, superAdminAiUsageRouter } from './routes/aiUsage.js';
 // IWIS competitor features
 import therapyRoomRoutes from './routes/therapyRoom.js';
 import dietPrescriptionRoutes from './routes/dietPrescription.js';
@@ -396,6 +397,9 @@ app.use('/api/webhooks', webhooksRoutes);
 app.use('/api/super-admin', superAdminRoutes);
 // Phase 2a — per-hospital WhatsApp config management
 app.use('/api/admin/whatsapp', adminWhatsappRoutes);
+// Phase 2c — AI usage reporting
+app.use('/api/admin/ai-usage', adminAiUsageRouter);
+app.use('/api/super-admin/ai-usage', superAdminAiUsageRouter);
 
 // Bull Board admin dashboard — admin-only (lazy: only mounts if queues are available)
 import { authMiddleware as authMw, roleMiddleware as roleMw } from './middleware/auth.js';
