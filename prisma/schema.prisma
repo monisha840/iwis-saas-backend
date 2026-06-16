@@ -2888,6 +2888,9 @@ model Hospital {
   seasonalChallengeProgresses SeasonalChallengeProgress[]
   // Phase 2a — per-hospital WhatsApp sender config
   whatsappConfig HospitalWhatsappConfig?
+  // Phase 2c — per-hospital AI usage metering
+  aiUsageLogs    AiUsageLog[]
+  aiUsageMonthly AiUsageMonthly[]
 }
 
 model HospitalWhatsappConfig {
@@ -2901,6 +2904,38 @@ model HospitalWhatsappConfig {
   connectedAt     DateTime?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
+}
+
+// Phase 2c — per-AI-call usage log (one row per external AI call)
+model AiUsageLog {
+  id            String   @id @default(cuid())
+  hospitalId    String
+  hospital      Hospital @relation(fields: [hospitalId], references: [id])
+  userId        String?
+  feature       String   // 'voice_coach' | 'voice_note' | 'tongue' | 'nudge' | 'dosha' | 'orchestration' | 'tts'
+  model         String   // 'gpt-4o-mini' | 'whisper-1' | 'text-embedding-3-small' | 'google-tts' ...
+  inputTokens   Int      @default(0)
+  outputTokens  Int      @default(0)
+  estimatedCost Float    @default(0)
+  metadata      Json?
+  createdAt     DateTime @default(now())
+
+  @@index([hospitalId, createdAt])
+  @@index([hospitalId, feature])
+}
+
+// Phase 2c — monthly rollup per hospital + feature
+model AiUsageMonthly {
+  id          String   @id @default(cuid())
+  hospitalId  String
+  hospital    Hospital @relation(fields: [hospitalId], references: [id])
+  month       String   // '2026-06'
+  feature     String
+  totalCalls  Int      @default(0)
+  totalCost   Float    @default(0)
+  updatedAt   DateTime @updatedAt
+
+  @@unique([hospitalId, month, feature])
 }
 
 enum HospitalStatus {
