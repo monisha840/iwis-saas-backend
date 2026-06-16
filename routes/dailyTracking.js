@@ -318,7 +318,7 @@ router.post(
 
       // Either Supabase-hosted URL or local /uploads/* path; matches the
       // pattern used by clinicalPhoto.js + self-exam.js.
-      const photoUrl = await uploadToSupabase(req.file, BUCKETS.JOURNEY_MEDIA);
+      const photoUrl = await uploadToSupabase(req.file, BUCKETS.JOURNEY_MEDIA, { hospitalId: req.user.hospitalId });
       const photoPath = req.file.path || photoUrl;
 
       const today = startOfDay();

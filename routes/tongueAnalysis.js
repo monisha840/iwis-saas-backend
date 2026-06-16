@@ -85,14 +85,16 @@ router.post(
             let photoUrl = null;
             let storageFailed = false;
             try {
+                // Phase 2b: hospital/patient namespacing is handled centrally by
+                // uploadToSupabase via opts. Keep just a clean timestamped filename.
                 const renamed = {
                     ...req.file,
-                    // Encode patient + hospital + timestamp into the path so
-                    // ops can locate a file from the DB record without
-                    // joining tables.
-                    originalname: `${patient.user?.hospitalId ?? 'no-hospital'}/${patient.id}/${Date.now()}.${(req.file.originalname.split('.').pop() ?? 'jpg').toLowerCase()}`,
+                    originalname: `${Date.now()}.${(req.file.originalname.split('.').pop() ?? 'jpg').toLowerCase()}`,
                 };
-                photoUrl = await uploadToSupabase(renamed, 'tongue-photos');
+                photoUrl = await uploadToSupabase(renamed, 'tongue-photos', {
+                    hospitalId: patient.user?.hospitalId,
+                    patientId: patient.id,
+                });
             } catch (err) {
                 logger.warn('[tongue] storage upload failed — saving observation without photo', {
                     err: err.message,

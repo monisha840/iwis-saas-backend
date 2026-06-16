@@ -45,8 +45,19 @@ const diskStorage = multer.diskStorage({
 
 /**
  * Upload a file to Supabase Storage, falling back to local disk.
+ *
+ * Phase 2b: object paths are namespaced per hospital (and per patient when
+ * known) so each hospital's files live in their own folder:
+ *   hospital-{hospitalId}/patient-{patientId}/{timestamp}-{filename}
+ * The hospital/patient segments are omitted when not provided (backward-safe).
+ *
+ * @param {object} file                 - multer file (buffer + originalname + mimetype)
+ * @param {string} bucket               - storage bucket name
+ * @param {object} [opts]
+ * @param {string} [opts.hospitalId]    - owning hospital (from req.user.hospitalId / patient)
+ * @param {string} [opts.patientId]     - owning patient (optional)
  */
-export async function uploadToSupabase(file, bucket = 'medical-documents') {
+export async function uploadToSupabase(file, bucket = 'medical-documents', opts = {}) {
     const sb = getSupabase();
 
     if (!sb) {
@@ -55,7 +66,11 @@ export async function uploadToSupabase(file, bucket = 'medical-documents') {
         return `/uploads/${file.filename || file.originalname}`;
     }
 
-    const path = `${Date.now()}-${file.originalname}`;
+    const segments = [];
+    if (opts.hospitalId) segments.push(`hospital-${opts.hospitalId}`);
+    if (opts.patientId) segments.push(`patient-${opts.patientId}`);
+    segments.push(`${Date.now()}-${file.originalname}`);
+    const path = segments.join('/');
     const { data, error } = await sb.storage
         .from(bucket)
         .upload(path, file.buffer, {

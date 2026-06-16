@@ -465,7 +465,7 @@ router.post(
       if (!req.file.mimetype?.startsWith('image/')) {
         return res.status(400).json({ error: 'Only image files are accepted' });
       }
-      const url = await uploadToSupabase(req.file, BUCKETS.PROFILE_PICTURES);
+      const url = await uploadToSupabase(req.file, BUCKETS.PROFILE_PICTURES, { hospitalId: req.user.hospitalId });
       const data = await UserService.updateMe(req.user.id, { profilePhoto: url });
       res.json({ url, user: data });
     } catch (err) {

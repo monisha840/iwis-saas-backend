@@ -229,7 +229,7 @@ const upload = getUploadMiddleware({ maxSizeMb: 15, fieldName: 'file' });
 router.post('/upload-asset', authorizeRoles('PATIENT'), upload, async (req, res, next) => {
     try {
         if (!req.file) return res.status(400).json({ error: 'file is required' });
-        const filePath = await uploadToSupabase(req.file, BUCKETS.JOURNEY_MEDIA);
+        const filePath = await uploadToSupabase(req.file, BUCKETS.JOURNEY_MEDIA, { hospitalId: req.user.hospitalId });
         res.status(201).json({ url: filePath });
     } catch (err) { next(err); }
 });

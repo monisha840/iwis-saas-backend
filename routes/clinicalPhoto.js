@@ -69,7 +69,7 @@ router.post('/', upload, async (req, res, next) => {
             }
         }
 
-        const filePath = await uploadToSupabase(req.file, BUCKETS.JOURNEY_MEDIA);
+        const filePath = await uploadToSupabase(req.file, BUCKETS.JOURNEY_MEDIA, { hospitalId: req.user.hospitalId, patientId: data.patientId });
         const photo = await ClinicalPhotoService.create({
             ...data,
             filePath,
